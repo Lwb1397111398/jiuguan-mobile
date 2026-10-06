@@ -1580,82 +1580,6 @@ def number_paragraphs(text: str) -> str:
     return "\n\n".join(f"P{i}：{p}" for i, p in enumerate(paras, 1))
 
 
-def numbered_range(paras: list[str], start: int, end: int) -> str:
-    """取段落列表 [start, end]（1-based 含端）的编号稿片段（执行批输入）。"""
-    lo, hi = max(1, start), min(len(paras), end)
-    return "\n\n".join(f"P{i}：{paras[i - 1]}" for i in range(lo, hi + 1))
-
-
-# 分批方案机器可读行：批1｜第1~8段（模板规定；兼容半角|、冒号、各种破折号）
-_REWRITE_PLAN_LINE_RE = re.compile(
-    r"^批\s*(\d+)\s*[｜|:：]?\s*第\s*(\d+)\s*[-~－—–至]\s*(\d+)\s*段")
-
-
-def parse_batch_plan(report: str, total_paras: int = 0) -> list[tuple[int, int]] | None:
-    """从扫描报告解析分批方案 → [(start, end), ...]（1-based 含端，有序全覆盖）。
-
-    只认「批N｜第X~Y段」行；批号必须从 1 连续递增。程序对解析结果做接缝校正：
-    首批起点拉到 1、相邻批重叠裁掉、断口拉齐、末批终点补到总段数（传入时）——
-    模型报方案偶尔丢段/叠段，校正后保证「拼接即全章」。解析不出任何行或
-    批号断裂 → None，调用方走程序兜底切批。
-    """
-    if not (report or "").strip():
-        return None
-    hits: list[tuple[int, int, int]] = []
-    for ln in report.splitlines():
-        m = _REWRITE_PLAN_LINE_RE.match(ln.strip())
-        if m:
-            hits.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
-    if not hits:
-        return None
-    hits.sort()
-    if hits[0][0] != 1 or any(b[0] != a[0] + 1 for a, b in zip(hits, hits[1:])):
-        return None
-    ranges: list[tuple[int, int]] = []
-    prev_end = 0
-    for _no, s, e in hits:
-        s = prev_end + 1           # 一律紧贴上一批末尾：重叠裁掉、断口拉齐
-        e = max(e, s)
-        if e <= prev_end:          # 空批（起点越过终点）丢弃
-            continue
-        ranges.append((s, e))
-        prev_end = e
-    if not ranges:
-        return None
-    first_s, first_e = ranges[0]
-    ranges[0] = (1, first_e)       # 首批起点强制 1（模型从 P0 或 P2 起报时兜住）
-    if total_paras > 0:
-        s, e = ranges[-1]
-        ranges[-1] = (s, min(e, total_paras) if e > total_paras else max(e, total_paras))
-    return ranges
-
-
-def plan_rewrite_batches_fallback(text: str) -> list[tuple[int, int]]:
-    """程序兜底切批：按自然段字数累计，每批约 2500~4000 字（先到为准）。
-
-    仅在扫描报告「分批方案」解析失败时使用——协议本意是 AI 按保留区/病灶簇
-    定批边界，程序兜底只保证「能跑」，批边界质量让位于可用性。
-    """
-    paras = split_paragraphs(text)
-    if not paras:
-        return []
-    batches: list[tuple[int, int]] = []
-    start, acc = 1, 0
-    for i, p in enumerate(paras, 1):
-        acc += len(p)
-        if acc >= 2500:
-            batches.append((start, i))
-            start, acc = i + 1, 0
-    if start <= len(paras):
-        batches.append((start, len(paras)))
-    return batches
-
-# 改写批包字段行（【改写批包】标记缺失时的兜底识别，2026-10-06）：
-# 模板规定批包字段为 范围与病灶处理：/配额消耗：/末句摘录：/跨批登记：。
-_REWRITE_PKG_FIELD_RE = re.compile(
-    r"^(?:范围与病灶处理|配额消耗|末句摘录|跨批登记)\s*[:：]", re.IGNORECASE)
-
-
 def _parse_batch_prose(text: str, info_out: dict | None = None,
                        marker: str = "【滚动状态包】",
                        field_re: "re.Pattern | None" = None):
@@ -3490,32 +3414,6 @@ class Pipeline:
                 f"本批正文识别为空或过短（{len(prose)} 字，可能是拒答或只输出了说明）。"
                 "可点「拒答重试」重新生成本批。")
         return prose, state, None
-
-    @classmethod
-    def parse_rewrite_batch(cls, text: str, info_out: dict | None = None):
-        """解析文风改写执行批输出 → (本批成稿, 改写批包, err)。
-
-        与 parse_batch_prose 同骨架（切分→正文清洗），包标记换【改写批包】、
-        字段行换 范围与病灶处理/配额消耗/末句摘录/跨批登记。批包原文不清洗
-        （下一批注入的就是模型自己写的原文）。不剥【块N】标记——改写稿是
-        成品正文，模型按协议不该输出块标记，残留清洗链已覆盖伪标签。
-        """
-        text = (text or "").strip()
-        if not text:
-            return "", "", "输出为空"
-        body = strip_model_output(text, detect_no_body=True)[0]
-        prose, pkg, err = _parse_batch_prose(
-            body, info_out, marker="【改写批包】", field_re=_REWRITE_PKG_FIELD_RE)
-        if err:
-            return "", pkg, err
-        prose = strip_prose_residue(strip_prose_preamble(prose))
-        if _looks_json(prose):
-            return "", pkg, "识别到 JSON 输出而不是正文，请重试"
-        if len(prose) < cls._BATCH_PROSE_MIN:
-            return "", pkg, (
-                f"本批成稿识别为空或过短（{len(prose)} 字，可能是拒答或只输出了说明）。"
-                "可点「拒答重试」重新生成本批。")
-        return prose, pkg, None
 
     # ---------- 文风改写·差量替换（2026-10-06） ----------
     # 整章模式的输出不是重抄全文，而是「只列病灶段的替换条目」：模型扫完
