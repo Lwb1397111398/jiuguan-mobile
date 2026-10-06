@@ -75,7 +75,7 @@ JAILBREAK_MODES = {
     "synopsis": "full",
     "volume": "full",
     "outline": "full", "detail": "full",
-    "prose": "full", "rewrite": "full",
+    "prose": "full", "rewrite": "full", "prose_rewrite": "full",
     "check": "light", "style": "light",
     "memory": "off",
 }
@@ -280,11 +280,15 @@ class Assembler:
 
         置顶卡（pinned）也在这里返回——是否拆出去紧跟锚定层由调用方决定，
         这样白名单/启用过滤逻辑只写一份。
+        文风改写（prose_rewrite）与改写（rewrite）同源：stages 白名单里写了
+        rewrite 的卡对 prose_rewrite 同样生效（「降 AI 感」「文风基准」等创作
+        偏好自动跟上，已有项目的卡无需逐张手改——2026-10-06）。
         """
+        lookup = "rewrite" if stage == "prose_rewrite" else stage
         out = []
         for c in self.store.active_cards("global"):
             whitelist = _card_stage_whitelist(c)
-            if whitelist is not None and stage not in whitelist:
+            if whitelist is not None and lookup not in whitelist:
                 continue
             out.append(c)
         return out
@@ -1789,7 +1793,8 @@ class Assembler:
             raise ValueError(f"未知任务角色: {role}")
         # 总纲生成/迭代统一走 synopsis 角色（brainstorm 已废弃删除）
         stage = role if role in ("synopsis", "volume", "outline", "detail",
-                                 "prose", "rewrite", "check", "style") else ""
+                                 "prose", "rewrite", "prose_rewrite",
+                                 "check", "style") else ""
         chapter = context.get("chapter")
         block = context.get("block")
         # 统一改写：注入模块按「改写设置」白名单开关（其他角色不受影响）。
@@ -2064,6 +2069,38 @@ class Assembler:
             add("待改写文本", "rewrite_text", context.get("rewrite_text", ""), 10, critical=True)
             req = context.get("user_req", "")
             add("改写要求", "user", req, 5)
+        elif role == "prose_rewrite":
+            # 文风改写（2026-10-06，流水线第 6 环）：整章「去 AI 味」句子层改写，
+            # 与局部润色（role=rewrite，按改写设置白名单注入）分开——本角色注入
+            # 固定：编号稿 + 风格样本 + 状态卡 + 细纲对账 + 扫描报告/上批末两段。
+            add("认知规则", "cognition", COGNITION_RULES, 3)
+            add("人物状态卡", "cards", self._character_cards(cast_full, include_sealed=True,
+                                   cur_order=(chapter or {}).get("order_index") or 0), 9, critical=True)
+            add("未出场人物简报", "cards", self._character_briefs(cast_brief), 3)
+            add("世界实体状态", "entities", self._entities_text(context), 4)
+            # 风格样本 = 协议里的「文风提示词……至少含样例」：用户标记的风格样本正文块
+            add("风格样本（文风基准）", "sample", self._style_samples(), 8, critical=True)
+            if chapter:
+                blocks = store.list_blocks(chapter["id"])
+                if blocks:
+                    # 信息对账依据：细纲要素与块末 to 落点（改写只动句子不动覆盖面）
+                    add("本章细纲（信息对账）", "detail_ref",
+                        self._detail_ref_text(blocks), 6)
+            # 待改写正文：程序已按自然段编号（P1/P2/…），病灶定位与批范围都按段号走
+            add("待改写正文（自然段编号）", "rewrite_text",
+                context.get("rewrite_text", ""), 10, critical=True)
+            scan = context.get("scan_report")
+            if scan:
+                # 分批模式：全章扫描报告整份注入每个执行批（协议：各批无权推翻保留区）
+                add("扫描报告（全章口径，本批依此执行）", "scan_report", scan, 9, critical=True)
+            tail = context.get("prev_batch_tail")
+            if tail:
+                # 执行接缝锚：上一批成稿末两段（连读检查风格延续/重复交代/断崖）
+                add("上一批成稿末两段（衔接）", "prev_end", tail, 7)
+            pkg = context.get("prev_batch_package")
+            if pkg:
+                # 改写批包：上批的病灶处理/配额消耗/末句摘录/跨批登记（协议：注入下一批）
+                add("上一批改写批包", "batch_state", pkg, 8, critical=True)
         elif role == "memory":
             add("上一版状态（当前有效记忆）", "memory",
                 self._format_memory_state(context.get("prev_state"), context), 10, critical=True)

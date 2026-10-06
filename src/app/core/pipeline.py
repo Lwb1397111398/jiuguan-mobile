@@ -140,7 +140,7 @@ REFUSAL_RETRY_EXTRA = (
 # 若超过模型自身最大输出（如 DeepSeek 官方上限 8192、GPT-4.1 32k），api.py 会收到
 # 400/422 后自动减半降级重发（递归直到渠道可接受），不会报错失败。
 _DEFAULT_MAX_TOKENS = {
-    "prose": 60000, "rewrite": 60000,
+    "prose": 60000, "rewrite": 60000, "prose_rewrite": 60000,
     "check": 60000, "style": 60000,
     "synopsis": 60000, "volume": 60000, "outline": 60000, "detail": 60000,
     "memory": 60000,
@@ -339,7 +339,8 @@ UPSTREAM_GUARD_RETRY_GAP = 8.0
 
 # 只对长文本创作角色启用：JSON 类角色（memory/check/style/ai_task）请求形态保持原样，
 # 避免给结构化输出任务塞入无关标题行。
-UPSTREAM_GUARD_ROLES = ("prose", "rewrite", "outline", "detail", "volume", "synopsis")
+UPSTREAM_GUARD_ROLES = ("prose", "rewrite", "prose_rewrite",
+                        "outline", "detail", "volume", "synopsis")
 
 # 流式回调内的「重置」哨兵：上游拦截后自动重试时，通知界面丢弃上一轮残留
 # （那段英文拦截说明不是正文，不能和新一轮的真实输出拼在一起）。
@@ -461,7 +462,7 @@ def strip_trailing_prefill(messages: list[dict]) -> list[dict]:
 # ---------- 截断自动续写（防截断，2026-08-09） ----------
 
 # 只对长文本创作角色启用；JSON 类角色截断后拼接必坏，不续写
-CONTINUABLE_ROLES = ("prose", "rewrite")
+CONTINUABLE_ROLES = ("prose", "rewrite", "prose_rewrite")
 
 # 输出是人类可读的结构化文本（而非 JSON）的结构化阶段：同样会被破甲开场白 /
 # Step 规划段污染，要走 strip_jailbreak_residue（但不能剥章节名行，那是数据）。
@@ -1554,17 +1555,123 @@ _BATCH_STATE_FIELD_RE = re.compile(
     r"^(?:摘要|to状态|配额登记|末句)\s*[:：]", re.IGNORECASE)
 
 
-def _parse_batch_prose(text: str, info_out: dict | None = None):
-    """解析单批正文输出 → (本批正文, 滚动状态包, 错误)。
+# ---------- 文风改写：自然段编号与分批方案（2026-10-06） ----------
+# 协议要求初稿以「自然段编号」形态喂给改写模型（病灶定位到段、批范围按段切），
+# 扫描报告的「分批方案」节按机器可读格式输出供程序解析执行。
 
-    分批模板规定输出结构：【思考环节】→【正文输出】（第N章…（第M批）+ 本批正文）
-    →【滚动状态包】（摘要/to状态/配额登记/末句）→【生成完毕】。
+def split_paragraphs(text: str) -> list[str]:
+    """把初稿切成自然段列表：空行分段优先；整篇无空行（模型没分段）退化为按行。
+
+    段内保留原始文本（不合并、不去重）；返回不含空段。
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return []
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paras) > 1:
+        return paras
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines if len(lines) > 1 else paras
+
+
+def number_paragraphs(text: str) -> str:
+    """初稿 → 「P1：段落」编号稿（文风改写扫描/整章调用的输入形态）。"""
+    paras = split_paragraphs(text)
+    return "\n\n".join(f"P{i}：{p}" for i, p in enumerate(paras, 1))
+
+
+def numbered_range(paras: list[str], start: int, end: int) -> str:
+    """取段落列表 [start, end]（1-based 含端）的编号稿片段（执行批输入）。"""
+    lo, hi = max(1, start), min(len(paras), end)
+    return "\n\n".join(f"P{i}：{paras[i - 1]}" for i in range(lo, hi + 1))
+
+
+# 分批方案机器可读行：批1｜第1~8段（模板规定；兼容半角|、冒号、各种破折号）
+_REWRITE_PLAN_LINE_RE = re.compile(
+    r"^批\s*(\d+)\s*[｜|:：]?\s*第\s*(\d+)\s*[-~－—–至]\s*(\d+)\s*段")
+
+
+def parse_batch_plan(report: str, total_paras: int = 0) -> list[tuple[int, int]] | None:
+    """从扫描报告解析分批方案 → [(start, end), ...]（1-based 含端，有序全覆盖）。
+
+    只认「批N｜第X~Y段」行；批号必须从 1 连续递增。程序对解析结果做接缝校正：
+    首批起点拉到 1、相邻批重叠裁掉、断口拉齐、末批终点补到总段数（传入时）——
+    模型报方案偶尔丢段/叠段，校正后保证「拼接即全章」。解析不出任何行或
+    批号断裂 → None，调用方走程序兜底切批。
+    """
+    if not (report or "").strip():
+        return None
+    hits: list[tuple[int, int, int]] = []
+    for ln in report.splitlines():
+        m = _REWRITE_PLAN_LINE_RE.match(ln.strip())
+        if m:
+            hits.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+    if not hits:
+        return None
+    hits.sort()
+    if hits[0][0] != 1 or any(b[0] != a[0] + 1 for a, b in zip(hits, hits[1:])):
+        return None
+    ranges: list[tuple[int, int]] = []
+    prev_end = 0
+    for _no, s, e in hits:
+        s = prev_end + 1           # 一律紧贴上一批末尾：重叠裁掉、断口拉齐
+        e = max(e, s)
+        if e <= prev_end:          # 空批（起点越过终点）丢弃
+            continue
+        ranges.append((s, e))
+        prev_end = e
+    if not ranges:
+        return None
+    first_s, first_e = ranges[0]
+    ranges[0] = (1, first_e)       # 首批起点强制 1（模型从 P0 或 P2 起报时兜住）
+    if total_paras > 0:
+        s, e = ranges[-1]
+        ranges[-1] = (s, min(e, total_paras) if e > total_paras else max(e, total_paras))
+    return ranges
+
+
+def plan_rewrite_batches_fallback(text: str) -> list[tuple[int, int]]:
+    """程序兜底切批：按自然段字数累计，每批约 2500~4000 字（先到为准）。
+
+    仅在扫描报告「分批方案」解析失败时使用——协议本意是 AI 按保留区/病灶簇
+    定批边界，程序兜底只保证「能跑」，批边界质量让位于可用性。
+    """
+    paras = split_paragraphs(text)
+    if not paras:
+        return []
+    batches: list[tuple[int, int]] = []
+    start, acc = 1, 0
+    for i, p in enumerate(paras, 1):
+        acc += len(p)
+        if acc >= 2500:
+            batches.append((start, i))
+            start, acc = i + 1, 0
+    if start <= len(paras):
+        batches.append((start, len(paras)))
+    return batches
+
+# 改写批包字段行（【改写批包】标记缺失时的兜底识别，2026-10-06）：
+# 模板规定批包字段为 范围与病灶处理：/配额消耗：/末句摘录：/跨批登记：。
+_REWRITE_PKG_FIELD_RE = re.compile(
+    r"^(?:范围与病灶处理|配额消耗|末句摘录|跨批登记)\s*[:：]", re.IGNORECASE)
+
+
+def _parse_batch_prose(text: str, info_out: dict | None = None,
+                       marker: str = "【滚动状态包】",
+                       field_re: "re.Pattern | None" = None):
+    """解析单批正文输出 → (本批正文, 批尾包, 错误)。
+
+    分批模板规定输出结构：【批内开工检查/思考环节】→【正文输出】（第N章…（第M批）
+    + 本批正文）→【滚动状态包】/【改写批包】→【生成完毕】。
     pipeline.run 返回前已剥思考段、<content> 伪标签与末尾完成标志，这里只做批级切分：
-    以**最后一个**【滚动状态包】标记行为界——其前是本批正文，其后原样作为状态包。
-    标记缺失时按末尾连续状态包字段行兜底（≥2 行才认，防把正文末段误切）。
+    以**最后一个**包标记行为界——其前是本批正文，其后原样作为批尾包。
+    标记缺失时按末尾连续包字段行兜底（≥2 行才认，防把正文末段误切）。
 
-    状态包识别不到不报错（空串）：下一批退化为只靠「末尾两段」衔接，正文照常收下。
+    包识别不到不报错（空串）：下一批退化为只靠「末尾两段」衔接，正文照常收下。
     info_out 写入 {"state_found": bool, "note": 提示}。
+
+    marker/field_re 可换形：文风改写执行批用同一解析骨架，包标记为【改写批包】、
+    字段行为 范围与病灶处理/配额消耗/末句摘录/跨批登记（2026-10-06）。
     """
     info = info_out if info_out is not None else {}
     info["state_found"] = False
@@ -1573,10 +1680,9 @@ def _parse_batch_prose(text: str, info_out: dict | None = None):
     if not raw:
         return "", "", "输出为空"
     # 剥批头引导行：【正文输出】/【本批正文】等环节标记行（模型常原样回显模板标记）
-    raw = re.sub(r"^[ \t]*【(?:正文|本批正文|正式)?输出】[ \t]*\n?", "", raw,
+    raw = re.sub(r"^[ \t]*【(?:正文|本批正文|本批成稿|正式)?输出】[ \t]*\n?", "", raw,
                  flags=re.MULTILINE).strip()
     state = ""
-    marker = "【滚动状态包】"
     idx = raw.rfind(marker)
     if idx >= 0:
         # 完成标志行可能落在状态包内部（模型把它打在状态包之后、标记剥离在
@@ -1585,17 +1691,18 @@ def _parse_batch_prose(text: str, info_out: dict | None = None):
         raw = raw[:idx].strip()
         info["state_found"] = bool(state)
     else:
+        field = field_re or _BATCH_STATE_FIELD_RE
         lines = raw.split("\n")
         cut = len(lines)
-        while cut > 0 and _BATCH_STATE_FIELD_RE.match(lines[cut - 1].strip()):
+        while cut > 0 and field.match(lines[cut - 1].strip()):
             cut -= 1
         if len(lines) - cut >= 2:
             state = "\n".join(lines[cut:]).strip()
             raw = "\n".join(lines[:cut]).strip()
             info["state_found"] = True
-            info["note"] = "状态包标记行缺失，已按末尾字段行识别"
+            info["note"] = "批包标记行缺失，已按末尾字段行识别"
     if not raw:
-        return "", state, "本批正文为空（只输出了滚动状态包？），请重试"
+        return "", state, "本批正文为空（只输出了批尾包？），请重试"
     return raw, state, None
 
 
@@ -2488,7 +2595,7 @@ class Pipeline:
         # <draft> 也算进去，草稿不会被吞。剥下的思考并入 thinking 供「思考过程」
         # 面板显示，不进任何创作数据。
         formal_text, think_body, clean_info = strip_model_output(
-            resp["text"], detect_no_body=role in ("prose", "rewrite"))
+            resp["text"], detect_no_body=role in ("prose", "rewrite", "prose_rewrite"))
         if think_body:
             resp["thinking"] = (resp.get("thinking", "") + "\n" + think_body).strip()
         # 草稿自检剥离（续写循环结束后统一执行：成对块全剥、未闭合走兜底；
@@ -2509,7 +2616,7 @@ class Pipeline:
         # （『日期-星期-时间-地点-天气』）收进 result["scene_meta"]，由 UI 在
         # 落库时写成「【场景】」本章动态交给记忆系统（store.set_scene_note）。
         scene_lines: list[str] = []
-        if role in ("prose", "rewrite"):
+        if role in ("prose", "rewrite", "prose_rewrite"):
             formal_text = strip_prose_residue(formal_text, scene_lines)
         elif role in TEXT_OUTPUT_ROLES:
             formal_text = strip_jailbreak_residue(formal_text)
@@ -2535,7 +2642,7 @@ class Pipeline:
         # 输出时常见）时，末尾剥离拿不到 → 标志随内容落库。这里对「强形式」标志行
         # 做一次全文清理（只认【生成完毕】这类，绝不碰「本章完/结束。」等正常行文）。
         # 不影响 found 判定——完整性只认末尾标志。JSON 类角色不清理（防伤 JSON 内容）。
-        if role in TEXT_OUTPUT_ROLES or role in ("prose", "rewrite"):
+        if role in TEXT_OUTPUT_ROLES or role in ("prose", "rewrite", "prose_rewrite"):
             formal_text, _marks_removed = strip_inline_end_marks(formal_text)
         out_tokens = resp["completion_tokens"] or build["est_output_tokens"]
         # input 记账用真实值：渠道返回 usage（非流式常规、流式开了 include_usage）
@@ -2610,7 +2717,7 @@ class Pipeline:
         text = (text or "").strip()
         if not text:
             return False, ""
-        if role in ("prose", "rewrite"):
+        if role in ("prose", "rewrite", "prose_rewrite"):
             return prose_complete(text)
         if role == "detail":
             return detail_complete(text, self._outline_point_count(context, draft=False))
@@ -3383,6 +3490,84 @@ class Pipeline:
                 f"本批正文识别为空或过短（{len(prose)} 字，可能是拒答或只输出了说明）。"
                 "可点「拒答重试」重新生成本批。")
         return prose, state, None
+
+    @classmethod
+    def parse_rewrite_batch(cls, text: str, info_out: dict | None = None):
+        """解析文风改写执行批输出 → (本批成稿, 改写批包, err)。
+
+        与 parse_batch_prose 同骨架（切分→正文清洗），包标记换【改写批包】、
+        字段行换 范围与病灶处理/配额消耗/末句摘录/跨批登记。批包原文不清洗
+        （下一批注入的就是模型自己写的原文）。不剥【块N】标记——改写稿是
+        成品正文，模型按协议不该输出块标记，残留清洗链已覆盖伪标签。
+        """
+        text = (text or "").strip()
+        if not text:
+            return "", "", "输出为空"
+        body = strip_model_output(text, detect_no_body=True)[0]
+        prose, pkg, err = _parse_batch_prose(
+            body, info_out, marker="【改写批包】", field_re=_REWRITE_PKG_FIELD_RE)
+        if err:
+            return "", pkg, err
+        prose = strip_prose_residue(strip_prose_preamble(prose))
+        if _looks_json(prose):
+            return "", pkg, "识别到 JSON 输出而不是正文，请重试"
+        if len(prose) < cls._BATCH_PROSE_MIN:
+            return "", pkg, (
+                f"本批成稿识别为空或过短（{len(prose)} 字，可能是拒答或只输出了说明）。"
+                "可点「拒答重试」重新生成本批。")
+        return prose, pkg, None
+
+    # ---------- 文风改写·差量替换（2026-10-06） ----------
+    # 整章模式的输出不是重抄全文，而是「只列病灶段的替换条目」：模型扫完
+    # 初稿后，只回传「P段号：改写后的整段」，没有病灶的段落一字不提，由
+    # 程序原样保留。省输出 token（病灶通常只占两三成）、按次计费渠道只花
+    # 一次调用的钱，而且保留段物理上不经过模型，杜绝「重抄全文顺手改坏」。
+
+    # 条目头行：P8：xxx / 8：xxx / 8，xxx / 8. xxx / 第8段：xxx。
+    # 「第N章：标题」行不会被误认——(?:第)?(\d+) 后若跟「章」则段?吃不到、
+    # 分隔符对不上，整行不匹配（标题行随后被当噪声忽略）。
+    _REWRITE_DIFF_ENTRY_RE = re.compile(
+        r"^\s*(?:P\s*(\d{1,4})|(?:第)?\s*(\d{1,4})\s*段?)\s*[:：.、，,]\s*(.*)$",
+        re.IGNORECASE)
+    # 「全章无病灶」的约定输出（模板要求带句号，末尾标点启发式才不会误判中断）
+    _REWRITE_DIFF_NONE_RE = re.compile(r"^\s*无病灶[。.\s]*$")
+
+    @classmethod
+    def parse_style_rewrite_diff(cls, text: str,
+                                 info_out: dict | None = None) -> dict[int, str]:
+        """解析差量替换输出 → {段号: 改写后的整段}（空 dict = 无病灶或无条目）。
+
+        条目 = 条目头行 + 其后的续行（改写段落可能折行）；条目间空行可有可无。
+        info_out 写入 {"none_declared": 是否声明无病灶, "noise_lines": 被忽略的行数}
+        供调用方提示。重复段号取后值（模型修正前文时以后一条为准）。
+        """
+        info = info_out if info_out is not None else {}
+        info["none_declared"] = False
+        info["noise_lines"] = 0
+        repl: dict[int, str] = {}
+        cur_no = 0
+        cur_lines: list[str] = []
+        for ln in (text or "").replace("\r\n", "\n").split("\n"):
+            s = ln.strip()
+            m = cls._REWRITE_DIFF_ENTRY_RE.match(s)
+            if m:
+                if cur_no:
+                    repl[cur_no] = "\n".join(cur_lines).strip()
+                cur_no = int(m.group(1) or m.group(2))
+                cur_lines = [m.group(3)]
+                continue
+            if cls._REWRITE_DIFF_NONE_RE.match(s):
+                info["none_declared"] = True
+                continue
+            if not s:
+                continue
+            if cur_no:
+                cur_lines.append(s)      # 条目续行（改写段落折行）
+            else:
+                info["noise_lines"] += 1  # 条目开始前的标题行/引导行：忽略
+        if cur_no:
+            repl[cur_no] = "\n".join(cur_lines).strip()
+        return {no: body for no, body in repl.items() if body}
 
     # ---------- 多章正文：手动导入批量入库（2026-09-16） ----------
 

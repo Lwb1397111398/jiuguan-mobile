@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # 新模型档案的默认上下文长度。写小说需要尽量长的上下文（多章记忆、前文注入），
 # 所以默认给到 100 万 token；若服务方模型实际上限更低、报"上下文超限"错误，
@@ -129,6 +129,24 @@ CREATE TABLE IF NOT EXISTS prose_batches (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prose_batches_chapter ON prose_batches(chapter_id, order_index);
+
+-- 文风改写（2026-10-06，流水线第 6 环）：整章文风改写的批次工作区。
+-- 分批模式下每批 = 一段连续自然段 + 一次 AI 调用；改写批包（模型输出在
+-- content 标签外）原样保存、注入下一批。全部批完成后合并经预览确认替换
+-- 编辑器正文，本表只作改写过程底稿与中断续跑依据，不参与导出/记忆。
+CREATE TABLE IF NOT EXISTS rewrite_batches (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  chapter_id    INTEGER NOT NULL,
+  order_index   INTEGER NOT NULL,            -- 第几批（1-based，连续）
+  para_start    INTEGER NOT NULL DEFAULT 0,  -- 本批起始自然段号（初稿编号，含）
+  para_end      INTEGER NOT NULL DEFAULT 0,  -- 本批结束自然段号（含）
+  content       TEXT NOT NULL DEFAULT '',    -- 本批成稿
+  batch_package TEXT NOT NULL DEFAULT '',    -- 本批改写批包原文（注入下一批）
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rewrite_batches_chapter ON rewrite_batches(chapter_id, order_index);
 
 -- 本章动态：每块正文确认后提取的块级状态变化，注入后续所有块
 CREATE TABLE IF NOT EXISTS chapter_notes (
@@ -346,6 +364,21 @@ MIGRATIONS = [
           updated_at    TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_prose_batches_chapter ON prose_batches(chapter_id, order_index);
+    """),
+    # v17（2026-10-06）：文风改写 rewrite_batches 表（同 v16 幂等模式）。
+    (17, """
+        CREATE TABLE IF NOT EXISTS rewrite_batches (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          chapter_id    INTEGER NOT NULL,
+          order_index   INTEGER NOT NULL,
+          para_start    INTEGER NOT NULL DEFAULT 0,
+          para_end      INTEGER NOT NULL DEFAULT 0,
+          content       TEXT NOT NULL DEFAULT '',
+          batch_package TEXT NOT NULL DEFAULT '',
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rewrite_batches_chapter ON rewrite_batches(chapter_id, order_index);
     """),
 ]
 

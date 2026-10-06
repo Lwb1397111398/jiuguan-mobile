@@ -1425,6 +1425,92 @@ class ProjectStore(QObject):
                 return sp
         return ""
 
+    # ---------- 文风改写（rewrite_batches：批次工作区 + 扫描报告，2026-10-06） ----------
+    # 与正文分批同构：批次持久化支持中断续跑；扫描报告（含分批方案）以正文指纹
+    # 存取，正文变了旧报告自动作废。
+
+    def list_rewrite_batches(self, chapter_id: int) -> list[dict]:
+        """本章改写批次（按批序旧→新）。"""
+        return self._rows("SELECT * FROM rewrite_batches WHERE chapter_id=?"
+                          " ORDER BY order_index", (chapter_id,))
+
+    def add_rewrite_batch(self, chapter_id: int, order_index: int,
+                          para_start: int, para_end: int,
+                          content: str, batch_package: str = "") -> dict:
+        """登记一批改写成稿。同章同批号已存在 → 覆盖（重试即替换）。"""
+        content = content or ""
+        batch_package = batch_package or ""
+        existing = self._one("SELECT id FROM rewrite_batches WHERE chapter_id=? AND order_index=?",
+                             (chapter_id, order_index))
+        now = db.now()
+        if existing:
+            self._exec("UPDATE rewrite_batches SET para_start=?, para_end=?, content=?,"
+                       " batch_package=?, updated_at=? WHERE id=?",
+                       (int(para_start), int(para_end), content, batch_package,
+                        now, existing["id"]))
+        else:
+            self._exec("INSERT INTO rewrite_batches(chapter_id,order_index,para_start,"
+                       "para_end,content,batch_package,created_at,updated_at)"
+                       " VALUES(?,?,?,?,?,?,?,?)",
+                       (chapter_id, order_index, int(para_start), int(para_end),
+                        content, batch_package, now, now))
+        row = self._one("SELECT * FROM rewrite_batches WHERE chapter_id=? AND order_index=?",
+                        (chapter_id, order_index))
+        return row
+
+    def clear_rewrite_batches(self, chapter_id: int):
+        """清空本章全部改写批次（重新开始改写）。已替换的正文不受影响。"""
+        self._exec("DELETE FROM rewrite_batches WHERE chapter_id=?", (chapter_id,))
+
+    def truncate_rewrite_batches(self, chapter_id: int, from_index: int):
+        """从第 from_index 批起作废（该批及其后全部重来）。"""
+        self._exec("DELETE FROM rewrite_batches WHERE chapter_id=? AND order_index>=?",
+                   (chapter_id, int(from_index)))
+
+    def rewrite_batch_merged(self, chapter_id: int) -> str:
+        """全部改写批次按序拼接成整章改写稿（空串 = 一批都还没写）。"""
+        rows = self.list_rewrite_batches(chapter_id)
+        return "\n\n".join((r.get("content") or "").strip()
+                           for r in rows if (r.get("content") or "").strip())
+
+    def rewrite_batch_state_package(self, chapter_id: int) -> str:
+        """最新一批的改写批包（注入下一批；无批次或全空返回空串）。"""
+        rows = self.list_rewrite_batches(chapter_id)
+        for r in reversed(rows):
+            sp = (r.get("batch_package") or "").strip()
+            if sp:
+                return sp
+        return ""
+
+    # 扫描报告的存取键（settings 表 KV）；value 为 JSON {report, fingerprint, created_at}
+    _REWRITE_SCAN_KEY = "style_rewrite_scan_{chapter_id}"
+
+    @staticmethod
+    def rewrite_fingerprint(text: str) -> str:
+        """正文指纹：初稿有任何变化（重新生成/手工编辑）旧扫描报告即作废。"""
+        import hashlib
+        return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+    def get_rewrite_scan(self, chapter_id: int) -> dict | None:
+        raw = self.get_setting(self._REWRITE_SCAN_KEY.format(chapter_id=chapter_id), "")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) and data.get("report") else None
+        except Exception:
+            return None
+
+    def set_rewrite_scan(self, chapter_id: int, report: str, fingerprint: str):
+        """保存全章扫描报告（连同初稿指纹）。同章旧报告直接覆盖。"""
+        self.set_setting(self._REWRITE_SCAN_KEY.format(chapter_id=chapter_id),
+                         json.dumps({"report": report or "",
+                                     "fingerprint": fingerprint or "",
+                                     "created_at": db.now()}, ensure_ascii=False))
+
+    def clear_rewrite_scan(self, chapter_id: int):
+        self.set_setting(self._REWRITE_SCAN_KEY.format(chapter_id=chapter_id), "")
+
     def save_text_block_draft(self, block_id: int, content: str):
         """保存草稿（不产生快照，可反复改）。"""
         self._exec("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?", (content, db.now(), block_id))

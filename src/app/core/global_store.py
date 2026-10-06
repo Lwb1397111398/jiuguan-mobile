@@ -800,6 +800,20 @@ class GlobalStore:
             if changed:
                 self._save_seeded("seeded_cards", seeded_cards)
 
+        # 文风改写档案继承（一次性，2026-10-06）：prose_rewrite 在老库里多半
+        # 已被补种过但档案是空的——开箱即用要求它默认跟随「正文」的绑定。
+        # 只有正文已绑档案时才继承并落标记；正文未绑（新装分阶段配置）不落
+        # 标记，等正文绑上后下次启动仍可继承。标记落定后用户改绑/解绑永不干预。
+        if not self.get_meta("prose_rewrite_profile_inherited", ""):
+            ref = self._one("SELECT profile_id FROM task_routes"
+                            " WHERE role='prose' AND profile_id IS NOT NULL")
+            if ref is not None:
+                self._exec("UPDATE task_routes SET profile_id=?"
+                           " WHERE role='prose_rewrite'"
+                           " AND (profile_id IS NULL OR profile_id=0)",
+                           (ref["profile_id"],))
+                self.set_meta("prose_rewrite_profile_inherited", "1")
+
         self._patch_stale_prior_sentence()
 
     def _patch_stale_prior_sentence(self) -> None:
