@@ -187,6 +187,15 @@ def _think_head_end(text: str, head_match) -> int | None:
         for m in _BRACKET_HEAD_RE.finditer(text, start):
             cands.append(m.start())
             break
+        # 裸章标题行（2026-10-07）：模型漏写「正式输出」锚点时，思考段与正文之间
+        # 常只有一行『第N章：名』；而【自由思考】这类标记可能与内容挤在同一行，
+        # 下一个独立成行的【…】标记会一直退到正文中段（『【本章声口总表】』）——
+        # 截到那里会把章标题连带剥进思考段，正文从此没有标题可认
+        # （实测《校霸》outline log25：整份大纲识别失败，5625 output tokens 白烧）。
+        # 章节名行是正文起点的强信号，与【…】标记取更早者。
+        m_ch = _CHAPTER_TITLE_LINE_M_RE.search(text, start)
+        if m_ch:
+            cands.append(m_ch.start())
     if not cands:
         return None
     end = min(cands)
@@ -506,6 +515,9 @@ _TAG_ONLY_LINE_RE = re.compile(r"^\s*(?:<[^<>\n]{1,80}>\s*)+$", re.M)
 _CHAPTER_TITLE_LINE_RE = re.compile(
     r"^[ \t]{0,3}(?![#])[*＊]{0,2}[ \t]*"
     r"第[0-9〇零一二两三四五六七八九十百千万]+[章回](?![\u4e00-\u9fff])")
+# 同款多行版（strip_think_sections 的截断边界扫描在整篇文本上找章节名行；
+# 上面那份只配 _is_chapter_title_line 的逐行调用，^ 不跨行）
+_CHAPTER_TITLE_LINE_M_RE = re.compile(_CHAPTER_TITLE_LINE_RE.pattern, re.M)
 
 # 对话/引语开头的下一行（冒号引导行若紧跟引语，是正常行文，不能剥）
 _QUOTE_START_RE = re.compile(r"[「『\"“'‘〔〖（(]")

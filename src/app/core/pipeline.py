@@ -3065,6 +3065,13 @@ class Pipeline:
             return [], "输出为空"
         secs = _md_split(text, _MD_H1_RE)
         if secs:
+            # H1 总纲框架段（2026-10-07 校霸项目实测）：『# 整体层』『# 分卷纲要』这类
+            # H1 是**一份总纲的内部章节**，不是候选方案分隔——按候选拆会把 # 分卷纲要
+            # 段当噪声（卷级容器词表）整段丢掉，整体层/伏笔台账/资产清单拆成碎片候选，
+            # 老板任选一份都丢了分卷，锁定时永远「识别不到分卷」。命中 → 整篇当一份候选，
+            # 分卷由 parse_synopsis_volumes 的裸行兜底（认 ## 分卷N 标题行）切出。
+            if any(t.strip().startswith(("整体层", "分卷纲要")) for t, _ in secs):
+                return [{"title": "总纲", "content": text}], None
             for title, body in secs[:limit]:
                 if not body.strip():
                     continue

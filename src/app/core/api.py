@@ -122,6 +122,14 @@ def mask_key(key: str) -> str:
 class LLMClient:
     """单个模型档案的调用客户端（无状态，每次调用新建或复用均可）。"""
 
+    # 思考去重认定的最小重复长度（2026-10-07）：低于该长度的重复一律不剥。
+    # 实测 GLM-5.3 长思考（3~6 万 tokens）的正常增量里，短片段与已累积文本
+    # 「巧合重复」极常见（高频词如「生死状」「我们」「应该」），旧逻辑 b in a
+    # 无长度门槛、首尾重叠 1 字就剥——正常流被静默吃字，长思考吃掉成百上千
+    # 字，剩下的低频碎片拼出来就是「乱七八糟的字」。宁可放过病态渠道的小片
+    # 重发（重复但内容全、可读），也不能吞正常渠道的内容。
+    _MERGE_REPEAT_MIN = 6
+
     def __init__(self, profile: dict):
         self.profile = profile or {}
         self.base_url = (self.profile.get("base_url") or "").strip().rstrip("/")
@@ -251,23 +259,27 @@ class LLMClient:
         部分渠道会把同一段思考同时放在结构化 content 块和顶层
         reasoning_content/thinking 字段，两处取一份即可。
 
-        流式增量场景（思考吐得快时每片只有几十字）：同一段思考会被渠道重发成
-        「尾部与下一片头部重叠」的小片（如 "好的" → "好的用户" → "的用户要求"）。
-        整段包含判断（b in a）对这种重叠分片失效——两片互不包含会被直接拼两遍，
-        界面上就是「的地方的地方」「1. 拍 1. 拍」。故在整段判断之后追加
-        尾部重叠剥离：找 a 尾与 b 头的最长公共子串，命中 k 字则只拼 b[k:]。
-        窗口上限 64 字（足够覆盖渠道重发片段，又不会把正常重复用词误并）。
+        流式增量场景：病态渠道会把同一段思考重发成「尾部与下一片头部重叠」的
+        小片（如 "好的" → "好的用户" → "的用户要求"），不去重就是整段翻倍。
+        但正常渠道（OpenAI 兼容/GLM/Anthropic 官方流）的增量是零重叠干净衔接的，
+        自然语言里「新片开头恰好等于已累积尾部/已出现短语」的巧合极多——
+        去重判据必须够大才不误伤（2026-10-07 实测：GLM-5.3 三万字长思考被
+        旧逻辑吃掉成百上千字，剩下的低频碎片拼出来就是乱码）。因此完全包含
+        与首尾重叠都只认 ≥6 字的重复，小片巧合重复一律放行（重复可读、
+        内容全 > 静默吃字）。窗口上限 64 字。
         """
         if not a:
             return b
         if not b:
             return a
-        if b in a:
+        if a == b:
+            return a
+        if len(b) >= LLMClient._MERGE_REPEAT_MIN and b in a:
             return a
         if a in b:
             return b
         limit = min(len(a), len(b), 64)
-        for n in range(limit, 0, -1):
+        for n in range(limit, LLMClient._MERGE_REPEAT_MIN - 1, -1):
             if a[-n:] == b[:n]:
                 return a + b[n:]
         return a + b

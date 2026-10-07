@@ -5,6 +5,7 @@
 回滚/级联过期逻辑在 ProjectStore（store.rollback_memory / mark_stale_from）。
 """
 import copy
+import sqlite3
 import threading
 
 from .assembler import _format_card
@@ -15,6 +16,20 @@ from .pipeline import Pipeline
 from .store import (ProjectStore, new_character_card, sync_dead_flags, _to_bool_dead,
                     detect_deaths_in_prose)
 from .task_templates import render as render_task
+
+
+def _is_closed_db_error(e: Exception) -> bool:
+    """后台线程撞上「库已关闭」（归档后切项目/回首页的竞态）→ 属正常放弃而非失败：
+    向量会在下次归档或「记忆」页重建时补齐，不登记诊断提醒。"""
+    return isinstance(e, sqlite3.ProgrammingError) or "closed database" in str(e)
+
+
+def _project_tag(store) -> str:
+    """当前项目名（诊断提醒按项目过滤显示用）；取不到留空=不过滤。"""
+    try:
+        return (store.title or "").strip()
+    except Exception:
+        return ""
 
 # 字段名归一化（模型输出五花八门 → 状态卡标准字段）
 FIELD_ALIASES = {
@@ -773,16 +788,17 @@ class MemoryService:
         try:
             from .diagnostics import clear_issue, record_issue
             from .store import lore_import_from_memory, lore_import_preview
+            project = _project_tag(self.store)
             if self.store.get_setting_int("auto_lore_import", 1):
                 imported = lore_import_from_memory(self.store)
                 if imported:
-                    clear_issue("lore_sync")
+                    clear_issue("lore_sync", project=project)
                 else:
-                    clear_issue("lore_sync")  # 无缺失也清除旧提醒（防御残留）
+                    clear_issue("lore_sync", project=project)  # 无缺失也清除旧提醒（防御残留）
             else:
                 missing = lore_import_preview(self.store)
                 if not missing:
-                    clear_issue("lore_sync")
+                    clear_issue("lore_sync", project=project)
                     return
                 names = "、".join(n for _c, n, _x in missing[:6]) + \
                     ("…" if len(missing) > 6 else "")
@@ -791,7 +807,8 @@ class MemoryService:
                              f"记忆里有 {len(missing)} 个对象还没有设定条目：{names}",
                              hint="设定卡会随状态卡一起注入，人设更完整；"
                                   "可到「设定资料库」页点「从记忆导入全部」补齐，"
-                                  "或到设置开启「归档后自动导入设定库」。")
+                                  "或到设置开启「归档后自动导入设定库」。",
+                             project=project)
         except Exception:
             pass  # 覆盖检查是锦上添花，任何异常不阻塞归档
 
@@ -804,6 +821,7 @@ class MemoryService:
         走的就是这条路，避免同章快照堆叠与状态叠加。
         返回 {ok, version, error, replaced}；有误时用户通过记忆页回滚/重置处理。
         """
+        project = _project_tag(self.store)
         if re_archive is None:
             re_archive = self.store.has_memory_snapshot(chapter_id)
         base = self.store.memory_state_before_chapter(chapter_id) if re_archive else None
@@ -813,7 +831,8 @@ class MemoryService:
             record_issue("auto_archive",
                          "自动归档失败",
                          f"第{ch.get('order_index', '?')}章：{r.get('error', '提取失败')}"[:400],
-                         hint="可在「记忆」页手动归档该章；成功归档后本提醒自动消失。")
+                         hint="可在「记忆」页手动归档该章；成功归档后本提醒自动消失。",
+                         project=project)
             return {"ok": False, "error": r.get("error", "提取失败")}
         diff = r["diff"]
         # default_off（程序备用检测项）不自动采纳：没有人工核对，宁可不标死
@@ -827,9 +846,10 @@ class MemoryService:
             record_issue("auto_archive",
                          "自动归档失败",
                          f"第{chapter_id}章写入失败：{e}"[:400],
-                         hint="可在「记忆」页手动归档该章；成功归档后本提醒自动消失。")
+                         hint="可在「记忆」页手动归档该章；成功归档后本提醒自动消失。",
+                         project=project)
             return {"ok": False, "error": f"归档写入失败：{e}"}
-        clear_issue("auto_archive")  # 本次归档成功：消除「自动归档失败」提醒
+        clear_issue("auto_archive", project=project)  # 本次归档成功：消除本项目「自动归档失败」提醒
         return {"ok": True, "version": version, "error": "", "replaced": bool(re_archive)}
 
     # ---------- 记忆向量（语义检索索引） ----------
@@ -837,14 +857,21 @@ class MemoryService:
     def index_vectors_async(self, snapshot_version: int, full_state: dict,
                             events: list | None = None):
         """归档后异步生成记忆向量（失败静默不阻塞归档，但登记诊断提醒；未配置嵌入则跳过）。"""
+        project = _project_tag(self.store)
+
         def worker():
+            if getattr(self.store, "is_closed", False):
+                return  # 项目已关闭/已切换：放弃本次，下次归档或手动重建会补
             try:
                 self._index_vectors(snapshot_version, full_state, events)
             except Exception as e:
+                if _is_closed_db_error(e):
+                    return  # 建索引途中项目被关掉：切换竞态属正常退出，不算失败
                 record_issue("vector_index",
                              "记忆向量索引生成失败",
                              f"版本 v{snapshot_version}：{e}"[:400],
-                             hint="下次归档会自动重试；也可以到「记忆」页点「重建语义向量」。")
+                             hint="下次归档会自动重试；也可以到「记忆」页点「重建语义向量」。",
+                             project=project)
         threading.Thread(target=worker, daemon=True).start()
 
     def _index_vectors(self, snapshot_version: int, full_state: dict,
@@ -862,7 +889,7 @@ class MemoryService:
         for u, v in zip(units, vecs):
             u["vector"] = v
         self.store.save_memory_vectors(snapshot_version, units)
-        clear_issue("vector_index")  # 索引成功：消除「向量索引生成失败」提醒
+        clear_issue("vector_index", project=_project_tag(self.store))  # 索引成功：消除本项目的失败提醒
 
     # ---------- 级联重归档 ----------
 
@@ -931,15 +958,22 @@ class MemoryService:
 
     def _index_vectors_serial(self, pending: list):
         """串行为多份快照建向量（单个后台线程顺序处理，防并发嵌入请求限流）。"""
+        project = _project_tag(self.store)
+
         def worker():
             for item in pending:
                 version, full_state = item[0], item[1]
                 events = item[2] if len(item) > 2 else []
+                if getattr(self.store, "is_closed", False):
+                    return  # 项目已关闭：剩余队列全部放弃（重归档后手动重建可补）
                 try:
                     self._index_vectors(version, full_state, events)
                 except Exception as e:
+                    if _is_closed_db_error(e):
+                        return  # 建索引途中项目被关掉：切换竞态属正常退出，不算失败
                     record_issue("vector_index",
                                  "记忆向量索引生成失败",
                                  f"版本 v{version}：{e}"[:400],
-                                 hint="下次归档会自动重试；也可以到「记忆」页重建全部向量。")
+                                 hint="下次归档会自动重试；也可以到「记忆」页重建全部向量。",
+                                 project=project)
         threading.Thread(target=worker, daemon=True).start()

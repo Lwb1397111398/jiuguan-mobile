@@ -313,6 +313,7 @@ class ProjectStore(QObject):
         self.db_path = os.path.join(self.folder, "project.db")
         self.conn = db.connect(self.db_path)
         self._lock = threading.RLock()  # 连接锁：UI 线程 + AI 工作线程共用
+        self._closed = False  # close() 后置位：后台线程（建向量等）据此放弃，不撞已关连接
         # 补齐新库缺失的分卷索引（旧库迁移已有、幂等安全）
         self._exec("CREATE INDEX IF NOT EXISTS idx_chapters_volume ON chapters(volume_id)")
         # 全局配置（模型/路由/偏好/预设）统一放在 GlobalStore，跨项目共享
@@ -2482,7 +2483,12 @@ class ProjectStore(QObject):
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return dest
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def close(self):
+        self._closed = True  # 先立旗再关连接：并发线程看到旗标即放弃，不报「库已关闭」
         try:
             with self._lock:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

@@ -24,6 +24,10 @@ import threading
 from datetime import datetime
 
 _PREFIX = "diagnostic_issue_"
+_MIGRATE_FLAG = "diagnostic_scoping_v1"
+# 项目级事件提醒（由某个项目的动作触发）会带 project 标签，只在该项目打开时显示；
+# embed_call / embed_partial 属全局配置健康，不带标签、所有项目都显示。
+_PROJECT_KEYS = ("vector_index", "auto_archive", "lore_sync")
 _lock = threading.Lock()
 
 # 严重级别 → 提醒栏展示（severity 越小越靠前）
@@ -62,8 +66,12 @@ def _decode(raw: str) -> dict | None:
 
 
 def record_issue(key: str, title: str, detail: str = "",
-                 severity: str = "warn", hint: str = ""):
-    """登记（或刷新）一条问题。同 key 重复发生只更新时间/次数/最新详情。"""
+                 severity: str = "warn", hint: str = "", project: str = ""):
+    """登记（或刷新）一条问题。同 key 重复发生只更新时间/次数/最新详情。
+
+    project：项目名（store.title）。项目级事件提醒（如某项目的向量索引失败）
+    必须带标签，否则会在所有项目里误显示；全局配置问题（嵌入接口等）留空。
+    """
     try:
         with _lock:
             conn = _conn()
@@ -76,6 +84,7 @@ def record_issue(key: str, title: str, detail: str = "",
                     "detail": (detail or "")[:400],
                     "severity": severity if severity in SEVERITY_ORDER else "warn",
                     "hint": (hint or "")[:300],
+                    "project": (project or "").strip(),
                     "first_seen": (prev or {}).get("first_seen") or _now(),
                     "last_seen": _now(),
                     "count": int((prev or {}).get("count", 0)) + 1,
@@ -91,13 +100,24 @@ def record_issue(key: str, title: str, detail: str = "",
         pass  # 诊断记录绝不影响主流程
 
 
-def clear_issue(key: str):
-    """问题已自愈（该处调用成功），删除对应提醒。"""
+def clear_issue(key: str, project: str = ""):
+    """问题已自愈（该处调用成功），删除对应提醒。
+
+    project 传项目名时只删该项目自己的记录（防止 A 项目的提醒被 B 项目的成功清掉）；
+    留空则整条删除（全局键 embed_call 等不带项目，沿用原行为）。
+    """
     try:
         with _lock:
             conn = _conn()
             try:
-                conn.execute("DELETE FROM meta WHERE key=?", (_PREFIX + key,))
+                if not (project or "").strip():
+                    conn.execute("DELETE FROM meta WHERE key=?", (_PREFIX + key,))
+                else:
+                    row = conn.execute("SELECT value FROM meta WHERE key=?",
+                                       (_PREFIX + key,)).fetchone()
+                    obj = _decode(row["value"]) if row else None
+                    if obj is not None and (obj.get("project") or "").strip() == project.strip():
+                        conn.execute("DELETE FROM meta WHERE key=?", (_PREFIX + key,))
                 conn.commit()
             finally:
                 conn.close()
@@ -155,14 +175,65 @@ def check_embed_partial(store) -> dict | None:
     }
 
 
+# ---------- 项目过滤（项目级事件提醒只在其项目打开时显示） ----------
+
+def _migrate_legacy_project_issues():
+    """一次性迁移（带 meta 旗标，幂等）：项目级事件键的旧记录没有 project 标签，
+    会在所有项目（包括新建的空项目）里误显示——正是老板遇到的
+    「新项目一打开就提示记忆向量索引生成失败」。清掉这些无主旧记录，
+    相关功能下次触发会带项目标签重新登记，不存在信息永久丢失。
+
+    只在桌面启动时调用一次（main.py）：绝不挂在 collect_issues 等读取路径上——
+    那会把升级后新写入的无标签记录（测试/移动端直写）一并吃掉（2026-10-08 教训）。"""
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                done = conn.execute("SELECT value FROM meta WHERE key=?",
+                                    (_MIGRATE_FLAG,)).fetchone()
+                if done:
+                    return
+                for key in _PROJECT_KEYS:
+                    row = conn.execute("SELECT value FROM meta WHERE key=?",
+                                       (_PREFIX + key,)).fetchone()
+                    if row:
+                        obj = _decode(row["value"])
+                        if obj is not None and not (obj.get("project") or "").strip():
+                            conn.execute("DELETE FROM meta WHERE key=?", (_PREFIX + key,))
+                conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                             (_MIGRATE_FLAG, _now()))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass  # 迁移绝不阻塞主流程
+
+
 def collect_issues(store=None) -> list[dict]:
-    """提醒栏数据源：已登记的事件问题 + 本地即时检查项（按 key 去重）。"""
+    """提醒栏数据源：已登记的事件问题 + 本地即时检查项（按 key 去重）。纯读取，无副作用。
+
+    项目过滤：带 project 标签的问题只在标签项目打开时显示（store 为 None 的
+    首页/未打开项目状态下一律隐藏）；不带标签的全局问题照旧全项目显示。
+    """
     issues = {i["key"]: i for i in list_issues()}
+    cur_title = ""
+    if store is not None:
+        try:
+            cur_title = (store.title or "").strip()
+        except Exception:
+            cur_title = ""
+    visible = {}
+    for key, item in issues.items():
+        proj = (item.get("project") or "").strip()
+        if proj and proj != cur_title:
+            continue  # 别的项目的问题：当前项目不显示
+        visible[key] = item
     if store is not None:
         local = check_embed_partial(store)
-        if local and local["key"] not in issues:
-            issues[local["key"]] = local
-    return sorted(issues.values(),
+        if local and local["key"] not in visible:
+            visible[local["key"]] = local
+    return sorted(visible.values(),
                   key=lambda x: (SEVERITY_ORDER.get(x.get("severity"), 1),
                                  str(x.get("last_seen", "")), x.get("key", "")))
 
@@ -170,11 +241,12 @@ def collect_issues(store=None) -> list[dict]:
 # ---- 供测试/工具用 ----
 
 def _reset_all():
-    """清空全部诊断记录（仅测试用）。"""
+    """清空全部诊断记录（仅测试用），含迁移旗标——让每条测试从干净状态开始。"""
     try:
         conn = _conn()
         try:
             conn.execute("DELETE FROM meta WHERE key LIKE ?", (_PREFIX + "%",))
+            conn.execute("DELETE FROM meta WHERE key = ?", (_MIGRATE_FLAG,))
             conn.commit()
         finally:
             conn.close()
