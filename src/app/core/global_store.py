@@ -68,13 +68,10 @@ GLOBAL_SETTING_DEFAULTS = {
     "draft_checklist_outline": "",       # 草稿自检：大纲自定义自检清单
     "draft_checklist_detail": "",        # 草稿自检：细纲自定义自检清单
     "draft_checklist_prose": "",         # 草稿自检：正文自定义自检清单
-    # ---------- 统一改写（2026-09-02）----------
-    # 注入模块白名单（逗号分隔 kind）：改写请求按此注入上下文，其余不发。
+    # ---------- 改写注入白名单（checker 修复链路用；2026-10-07 旧「改写设置」弹窗已删）----------
+    # 注入模块白名单（逗号分隔 kind）：rewrite 角色请求按此注入上下文，其余不发。
     # 默认 = 旧版 rewrite 固定注入的四模块 + 全局/阶段偏好。
     "rewrite_modules": "cognition,cards,entities,rumors,prefs_global,prefs_stage",
-    "rewrite_default_req": "",           # 默认改写要求（未另行输入时使用；空=通用润色指令兜底）
-    "rewrite_presets": "",               # 常用改写要求（每行一条，改写弹窗一键填入）
-    "rewrite_ask_req": "1",              # 改写前弹窗询问要求：1=询问（可临时改）/ 0=直接用默认要求
     # ---------- 记忆联动（2026-09-08）----------
     "auto_lore_import": "1",             # 归档后自动把记忆新人物/新实体导入设定库（0=只提醒不导入）
     # ---------- 酒馆预设导入（2026-09-10）----------

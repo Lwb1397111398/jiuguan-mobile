@@ -1382,9 +1382,31 @@ def split_shots(shot_script: str) -> list[dict]:
                 # 拍头首段当拍类型（『拍1：转场』无标签写法 / 新模板分隔符已消费的
                 # 『拍1.1（B档）｜铺垫｜…』——括注被拍头正则消费，rest 行首无括注）；
                 # 首段超 12 字多半是句子不是类型，不收
-                head = rest.split("|")[0].split("｜")[0].strip()
-                if head and len(head) <= 12 and "【" not in head:
-                    cur["type"] = head
+                segs = [x.strip() for x in re.split(r"[|｜]", rest) if x.strip()]
+                if segs:
+                    head = segs[0]
+                    if head and len(head) <= 12 and "【" not in head:
+                        cur["type"] = head
+                # 新模板 B 档拍行自带字段（『…｜起：X→止：Y｜焦点：Z｜方向｜约N字』）：
+                # 逐段提取进 anchor/fields/items——这些信息旧逻辑只留在分镜原文里，
+                # 拍树上 B 档就只剩序号+类型+字数（A 档独占块级【锚点】等标签的归属，
+                # 老板 2026-10-07 反馈「B 档只显示序号和多少字」的根因）
+                for k, seg in enumerate(segs[1:], 1):
+                    zs = re.match(r"^起[：:](.+?)→止[：:](.+)$", seg)
+                    if zs:
+                        if not cur["anchor"]:
+                            cur["anchor"] = (f"起于：{zs.group(1).strip()} ｜ "
+                                             f"止于：{zs.group(2).strip()}")
+                    elif seg.startswith(("焦点：", "焦点:")):
+                        cur["fields"].append(("焦点", seg[3:].strip()))
+                    elif (k == 1 and len(seg) <= 20
+                          and not seg.startswith(("起", "止", "焦点", "约", "≈"))):
+                        cur["fields"].append(("节奏", seg))
+                    elif not re.fullmatch(r"[约≈]\s*\d{2,5}\s*字", seg):
+                        # 方向描述段 → items（UI • 行展示）；段尾粘着的『，约N字』剥掉
+                        seg = re.sub(r"[，,]\s*[约≈]\s*\d{2,5}\s*字$", "", seg)
+                        if seg and seg not in cur["items"]:
+                            cur["items"].append(seg)
             # 拍级字数两种写法：独立『字数预算：约N字』行（旧），或拍头内联『…｜约900字』
             # （2026-10-05 新模板，字数在拍行末段）。都结构化进 words，不进 items。
             wm = _SHOT_TAIL_WORDS_RE.match(rest)

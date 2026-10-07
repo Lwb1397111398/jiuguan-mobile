@@ -26,7 +26,8 @@ STAGE_TPL_KEYS = {
     "detail": ["detail", "detail_block"],
     # 一次性主模板 prose_chapter_md；分批模板 prose_batch_first/next 与桌面同步
     "prose": ["prose_chapter_md", "prose_batch_first", "prose_batch_next", "prose"],
-    "rewrite": ["rewrite"],
+    # 2026-10-07 旧 rewrite 模板删除（桌面同步），改写阶段卡指向整章差量模板
+    "rewrite": ["prose_rewrite_whole"],
     "check": ["check", "check_selection"],
     "style": ["style"],
 }

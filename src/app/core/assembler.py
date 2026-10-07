@@ -1797,7 +1797,7 @@ class Assembler:
                                  "check", "style") else ""
         chapter = context.get("chapter")
         block = context.get("block")
-        # 统一改写：注入模块按「改写设置」白名单开关（其他角色不受影响）。
+        # rewrite 角色（checker 修复链路）：注入模块按白名单开关（其他角色不受影响）。
         # 上移至此：语义检索（含唤醒）的注入条件依赖 rw_mods。
         rw_mods = rewrite_modules(store) if role == "rewrite" else None
         # 2.5 语义检索（向量召回）提前到 _split_cast 之前计算：结果两用——
@@ -1851,7 +1851,7 @@ class Assembler:
         # 1.8 置顶偏好：跳出「全局偏好」栏，紧跟破限锚定层注入（几乎最前）。
         # 仍受 stages 白名单限制：只在它生效的阶段置顶。critical=置顶就是要最大
         # 效力，超预算时不裁（要裁也从普通偏好先裁）。
-        # 改写角色受改写设置控制：prefs_global 关闭时全局偏好（含置顶）整体不注入。
+        # rewrite 角色按白名单：prefs_global 关闭时全局偏好（含置顶）整体不注入。
         p_prefs = "" if (rw_mods is not None and "prefs_global" not in rw_mods) \
             else self._pinned_prefs(stage)
         if p_prefs:
@@ -2029,9 +2029,9 @@ class Assembler:
             add("近章前文", "prior", prior, 1)
             add("待审校正文", "prose", context.get("prose", ""), 10, critical=True)
         elif role == "rewrite":
-            # 统一改写（2026-09-02）：不再分模式，注入模块按「改写设置」白名单开关
-            # （rewrite_modules，全局共享）。默认仅旧版四模块；总纲/大纲/细纲/前文等
-            # 按需勾选——改写通常只看局部文本，默认少注入省 token。
+            # rewrite 角色现在只剩 checker 修复链路使用（2026-10-07 界面「改写」按钮
+            # 已并入文风改写协议，设置弹窗删除）。注入模块按白名单（rewrite_modules，
+            # 全局共享，默认值见 global_store）开关；默认少注入省 token。
             if "cognition" in rw_mods:
                 add("认知规则", "cognition", COGNITION_RULES, 5)
             if "cards" in rw_mods:
@@ -2070,8 +2070,8 @@ class Assembler:
             req = context.get("user_req", "")
             add("改写要求", "user", req, 5)
         elif role == "prose_rewrite":
-            # 文风改写（2026-10-06，流水线第 6 环）：整章「去 AI 味」句子层改写，
-            # 与局部润色（role=rewrite，按改写设置白名单注入）分开——本角色注入
+            # 改写（2026-10-06，流水线第 6 环）：整章「去 AI 味」句子层改写，
+            # 与 checker 修复链路（role=rewrite，按白名单注入）分开——本角色注入
             # 固定：编号稿 + 风格样本 + 状态卡 + 细纲对账 + 扫描报告/上批末两段。
             add("认知规则", "cognition", COGNITION_RULES, 3)
             add("人物状态卡", "cards", self._character_cards(cast_full, include_sealed=True,

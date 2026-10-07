@@ -22,8 +22,6 @@ from gen import start_generation
 
 from app.core.assembler import Assembler
 
-# 改写要求兜底（与桌面 `app/ui/writing_desk.py` 的 REQ_FALLBACK 同文案，改一处必须改两处）
-REQ_FALLBACK = "按用户要求改写该段落，保持原意，提升表达质量"
 
 
 def chapter_rule_text(store) -> tuple[str, int | None]:
@@ -964,7 +962,7 @@ class WritingPage:
         gen_row = [
             *([ft.FilledButton("生成整章正文", on_click=self._prose_generate,
                                icon=ft.Icons.EDIT_NOTE)] if whole else []),
-            ft.TextButton("改写", on_click=lambda e: self._rewrite_sheet(ch),
+            ft.TextButton("改写", on_click=lambda e: self._do_style_rewrite(ch),
                           icon=ft.Icons.AUTO_FIX_HIGH),
             ft.TextButton("停止", on_click=self._prose_stop,
                           disabled=self._task is None or self._task.stopped),
@@ -1789,8 +1787,6 @@ class WritingPage:
              "直接粘贴细纲文本入库（只剥不改，跳过 AI）"),
             ("prose", ft.Icons.CONTENT_PASTE_GO_OUTLINED, "粘贴正文…",
              "直接粘贴正文本入库（单章或多章，只剥不改）"),
-            ("rewrite", ft.Icons.TUNE, "改写设置（注入模块）",
-             "选择改写时注入哪些上下文模块"),
         ]
 
         def _go(name, e):
@@ -1805,8 +1801,6 @@ class WritingPage:
                 self._paste_dialog(ch, "detail")
             elif name == "prose":
                 self._paste_dialog(ch, "prose")
-            else:
-                self._rewrite_settings_sheet()
 
         rows = [ft.ListTile(leading=ft.Icon(i), title=ft.Text(t, size=14),
                             subtitle=ft.Text(s, size=11), dense=True,
@@ -2170,9 +2164,13 @@ class WritingPage:
             ], spacing=8), padding=16, height=540),
             show_drag_handle=True))
 
-    # ---------- 改写（role=rewrite，注入模块白名单） ----------
+    # ---------- 改写（整章差量替换协议，role=prose_rewrite） ----------
 
-    def _rewrite_sheet(self, ch: dict):
+    def _do_style_rewrite(self, ch: dict):
+        """整章一次调用：AI 只回传病灶段条目（P段号：改后的段落），
+        程序把条目替换进初稿，其余段落原样保留（不经模型）。
+        只改写法不改事实；结果与原版对比择一，确认后回填编辑器。"""
+        from app.core.style_rewrite import apply_diff, build_whole
         store = self.session.store
         cid = ch["id"]
         ed = getattr(self, "_desk_editor", None)
@@ -2181,49 +2179,7 @@ class WritingPage:
         if not text:
             toast(self.page, "没有可改写的内容", error=True)
             return
-        default_req = (store.get_setting("rewrite_default_req", "") or "").strip()
-        presets = [ln.strip() for ln in
-                   (store.get_setting("rewrite_presets", "") or "").splitlines()
-                   if ln.strip()]
-        ask = (store.get_setting("rewrite_ask_req", "1") or "1") == "1"
-        if not ask:
-            # 设置里关了「每次询问」→ 直接用默认要求执行
-            self._do_rewrite(ch, text, default_req)
-            return
-        field = ft.TextField(label="改写要求", value=default_req, multiline=True,
-                             min_lines=2, max_lines=4,
-                             hint_text="留空则用兜底指令：" + REQ_FALLBACK)
-
-        def _set(v):
-            field.value = v
-            self.page.update()
-
-        def _ok(ev):
-            self.page.pop_dialog()
-            self._do_rewrite(ch, text, (field.value or "").strip())
-
-        def _cancel(ev):
-            self.page.pop_dialog()
-        chips = ft.Row([ft.OutlinedButton(p[:16], on_click=lambda e, p=p: _set(p))
-                        for p in presets[:6]], spacing=4, wrap=True) if presets \
-            else ft.Container(height=0)
-        self.page.show_dialog(ft.AlertDialog(
-            modal=True, title=ft.Text(f"改写（{len(text)} 字）"),
-            content=ft.Container(ft.Column([
-                hint("改写只动文字表达，不改剧情事实；可到「更多 → 改写设置」调整注入模块。"),
-                chips,
-                field,
-            ], tight=True, spacing=8, scroll=ft.ScrollMode.AUTO),
-                width=460, height=340),
-            actions=[ft.TextButton("取消", on_click=_cancel),
-                     ft.FilledButton("开始改写", on_click=_ok)],
-            actions_alignment=ft.MainAxisAlignment.END))
-
-    def _do_rewrite(self, ch: dict, text: str, req: str):
-        from app.core.task_templates import render as render_task
-        store = self.session.store
-        effective = req or REQ_FALLBACK
-        task = render_task("rewrite", store, req=effective)
+        ctx, task = build_whole(store, ch, text)
         close_running = None
 
         def on_started(tk):
@@ -2238,21 +2194,27 @@ class WritingPage:
             if result.get("status") == "stopped":
                 toast(self.page, "已停止")
                 return
-            from app.core.pipeline import strip_prose_preamble
-            from app.core.textclean import strip_prose_residue
-            new_text = strip_prose_residue(
-                strip_prose_preamble(result.get("text") or ""))
-            if not new_text.strip():
-                toast(self.page, "改写结果为空", error=True)
+            from app.core.pipeline import Pipeline
+            info: dict = {}
+            repl = Pipeline.parse_style_rewrite_diff(result.get("text") or "", info)
+            if not repl and not info.get("none_declared"):
+                toast(self.page, "未识别到替换条目（P段号：改写后的段落），输出可能不符合格式",
+                      error=True)
                 return
-            self._apply_diag(result, "rewrite", new_text)
-            self._pick_rewrite_version(ch, text, new_text)
+            merged, applied, skipped = apply_diff(text, repl)
+            if skipped:
+                toast(self.page, "段号 %s 超出本章范围，已忽略"
+                      % "、".join(str(s) for s in skipped))
+            if not applied:
+                toast(self.page, "AI 判定全章无病灶，无需改写"
+                      if info.get("none_declared") else "没有可落地的替换条目")
+                return
+            self._apply_diag(result, "prose_rewrite", merged)
+            self._pick_rewrite_version(ch, text, merged)
 
-        start_generation(self.page, self.session, role="rewrite",
-                         context={"chapter": ch, "rewrite_text": text,
-                                  "character_names": ch.get("characters") or [],
-                                  "user_req": effective},
-                         task=task, title="改写", on_done=on_done,
+        start_generation(self.page, self.session, role="prose_rewrite",
+                         context=ctx, task=task,
+                         title=f"改写（整章 {len(text)} 字）", on_done=on_done,
                          on_started=on_started)
 
     def _pick_rewrite_version(self, ch: dict, old: str, new: str):
@@ -2299,38 +2261,3 @@ class WritingPage:
         toast(self.page, f"改写完成（{len(text)} 字），检查后点「接受本章」落库")
         self.refresh()
 
-    def _rewrite_settings_sheet(self):
-        from app.core.assembler import (REWRITE_DEFAULT_MODULES, REWRITE_MODULES,
-                                        rewrite_modules)
-        store = self.session.store
-        cur = rewrite_modules(store)
-        boxes: dict = {}
-        rows = []
-        for kind, label in REWRITE_MODULES.items():
-            cb = ft.Checkbox(label=label, value=(kind in cur))
-            boxes[kind] = cb
-            rows.append(cb)
-
-        def _save(ev):
-            picked = [k for k, cb in boxes.items() if cb.value]
-            store.set_setting("rewrite_modules", ",".join(picked))
-            self.page.pop_dialog()
-            toast(self.page, f"已保存（注入 {len(picked)} 个模块）" if picked
-                  else "已保存：改写时不注入可选模块")
-
-        def _reset(ev):
-            keep = set(REWRITE_DEFAULT_MODULES.split(","))
-            for k, cb in boxes.items():
-                cb.value = k in keep
-            self.page.update()
-        self.page.show_dialog(ft.BottomSheet(
-            content=ft.Container(ft.Column([
-                ft.Text("改写注入模块", size=16, weight=ft.FontWeight.BOLD),
-                hint("勾选的模块会在改写时作为上下文注入。待改写文本、改写要求、系统身份、"
-                     "破甲、锁定项始终注入，不在此列表。"),
-                ft.Column(rows, scroll=ft.ScrollMode.AUTO, height=420),
-                ft.Row([ft.TextButton("恢复默认", on_click=_reset),
-                        ft.FilledButton("保存", on_click=_save)],
-                       alignment=ft.MainAxisAlignment.END, spacing=8),
-            ], spacing=8), padding=16, height=580),
-            show_drag_handle=True))
