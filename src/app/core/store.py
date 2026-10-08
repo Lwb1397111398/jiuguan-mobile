@@ -1431,19 +1431,32 @@ class ProjectStore(QObject):
         self._exec("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?", (content, db.now(), block_id))
 
     def accept_text_block(self, block_id: int, content: str):
-        """接受正文：旧版自动存快照，version+1，状态→已接受（事务：读旧版+存快照+推进版本原子）。"""
+        """接受正文：旧版自动存快照，version+1，状态→已接受（事务：读旧版+存快照+推进版本原子）。
+
+        幂等（2026-10-08 修复）：内容与当前版完全一致时不存快照、不升版本号——
+        分批「合并批次写入正文」重复点、写作台重复点「接受」、自动模式重试循环
+        重新合并落库，此前都会把一字未改的正文空升一版（卡片显示「第 2 版」）。
+        """
         with self._transaction():
             old = self.conn.execute("SELECT * FROM text_blocks WHERE id=?", (block_id,)).fetchone()
             if old is None:
                 return
             old = dict(old)
-            if old["content"] and old["content"] != content:
+            if (old["content"] or "") == (content or ""):
+                if old["status"] != "草稿":
+                    return      # 内容没变且已接受/已锁定：幂等空操作，不发信号
+                # 草稿内容未变：只把状态推进到已接受，不升版本、不存快照
                 self.conn.execute(
-                    "INSERT INTO text_block_snapshots(text_block_id,version,content,created_at) VALUES(?,?,?,?)",
-                    (block_id, old["version"], old["content"], db.now()))
-            self.conn.execute(
-                "UPDATE text_blocks SET content=?, status='已接受', version=version+1, updated_at=? WHERE id=?",
-                (content, db.now(), block_id))
+                    "UPDATE text_blocks SET status='已接受', updated_at=? WHERE id=?",
+                    (db.now(), block_id))
+            else:
+                if old["content"]:
+                    self.conn.execute(
+                        "INSERT INTO text_block_snapshots(text_block_id,version,content,created_at) VALUES(?,?,?,?)",
+                        (block_id, old["version"], old["content"], db.now()))
+                self.conn.execute(
+                    "UPDATE text_blocks SET content=?, status='已接受', version=version+1, updated_at=? WHERE id=?",
+                    (content, db.now(), block_id))
             chapter_id = old["chapter_id"]
         if chapter_id:
             # 事务外发信号：写作台据此刷新当前章编辑器（自动模式后台落库可见）
