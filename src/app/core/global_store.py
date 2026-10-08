@@ -18,7 +18,8 @@ import threading
 from . import db
 from .outline_fields import effective_field_defs
 from .paths import app_data_dir
-from .sysprompts import DEFAULT_ROLES, BUILTIN_CARDS
+from .sysprompts import (DEFAULT_ROLES, BUILTIN_CARDS,
+                         PROSE_REWRITE_LEGACY_NAME, PROSE_REWRITE_LEGACY_PROMPT)
 
 MIGRATE_MARK = "config_migrated"
 
@@ -68,10 +69,6 @@ GLOBAL_SETTING_DEFAULTS = {
     "draft_checklist_outline": "",       # 草稿自检：大纲自定义自检清单
     "draft_checklist_detail": "",        # 草稿自检：细纲自定义自检清单
     "draft_checklist_prose": "",         # 草稿自检：正文自定义自检清单
-    # ---------- 改写注入白名单（checker 修复链路用；2026-10-07 旧「改写设置」弹窗已删）----------
-    # 注入模块白名单（逗号分隔 kind）：rewrite 角色请求按此注入上下文，其余不发。
-    # 默认 = 旧版 rewrite 固定注入的四模块 + 全局/阶段偏好。
-    "rewrite_modules": "cognition,cards,entities,rumors,prefs_global,prefs_stage",
     # ---------- 记忆联动（2026-09-08）----------
     "auto_lore_import": "1",             # 归档后自动把记忆新人物/新实体导入设定库（0=只提醒不导入）
     # ---------- 酒馆预设导入（2026-09-10）----------
@@ -754,8 +751,10 @@ class GlobalStore:
         - 已记录过的内容无论是否仍在库中，一律不再补——用户删除的永远不回来。
         - 首次建立记录时把当前版本全部标记为已种（缺失的一律不补，尊重用户删除）。
         """
-        # 废弃角色清理（幂等）：volume_detail（卷纲已舍弃）、brainstorm（与总纲重复，已并入 synopsis）
-        for obsolete in ("volume_detail", "brainstorm"):
+        # 废弃角色清理（幂等）：volume_detail（卷纲已舍弃）、brainstorm（与总纲重复，已并入
+        # synopsis）、rewrite（2026-10-08 改写二合一：老「改写润色」角色删除，其唯一消费方
+        # checker 审校修复链路并入 prose_rewrite，后者显示名改为「改写」）
+        for obsolete in ("volume_detail", "brainstorm", "rewrite"):
             self._exec("DELETE FROM task_routes WHERE role=?", (obsolete,))
 
         # ---- 默认角色：版本化补种 ----
@@ -812,6 +811,27 @@ class GlobalStore:
                 self.set_meta("prose_rewrite_profile_inherited", "1")
 
         self._patch_stale_prior_sentence()
+        self._upgrade_prose_rewrite_identity()
+
+    def _upgrade_prose_rewrite_identity(self) -> None:
+        """prose_rewrite 存量升级（幂等，2026-10-08 改写二合一）。
+
+        老库里这行路由是补种时写死的旧默认（显示名「文风改写」、提示词偏整章差量
+        协议）。现在它是唯一改写角色（兼 checker 审校修复），把仍是旧默认值的行
+        升级成新默认；用户自己改过名/提示词的不动——与「用户数据优先」同纪律。
+        """
+        cur = DEFAULT_ROLES.get("prose_rewrite")
+        if not cur:
+            return
+        new_name, _temp, new_prompt = cur
+        row = self._one("SELECT name, system_prompt FROM task_routes WHERE role='prose_rewrite'")
+        if not row:
+            return
+        if (row.get("name") or "") == PROSE_REWRITE_LEGACY_NAME:
+            self._exec("UPDATE task_routes SET name=? WHERE role='prose_rewrite'", (new_name,))
+        if (row.get("system_prompt") or "") == PROSE_REWRITE_LEGACY_PROMPT:
+            self._exec("UPDATE task_routes SET system_prompt=? WHERE role='prose_rewrite'",
+                       (new_prompt,))
 
     def _patch_stale_prior_sentence(self) -> None:
         """存量库修补（幂等，2026-09-05）：正文已移除「前文注入」板块，

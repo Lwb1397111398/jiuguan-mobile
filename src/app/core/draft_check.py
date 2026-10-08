@@ -12,7 +12,7 @@
 """
 
 # 支持草稿自检的阶段（rewrite/check/style/memory 等审校机械角色不参与：
-# check 本身就是自检，rewrite 改写短文本收益低）
+# check 本身就是自检，prose_rewrite 差量输出收益低）
 DRAFT_STAGES = ("synopsis", "volume", "outline", "detail", "prose")
 
 _STAGE_LABELS = {

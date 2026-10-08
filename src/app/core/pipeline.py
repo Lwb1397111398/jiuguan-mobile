@@ -140,7 +140,7 @@ REFUSAL_RETRY_EXTRA = (
 # 若超过模型自身最大输出（如 DeepSeek 官方上限 8192、GPT-4.1 32k），api.py 会收到
 # 400/422 后自动减半降级重发（递归直到渠道可接受），不会报错失败。
 _DEFAULT_MAX_TOKENS = {
-    "prose": 60000, "rewrite": 60000, "prose_rewrite": 60000,
+    "prose": 60000, "prose_rewrite": 60000,
     "check": 60000, "style": 60000,
     "synopsis": 60000, "volume": 60000, "outline": 60000, "detail": 60000,
     "memory": 60000,
@@ -182,7 +182,7 @@ def detect_unfinished(text: str, min_chars: int = 80) -> bool:
     不剥就会把已经收尾的文本判成「结尾没有闭合」——备选判据说写完了、这里又
     翻成没写完，手动模式白弹一次确认框。
 
-    **本函数只适用于 prose/rewrite**（正文与改写）：它是「末尾标点启发式」，
+    **本函数只适用于 prose/prose_rewrite**（正文与改写）：它是「末尾标点启发式」，
     而结构化阶段（大纲/细纲/分卷/总纲）的末行常是 `to：状态行`／字段行，
     天然不带句号 → 必然误判。结构化阶段的完整性由「完成标志 + 结构完整性备选
     （completeness.py）」负责，调用方不要给它们用本函数。
@@ -339,7 +339,7 @@ UPSTREAM_GUARD_RETRY_GAP = 8.0
 
 # 只对长文本创作角色启用：JSON 类角色（memory/check/style/ai_task）请求形态保持原样，
 # 避免给结构化输出任务塞入无关标题行。
-UPSTREAM_GUARD_ROLES = ("prose", "rewrite", "prose_rewrite",
+UPSTREAM_GUARD_ROLES = ("prose", "prose_rewrite",
                         "outline", "detail", "volume", "synopsis")
 
 # 流式回调内的「重置」哨兵：上游拦截后自动重试时，通知界面丢弃上一轮残留
@@ -462,7 +462,7 @@ def strip_trailing_prefill(messages: list[dict]) -> list[dict]:
 # ---------- 截断自动续写（防截断，2026-08-09） ----------
 
 # 只对长文本创作角色启用；JSON 类角色截断后拼接必坏，不续写
-CONTINUABLE_ROLES = ("prose", "rewrite", "prose_rewrite")
+CONTINUABLE_ROLES = ("prose", "prose_rewrite")
 
 # 输出是人类可读的结构化文本（而非 JSON）的结构化阶段：同样会被破甲开场白 /
 # Step 规划段污染，要走 strip_jailbreak_residue（但不能剥章节名行，那是数据）。
@@ -2541,7 +2541,7 @@ class Pipeline:
         # <draft> 也算进去，草稿不会被吞。剥下的思考并入 thinking 供「思考过程」
         # 面板显示，不进任何创作数据。
         formal_text, think_body, clean_info = strip_model_output(
-            resp["text"], detect_no_body=role in ("prose", "rewrite", "prose_rewrite"))
+            resp["text"], detect_no_body=role in ("prose", "prose_rewrite"))
         if think_body:
             resp["thinking"] = (resp.get("thinking", "") + "\n" + think_body).strip()
         # 草稿自检剥离（续写循环结束后统一执行：成对块全剥、未闭合走兜底；
@@ -2549,7 +2549,7 @@ class Pipeline:
         formal_text, draft_body, draft_incomplete = split_draft(formal_text)
         # 正文残留清洗（2026-09-05，2026-09-10 扩到全阶段）：剥破甲回显的
         # <content>/伪标签、说书人开场白引导行、正文开头的章节名行。
-        # - 创作文本（prose/rewrite）：全部规则，含章节名行/冒号引导行的剥除；
+        # - 创作文本（prose/prose_rewrite）：全部规则，含章节名行/冒号引导行的剥除；
         # - 结构化文本阶段（outline/detail/volume/synopsis）：只走破甲残留子集
         #   （strip_jailbreak_residue）——实测这些阶段同样会吐「墨开…今夜的故事
         #   从此处开始：」+ Step 规划段（T001 大纲 17 条、分卷 7 条、细纲 2 条），
@@ -2558,11 +2558,11 @@ class Pipeline:
         # - JSON 类角色（memory/check/style/ai_task）一律不洗：走 jsonx 自己的
         #   清洗路径，且 <content> 之类的全局删除可能伤到 JSON 字符串里的正文。
         # 幂等、只动行级残留、绝不丢正文。手机端共用本入口，行为一致。
-        # 场景头捕获（2026-09-26）：prose/rewrite 清洗剥掉的开头场景头
+        # 场景头捕获（2026-09-26）：prose/prose_rewrite 清洗剥掉的开头场景头
         # （『日期-星期-时间-地点-天气』）收进 result["scene_meta"]，由 UI 在
         # 落库时写成「【场景】」本章动态交给记忆系统（store.set_scene_note）。
         scene_lines: list[str] = []
-        if role in ("prose", "rewrite", "prose_rewrite"):
+        if role in ("prose", "prose_rewrite"):
             formal_text = strip_prose_residue(formal_text, scene_lines)
         elif role in TEXT_OUTPUT_ROLES:
             formal_text = strip_jailbreak_residue(formal_text)
@@ -2588,7 +2588,7 @@ class Pipeline:
         # 输出时常见）时，末尾剥离拿不到 → 标志随内容落库。这里对「强形式」标志行
         # 做一次全文清理（只认【生成完毕】这类，绝不碰「本章完/结束。」等正常行文）。
         # 不影响 found 判定——完整性只认末尾标志。JSON 类角色不清理（防伤 JSON 内容）。
-        if role in TEXT_OUTPUT_ROLES or role in ("prose", "rewrite", "prose_rewrite"):
+        if role in TEXT_OUTPUT_ROLES or role in ("prose", "prose_rewrite"):
             formal_text, _marks_removed = strip_inline_end_marks(formal_text)
         out_tokens = resp["completion_tokens"] or build["est_output_tokens"]
         # input 记账用真实值：渠道返回 usage（非流式常规、流式开了 include_usage）
@@ -2663,7 +2663,7 @@ class Pipeline:
         text = (text or "").strip()
         if not text:
             return False, ""
-        if role in ("prose", "rewrite", "prose_rewrite"):
+        if role in ("prose", "prose_rewrite"):
             return prose_complete(text)
         if role == "detail":
             return detail_complete(text, self._outline_point_count(context, draft=False))

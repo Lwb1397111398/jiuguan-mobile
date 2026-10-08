@@ -75,7 +75,7 @@ JAILBREAK_MODES = {
     "synopsis": "full",
     "volume": "full",
     "outline": "full", "detail": "full",
-    "prose": "full", "rewrite": "full", "prose_rewrite": "full",
+    "prose": "full", "prose_rewrite": "full",
     "check": "light", "style": "light",
     "memory": "off",
 }
@@ -142,37 +142,8 @@ PROTOCOL_STACK_TEXT = (
 # 但仍在【输出完成标志】（12.6）之前 —— 贴近生成点，同时又让完成标志协议收尾。
 _PROTOCOL_STACK_ORDER = 12.4
 
-# ---------- 统一改写（2026-09-02）：可配置注入模块 ----------
-# rewrite_modules 白名单里的 kind → 展示名（设置弹窗按此渲染勾选项）。
-# 待改写文本/改写要求/任务指令/系统身份/破甲/锁定项是改写任务的骨架，恒注入不可关。
-# 默认集 = 旧版 rewrite 固定注入的四模块 + 全局/阶段偏好（与 global_store 默认值一致）。
-REWRITE_MODULES = {
-    "cognition": "认知规则（角色视角一致性）",
-    "cards": "人物状态卡（不可违背）",
-    "entities": "世界实体状态",
-    "rumors": "公共传闻",
-    "prefs_global": "全局偏好（含置顶偏好）",
-    "prefs_stage": "阶段偏好（改写阶段卡片）",
-    "synopsis": "已确认总纲",
-    "outline": "本章大纲",
-    "detail": "本章细纲",
-    "style_sample": "风格样本",
-    "lore": "设定资料",
-    "prior": "前文注入",
-    "recent_events": "最近章节事件",
-    "time_recovery": "故事时间与伤势恢复",
-    "style_warn": "高频表达提醒",
-    "memory_retrieval": "相关记忆（语义检索）",
-}
-REWRITE_DEFAULT_MODULES = "cognition,cards,entities,rumors,prefs_global,prefs_stage"
-
-
-def rewrite_modules(store: ProjectStore) -> set:
-    """读取改写注入模块白名单（容错：空/含损坏项回默认；未知 kind 静默忽略）。"""
-    raw = (store.get_setting("rewrite_modules", "") or "").strip()
-    if not raw:
-        raw = REWRITE_DEFAULT_MODULES
-    return {k.strip() for k in raw.split(",") if k.strip() in REWRITE_MODULES}
+# 改写注入白名单已随老「rewrite」角色删除（2026-10-08 改写二合一）：唯一改写角色
+# prose_rewrite（显示名「改写」）注入固定，checker 审校修复链路也走它。
 
 
 def split_jailbreak(text: str) -> tuple[str, str, str]:
@@ -280,9 +251,10 @@ class Assembler:
 
         置顶卡（pinned）也在这里返回——是否拆出去紧跟锚定层由调用方决定，
         这样白名单/启用过滤逻辑只写一份。
-        文风改写（prose_rewrite）与改写（rewrite）同源：stages 白名单里写了
-        rewrite 的卡对 prose_rewrite 同样生效（「降 AI 感」「文风基准」等创作
-        偏好自动跟上，已有项目的卡无需逐张手改——2026-10-06）。
+        改写阶段卡（stage 键 "rewrite"）服务于唯一改写角色 prose_rewrite（2026-10-08
+        二合一，老 rewrite 角色已删）：stages 白名单里写了 rewrite 的卡对
+        prose_rewrite 生效（「降 AI 感」「文风基准」等创作偏好自动跟上，
+        已有项目的卡无需逐张手改）。
         """
         lookup = "rewrite" if stage == "prose_rewrite" else stage
         out = []
@@ -1485,8 +1457,6 @@ class Assembler:
                          "长期事项期限已过正文仍未交代进展，均按一致性问题报告。")
         elif purpose == "detail":
             lines.append("细纲中的时间推进须与当前故事时间衔接；涉及伤势的块须符合恢复进度。")
-        elif purpose == "rewrite":
-            lines.append("改写时：时间流逝与人物伤势须与当前故事时间及恢复进度保持一致，不得改出时间线矛盾。")
         return "\n".join(lines)
 
     def _synopsis_text(self) -> str:
@@ -1793,13 +1763,10 @@ class Assembler:
             raise ValueError(f"未知任务角色: {role}")
         # 总纲生成/迭代统一走 synopsis 角色（brainstorm 已废弃删除）
         stage = role if role in ("synopsis", "volume", "outline", "detail",
-                                 "prose", "rewrite", "prose_rewrite",
+                                 "prose", "prose_rewrite",
                                  "check", "style") else ""
         chapter = context.get("chapter")
         block = context.get("block")
-        # rewrite 角色（checker 修复链路）：注入模块按白名单开关（其他角色不受影响）。
-        # 上移至此：语义检索（含唤醒）的注入条件依赖 rw_mods。
-        rw_mods = rewrite_modules(store) if role == "rewrite" else None
         # 2.5 语义检索（向量召回）提前到 _split_cast 之前计算：结果两用——
         # ①相关记忆文本模块（原职责）；②软唤醒集喂给词面沉睡判定（协同机制，
         # 2026-09-08 第六轮）：被向量召回的 char/entity 本次视为「剧情碰到」，
@@ -1809,7 +1776,7 @@ class Assembler:
         # 下方 add 模块时不再重复调用）。未配置嵌入/失败 → 空集 = 纯词面今天行为。
         self._cur_wake = {"char": set(), "entity": set()}
         retr_text = ""
-        if stage and (rw_mods is None or "memory_retrieval" in rw_mods):
+        if stage:
             retr_text, self._cur_wake = self._semantic_pack(stage, context)
         char_names = context.get("character_names") or (
             (chapter.get("characters") or []) if chapter else [])
@@ -1851,21 +1818,18 @@ class Assembler:
         # 1.8 置顶偏好：跳出「全局偏好」栏，紧跟破限锚定层注入（几乎最前）。
         # 仍受 stages 白名单限制：只在它生效的阶段置顶。critical=置顶就是要最大
         # 效力，超预算时不裁（要裁也从普通偏好先裁）。
-        # rewrite 角色按白名单：prefs_global 关闭时全局偏好（含置顶）整体不注入。
-        p_prefs = "" if (rw_mods is not None and "prefs_global" not in rw_mods) \
-            else self._pinned_prefs(stage)
+        # （2026-10-08 改写二合一：rewrite 角色白名单已删，所有角色按 stages 生效）
+        p_prefs = self._pinned_prefs(stage)
         if p_prefs:
             add("置顶偏好（紧随破限锚定）", "pinned_prefs",
                 "【置顶偏好（最高优先，紧随破限锚定）】\n请严格遵守：\n" + p_prefs, 5,
                 critical=True)
         # 2 偏好（独立模块：超预算时先从偏好裁剪，保证任务指令与数据区）
         # 全局偏好与阶段偏好是两类不同来源：分开注入、分别标注，互不混淆
-        g_prefs = "" if (rw_mods is not None and "prefs_global" not in rw_mods) \
-            else self._global_prefs(stage)
+        g_prefs = self._global_prefs(stage)
         if g_prefs:
             add("全局偏好", "prefs", "【全局偏好】\n请严格遵守：\n" + g_prefs, 6)
-        s_prefs = "" if (rw_mods is not None and "prefs_stage" not in rw_mods) \
-            else self._stage_prefs(stage)
+        s_prefs = self._stage_prefs(stage)
         if s_prefs:
             add("阶段偏好", "prefs", "【阶段偏好】\n请严格遵守：\n" + s_prefs, 6)
         # 2.5 相关记忆（语义检索）：结果已在 build 顶部随唤醒集一并算好
@@ -2028,51 +1992,13 @@ class Assembler:
                 prior = self._recent_full(chapter["id"])
             add("近章前文", "prior", prior, 1)
             add("待审校正文", "prose", context.get("prose", ""), 10, critical=True)
-        elif role == "rewrite":
-            # rewrite 角色现在只剩 checker 修复链路使用（2026-10-07 界面「改写」按钮
-            # 已并入文风改写协议，设置弹窗删除）。注入模块按白名单（rewrite_modules，
-            # 全局共享，默认值见 global_store）开关；默认少注入省 token。
-            if "cognition" in rw_mods:
-                add("认知规则", "cognition", COGNITION_RULES, 5)
-            if "cards" in rw_mods:
-                add("人物状态卡", "cards", self._character_cards(cast_full, include_sealed=True,
-                                   cur_order=(chapter or {}).get("order_index") or 0), 9, critical=True)
-                add("未出场人物简报", "cards", self._character_briefs(cast_brief), 4)
-            if "entities" in rw_mods:
-                add("世界实体状态", "entities", self._entities_text(context), 7)
-            if "rumors" in rw_mods:
-                add("公共传闻", "rumors", self._rumors_text(context), 6)
-            if "synopsis" in rw_mods:
-                add("已确认总纲", "synopsis", self._synopsis_text(), 3)
-            if "outline" in rw_mods and chapter:
-                add("本章大纲", "outline", self._chapter_text(chapter), 4)
-            if "detail" in rw_mods and chapter:
-                blocks = store.list_blocks(chapter["id"])
-                if blocks:
-                    add("本章细纲", "detail_ref", self._detail_ref_text(blocks), 5)
-            if "style_sample" in rw_mods:
-                add("风格样本", "sample", self._style_samples(), 2)
-            if "lore" in rw_mods:
-                add("设定资料", "lore", self._lore_text(char_names, context), 5)
-            if "prior" in rw_mods and chapter:
-                add("前文注入", "prior", self._prior_chapters(chapter["id"]), 1)
-            if "recent_events" in rw_mods and chapter:
-                add("最近章节事件", "recent_events",
-                    self._recent_events(chapter["id"]), 2)
-            if "time_recovery" in rw_mods:
-                add("故事时间与伤势恢复", "time_recovery",
-                    self._time_recovery_text("rewrite"), 6)
-            if "style_warn" in rw_mods and chapter:
-                add("高频表达提醒", "style_warn",
-                    self._high_freq_warning(chapter["id"]), 6)
-            # 任务骨架恒注入：待改写文本 + 改写要求（不可关）
-            add("待改写文本", "rewrite_text", context.get("rewrite_text", ""), 10, critical=True)
-            req = context.get("user_req", "")
-            add("改写要求", "user", req, 5)
         elif role == "prose_rewrite":
-            # 改写（2026-10-06，流水线第 6 环）：整章「去 AI 味」句子层改写，
-            # 与 checker 修复链路（role=rewrite，按白名单注入）分开——本角色注入
-            # 固定：编号稿 + 风格样本 + 状态卡 + 细纲对账 + 扫描报告/上批末两段。
+            # 改写（流水线第 6 环；2026-10-08 二合一后唯一改写角色，老 rewrite 角色
+            # 与其注入白名单已删）。两类调用共用本分支：
+            # ①整章「去 AI 味」文风改写——rewrite_text 为自然段编号稿（P1/P2/…），
+            #   差量输出协议全在任务层（STYLE_REWRITE_PREAMBLE + prose_rewrite_whole 模板）；
+            # ②checker 审校修复链路——rewrite_text 为待修复问题段落原文，
+            #   user_req 为修复要求（带「改写要求」模块）。
             add("认知规则", "cognition", COGNITION_RULES, 3)
             add("人物状态卡", "cards", self._character_cards(cast_full, include_sealed=True,
                                    cur_order=(chapter or {}).get("order_index") or 0), 9, critical=True)
@@ -2086,9 +2012,16 @@ class Assembler:
                     # 信息对账依据：细纲要素与块末 to 落点（改写只动句子不动覆盖面）
                     add("本章细纲（信息对账）", "detail_ref",
                         self._detail_ref_text(blocks), 6)
-            # 待改写正文：程序已按自然段编号（P1/P2/…），病灶定位与批范围都按段号走
-            add("待改写正文（自然段编号）", "rewrite_text",
-                context.get("rewrite_text", ""), 10, critical=True)
+            # 待改写正文：整章协议传自然段编号稿（病灶定位与差量替换按段号走）；
+            # 审校修复传问题段落原文 + 修复要求（user_req，旧 rewrite 分支同款骨架）
+            req = context.get("user_req", "")
+            if req:
+                add("待改写正文（问题段落）", "rewrite_text",
+                    context.get("rewrite_text", ""), 10, critical=True)
+                add("改写要求", "user", req, 6)
+            else:
+                add("待改写正文（自然段编号）", "rewrite_text",
+                    context.get("rewrite_text", ""), 10, critical=True)
             scan = context.get("scan_report")
             if scan:
                 # 分批模式：全章扫描报告整份注入每个执行批（协议：各批无权推翻保留区）

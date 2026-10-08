@@ -95,7 +95,10 @@ class Checker:
 
     def fix_issue(self, chapter_id: int, issue: dict, instruction: str = "",
                   on_chunk=None, stop_event=None) -> dict:
-        """针对一条问题，生成修改建议（rewrite 角色）。返回建议文本，用户确认后替换。"""
+        """针对一条问题，生成修改建议（改写角色 prose_rewrite）。返回建议文本，用户确认后替换。
+
+        2026-10-08：老 rewrite 角色删除，审校修复并入 prose_rewrite（唯一改写角色）。
+        """
         ch = self.store.get_chapter(chapter_id)
         if not ch:
             return {"ok": False, "error": "章节不存在"}
@@ -127,7 +130,7 @@ class Checker:
                 "约束：只修改问题所在句子/段落；不得改变已定事实、人物对白、人物性格与叙事功能；"
                 "不得使用被指出的套话表达。"
                 "只输出修改后的段落正文（对应原问题位置），不要解释。")
-        return self.pipeline.run("rewrite", {
+        return self.pipeline.run("prose_rewrite", {
             "chapter": ch,
             "rewrite_text": target,
             "character_names": ch.get("characters") or [],

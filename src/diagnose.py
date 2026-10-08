@@ -91,7 +91,7 @@ def diagnose(result, role: str, text: str, batch_continue: bool = False):
     #    分批续批（batch_continue）同样豁免本启发式：本批结尾停在章中间
     #    是正常形态（与桌面 TaskRunDialog._batch_continue 同口径）。
     unfinished = not result.get("end_mark", True)
-    if not unfinished and role in ("prose", "rewrite") and not batch_continue:
+    if not unfinished and role in ("prose", "prose_rewrite") and not batch_continue:
         unfinished = detect_unfinished(text)
     if unfinished:
         if not result.get("end_mark", True):
