@@ -27,7 +27,8 @@ from .outline_fields import (
 )
 from .store import ProjectStore
 from .textclean import (strip_jailbreak_residue, strip_leading_scene_marks,
-                        strip_model_output, strip_prose_residue)
+                        strip_model_output, strip_prose_residue,
+                        _is_scene_header_line)
 from .throttle import wait_gap as _wait_gap
 
 # 拒答信号模式：只匹配"明确拒绝执行任务"的句式（保守，避免误判剧情内台词，
@@ -1577,6 +1578,82 @@ def batch_tail_two_paras(text: str, keep: int = 2) -> str:
 _BATCH_STATE_FIELD_RE = re.compile(
     r"^(?:摘要|to状态|配额登记|末句)\s*[:：]", re.IGNORECASE)
 
+# 批头章名行（分批模板的正文起点定位行，2026-10-09）：『第N章：章名（第M批）』。
+# 判定 = 行首『第N章/第N回』短行 + 行内含『（…批）』括注（（第3批）/（第16日）（第2批）
+# 这类嵌套变体都命中）。该行是提示词给模型的批界标，落库正文里不该有它；
+# 其前的开工检查块/分隔行/场景头同理是段前垃圾。
+# 护栏：括注限在标题行内且 ≤14 字、整行 ≤120 字——正文行文里『（第二批）』类
+# 短语必须同时满足「行首是第N章标题」才会误中，风险极低。
+_BATCH_HEAD_LINE_RE = re.compile(
+    r"^[ \t]{0,3}[*＊#> ]*[ \t]*"
+    r"第[0-9〇零一二两三四五六七八九十百千万]+[章回]"
+    r"[^\n]{0,100}?[（(][^\n（()）]{0,14}?批[）)][ \t]*$")
+# 批内开工检查段头行：独立成行的【…开工检查…】/【…开工核对…】
+_CHECK_HEAD_LINE_RE = re.compile(
+    r"^[ \t]*[【\[][^】\n]{0,24}?(?:开工[检檢]查|开工核对)[^】\n]{0,12}?[】\]][ \t]*$")
+# 检查块条目行（段头之后的 ①②③/序号/短横项目 + 缩进子条目/拍X.Y 速览行，
+# 实测极寒末日 log39「  拍13.1（B档）：…」）：修复函数判断删除范围用
+_CHECK_ITEM_LINE_RE = re.compile(
+    r"^(?:[ \t]*(?:[①-⑳Ⓐ-Ⓩ]|[0-9]{1,2}\s*[、.．)）]|[（(][0-9]{1,2}[）)]|[-–—•●○◇◆＊*]\s)"
+    r"|[ \t]{2,}\S|拍\s*[0-9]+\s*[.．]\s*[0-9]+)")
+# 模型自己补的占位说明回显行（实测极寒末日 ch10：检查块后孤悬两行『（删除此行）』）。
+# 只认整行括号包裹 ≤22 字且命中 删除/占位/此行/替换/不输出 词，正常正文不会独有这样一行
+_ECHO_INSTRUCTION_LINE_RE = re.compile(
+    r"^[ \t]*[（(][^（()）\n]{0,20}?(?:删除|占位|此行|替换|不输出)[^（()）\n]{0,14}?[)）][ \t]*$")
+
+
+def _check_tail_line(line: str) -> bool:
+    """紧跟检查块的「过渡句」行：『核对完成，直接正文输出。』『开始输出正文。『场景头』』——
+    模型把「动笔宣言」（有时粘连一个 RP 场景头/伪标签）单独写一行顶在正文前（实测
+    极寒末日 log52、校霸 log50/59）。只在检查块段尾判定（上下文受限），且必须短行、
+    含正文/输出/动笔类动词、以句号/冒号/『…』/标签收尾——长正文段落不命中。
+    """
+    s = line.strip()
+    if not s or len(s) > 60:
+        return False
+    if not re.search(r"(正文|输出|动笔|落笔|开写|开始)", s):
+        return False
+    return (s.endswith(("。", "：", ":")) or "『" in s
+            or bool(re.search(r"<[^<>\n]{1,30}>\s*$", s)))
+# 分隔线行（*** / --- / ~~~ 等，模型爱打在检查段与正文之间）
+_BATCH_DIVIDER_LINE_RE = re.compile(r"^[ \t]*(?:[-*~＿_]\s*){3,}$")
+
+
+def _is_batch_head_line(line: str) -> bool:
+    return bool(_BATCH_HEAD_LINE_RE.match(line))
+
+
+def _strip_batch_open(body: str) -> str:
+    """分批正文起点定位：批头章名行连同其前的段前垃圾整体割掉。
+
+    分批模板规定正文以『第N章：…（第M批）』起头——模型不写【正文输出】标记时
+    （极寒末日/校霸实测 28 条全部如此），思考剥离的锚点与词表都够不到开工检查块，
+    它就顶着检查段、分隔线、场景头一起漏进正文。这里按**模板契约**直接切：
+    取窗口（3000 字，同思考段上限）内最后一个批头行（检查段里引用批头格式的
+    行不算起点，真批头在它之后），割掉其前含本行的一切；窗口内没有批头行、
+    或切完没有正文 → 不动（绝不丢正文）。
+    """
+    window = min(len(body), 3000)
+    last = None
+    for m in _BATCH_HEAD_LINE_RE.finditer(body):
+        if m.start() > window:
+            break
+        if body[m.end():].strip():
+            last = m
+    if last:
+        return body[last.end():].lstrip()
+    # 连定位行都没写、段前垃圾（场景头回显/分隔线/占位行）之后紧跟着检查段头
+    # → 按「修复函数」的段边界删（到条目为止；留下的顶头场景头由后续终清洗收走）
+    for l0 in body.split("\n")[:16]:
+        s0 = l0.strip()
+        if (not s0 or _BATCH_DIVIDER_LINE_RE.match(l0)
+                or _ECHO_INSTRUCTION_LINE_RE.match(l0) or _is_scene_header_line(s0)):
+            continue
+        if _CHECK_HEAD_LINE_RE.match(l0):
+            return Pipeline.strip_merged_batch_junk(body)[0].lstrip()
+        break
+    return body
+
 
 # ---------- 文风改写：自然段编号与分批方案（2026-10-06） ----------
 # 协议要求初稿以「自然段编号」形态喂给改写模型（病灶定位到段、批范围按段切），
@@ -1601,6 +1678,22 @@ def number_paragraphs(text: str) -> str:
     """初稿 → 「P1：段落」编号稿（文风改写扫描/整章调用的输入形态）。"""
     paras = split_paragraphs(text)
     return "\n\n".join(f"P{i}：{p}" for i, p in enumerate(paras, 1))
+
+
+def _strip_batch_tail(text: str) -> str:
+    """批尾悬挂清理：剥掉正文末尾孤立的分隔线/占位回显行。
+
+    完成标志（【生成完毕】）被剥掉后常留一行 *** 顶在状态包之前（实测
+    极寒末日 log99/112/192/193），状态包切除后它就挂在批尾进了正文。"""
+    lines = (text or "").split("\n")
+    while lines:
+        s = lines[-1].strip()
+        if not s or (_BATCH_DIVIDER_LINE_RE.match(lines[-1])
+                     or _ECHO_INSTRUCTION_LINE_RE.match(lines[-1])):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).rstrip()
 
 
 def _parse_batch_prose(text: str, info_out: dict | None = None,
@@ -1632,6 +1725,13 @@ def _parse_batch_prose(text: str, info_out: dict | None = None,
     state = ""
     idx = raw.rfind(marker)
     if idx >= 0:
+        # 批头定位切割只在正文段内做（状态包区原样保留，下一批要注入模型写的原文）
+        body_part = _strip_batch_open(raw[:idx])
+        raw = (body_part + "\n" + raw[idx:]).strip()
+        idx = raw.rfind(marker)
+    else:
+        raw = _strip_batch_open(raw)
+    if idx >= 0:
         # 完成标志行可能落在状态包内部（模型把它打在状态包之后、标记剥离在
         # 全文末尾只剥一次）——状态包剥一遍强形式标志行再存。
         state, _marks = strip_inline_end_marks(raw[idx + len(marker):].strip())
@@ -1648,6 +1748,9 @@ def _parse_batch_prose(text: str, info_out: dict | None = None,
             raw = "\n".join(lines[:cut]).strip()
             info["state_found"] = True
             info["note"] = "批包标记行缺失，已按末尾字段行识别"
+    if not raw:
+        return "", state, "本批正文为空（只输出了批尾包？），请重试"
+    raw = _strip_batch_tail(raw)
     if not raw:
         return "", state, "本批正文为空（只输出了批尾包？），请重试"
     return raw, state, None
@@ -3460,6 +3563,98 @@ class Pipeline:
                 f"本批正文识别为空或过短（{len(prose)} 字，可能是拒答或只输出了说明）。"
                 "可点「拒答重试」重新生成本批。")
         return prose, state, None
+
+    @classmethod
+    def strip_merged_batch_junk(cls, text: str) -> tuple[str, int]:
+        """一键清理**已入库**正文/批次工作区里的分批残留（2026-10-09）。
+
+        生产链已兜住（pipeline._strip_batch_open：有批头行按批头切、没批头行按
+        检查段头切），此函数管历史脏数据（老板实测：极寒末日 9 章、校霸多章
+        正文顶头夹着检查块），也被 _strip_batch_open 复用为无批头行的段删除器。
+        两类残留、三条删除规则：
+        ① 『【批内开工检查】段头行 → 其后最近的批头章名行/场景头行』整段删
+          （含该尾行；其间空行与 ***/--- 分隔行同删）。向后 2000 字内先撞上
+          正文行 → 删到该行前为止（段头+条目+过渡行全收，正文行绝不吞），宁漏不误伤。
+        ② 独立的批头章名行（检查块已被旧链剥掉、只剩定位行漏进正文）删该行，
+          并回删其前紧邻的场景头/分隔行（中间至多隔 2 个空行——它是段前垃圾尾巴）。
+        ③ 删过的文本才把 3 个以上连续空行压成一个空行（保住段落分隔）。
+        一条都不命中 → 原样返回 (原文, 0)：正常正文零改动；幂等。返回 (文本, 删除处数)。
+        """
+        lines = (text or "").replace("\r\n", "\n").split("\n")
+        out: list[str] = []
+        removed = 0
+        i, n = 0, len(lines)
+        while i < n:
+            ln = lines[i]
+            if _CHECK_HEAD_LINE_RE.match(ln):
+                end = i + 1
+                acc = 0
+                while end < n and acc < 2000:
+                    cur = lines[end]
+                    acc += len(cur) + 1
+                    s = cur.strip()
+                    if not s or (_BATCH_DIVIDER_LINE_RE.match(cur)
+                            or _CHECK_ITEM_LINE_RE.match(cur)
+                            or _ECHO_INSTRUCTION_LINE_RE.match(cur)
+                            or _check_tail_line(cur)):
+                        end += 1   # 空行/条目行/分隔行/占位回显/过渡句都是检查段的一部分
+                        continue
+                    if _is_batch_head_line(cur) or _is_scene_header_line(s):
+                        end += 1   # 尾行也是段前垃圾，含删
+                        break
+                    # 首个真正文行：删到它前行为止（段头行本身是删除下限——
+                    # 条目/过渡行与正文之间没有空行也要删干净，2026-10-09 用例修订）
+                    break
+                del lines[i:end]
+                n -= end - i
+                removed += 1
+                continue           # 原地重扫（下一段的残留可能紧接着）
+            if _ECHO_INSTRUCTION_LINE_RE.match(ln):
+                i += 1             # 孤悬的占位回显行（常随检查段来，检查段已被
+                removed += 1       # 思考剥离收走时它就落单在正文里）
+                continue
+            if _is_batch_head_line(ln):
+                j = len(out) - 1
+                blanks = 0
+                cut = None
+                while j >= 0:
+                    s = out[j].strip()
+                    if not s:
+                        blanks += 1
+                        if blanks > 2:
+                            break
+                        j -= 1
+                        continue
+                    if (_BATCH_DIVIDER_LINE_RE.match(out[j])
+                            or _is_scene_header_line(s)):
+                        cut = j
+                        j -= 1
+                        continue
+                    break
+                if cut is not None:
+                    del out[cut:]
+                i += 1
+                removed += 1
+                continue
+            out.append(ln)
+            i += 1
+        if not removed:
+            return text or "", 0
+        # 批尾悬挂：完成标志/状态包被历史链路剥走后留下的孤立分隔线（实测
+        # 「…狂笑起来。\n\n【生成完毕】\n\n***」清理后正文尾顶着一行 ***）。
+        # 只在发生过删除时收尾，纯正文以 *** 收尾的旧章节不受影响。
+        while out:
+            s = out[-1].strip()
+            if not s:
+                out.pop()
+                continue
+            if _BATCH_DIVIDER_LINE_RE.match(out[-1]) or _ECHO_INSTRUCTION_LINE_RE.match(out[-1]):
+                out.pop()
+                removed += 1
+                continue
+            break
+        cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+        return cleaned, removed
 
     # ---------- 文风改写·差量替换（2026-10-06） ----------
     # 整章模式的输出不是重抄全文，而是「只列病灶段的替换条目」：模型扫完

@@ -51,12 +51,16 @@ _THINK_CLOSE_RE = re.compile(
 _PUNCT_RE = re.compile(r"[。，；！？!?]")
 
 # Markdown 标题形式的思考段头：## 思考环节 / ### 思考 / # 思维链（可带加粗）
+# 「开工检查」不进这张词表（2026-10-09 定标）：分批续批模板的检查段与正文之间常
+# 没有【正文输出】锚点，通用思考段截断的边界会退到下一个【…】（＝滚动状态包），
+# 把两千字的整段正文当思考剥掉（极寒末日 log23/39、极限体能 log59、校霸 log43
+# 误伤实锤）——批内检查段只在**批级**剥离，见 pipeline._strip_batch_open。
 _MD_THINK_HEAD_RE = re.compile(
     r"^[ \t]{0,3}(#{1,6})[ \t]*(\*{0,2})[^\n]{0,16}?"
     r"(?:思考|思维链|推理|分析|构思|自检|自我检[查核]|打草稿)"
     r"[^\n]{0,16}?\2[ \t]*[:：]?[ \t]*$", re.M)
 
-# 【】/[] 包裹的思考段头：【思考环节】/ [推理过程]
+# 【】/[] 包裹的思考段头：【思考环节】/ [推理过程]（开工检查见上，不进表）
 _BRACKET_THINK_HEAD_RE = re.compile(
     r"^[ \t]{0,3}[【\[][ \t]*[^\n]{0,16}?"
     r"(?:思考|思维链|推理|分析|构思|自检|自我检[查核])"
@@ -98,7 +102,10 @@ def has_think_marks(text: str) -> bool:
         return False
     if _THINK_OPEN_RE.search(t):
         return True
-    if "思考" in t or "思维链" in t or "推理" in t or "正式输出" in t:
+    # 「正文输出」= 分批模板的正文起点标记（_FORMAL_HEAD_RE 同义项）；
+    # 「开工检查」= 分批续批模板的思考段头——两词不进预筛会让整条剥离链被跳过。
+    if ("思考" in t or "思维链" in t or "推理" in t or "正式输出" in t
+            or "正文输出" in t or "开工检查" in t or "开工核对" in t):
         return True
     # 无标记内联思考的廉价预筛：头部是一大段外文（实测几乎全是英文 planning），
     # 正文却是中文（或反过来）→ 可能走了 strip_inline_think 的形态。这里只做
@@ -486,6 +493,11 @@ def _looks_like_all_think(text: str, work: str) -> bool:
         return True
     han = sum(1 for _ in _HAN_CHAR_RE.finditer(work))
     if han < 50:
+        # 例外（2026-10-09）：模型按协议打了环节标记（正文输出/滚动状态包）却
+        # 只产出几十字——这是「正文过短」不是「整篇思考」，交回调用方按字数
+        # 门槛拒收（报错文案从「输出为空」恢复为「过短」，重试行为不变）。
+        if re.search(r"正文输出|正式输出|滚动状态包|改写批包", text):
+            return False
         return True
     if han < len(text) * 0.05:
         markers = sum(1 for s, e in _paragraph_spans(text)
