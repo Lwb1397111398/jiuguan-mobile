@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # 新模型档案的默认上下文长度。写小说需要尽量长的上下文（多章记忆、前文注入），
 # 所以默认给到 100 万 token；若服务方模型实际上限更低、报"上下文超限"错误，
@@ -38,8 +38,20 @@ CREATE TABLE IF NOT EXISTS volumes (
   title           TEXT NOT NULL DEFAULT '',
   summary         TEXT NOT NULL DEFAULT '',  -- 分卷描述（本卷主线与扩充深化的情节，供大纲锚定与卷间衔接）
   target_chapters INTEGER,                    -- 建议章数（NULL = 未指定/AI 自定）
+  version         INTEGER NOT NULL DEFAULT 1, -- 当前版本号（每次内容变更旧版自动入 volume_versions）
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
+);
+
+-- 分卷版本快照：旧版在每次内容变更前自动存档（对齐总纲的版本历史与正文块快照模式）
+CREATE TABLE IF NOT EXISTS volume_versions (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  volume_id       INTEGER NOT NULL,
+  version         INTEGER NOT NULL,          -- 被替换下来的旧版版本号
+  title           TEXT NOT NULL DEFAULT '',
+  summary         TEXT NOT NULL DEFAULT '',
+  target_chapters INTEGER,
+  created_at      TEXT NOT NULL
 );
 
 -- 章节：状态机 未规划→有大纲→有细纲→写作中→已完成→已归档→已锁定
@@ -375,10 +387,25 @@ MIGRATIONS = [
           para_end      INTEGER NOT NULL DEFAULT 0,
           content       TEXT NOT NULL DEFAULT '',
           batch_package TEXT NOT NULL DEFAULT '',
-          created_at    TEXT NOT NULL,
+          created_at    TEXT NOT NULL DEFAULT '',
           updated_at    TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_rewrite_batches_chapter ON rewrite_batches(chapter_id, order_index);
+    """),
+    # v18（2026-10-08）：分卷迭代版本化——volume_versions 快照表（同 v16/v17 幂等模式，
+    # CREATE TABLE IF NOT EXISTS：新库由 SCHEMA_SQL 建好，老库补建）；
+    # volumes.version 列走 _ensure_volume_version 幂等补列，不进本清单（见上方红线注释）。
+    (18, """
+        CREATE TABLE IF NOT EXISTS volume_versions (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          volume_id       INTEGER NOT NULL,
+          version         INTEGER NOT NULL,
+          title           TEXT NOT NULL DEFAULT '',
+          summary         TEXT NOT NULL DEFAULT '',
+          target_chapters INTEGER,
+          created_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_volume_versions ON volume_versions(volume_id, version);
     """),
 ]
 
@@ -566,6 +593,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_lore_last_seen(conn)
     _ensure_lore_removed_at(conn)
     _ensure_model_profile_rpm(conn)
+    _ensure_volume_version(conn)
     if current < SCHEMA_VERSION:
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
     conn.commit()
@@ -697,3 +725,14 @@ def _ensure_model_profile_rpm(conn: sqlite3.Connection) -> None:
     if "rpm" not in columns:
         conn.execute("ALTER TABLE model_profiles ADD COLUMN rpm INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+
+
+def _ensure_volume_version(conn: sqlite3.Connection) -> None:
+    """为旧库的 volumes 补 version 列（分卷迭代版本化，2026-10-08 v18）。
+
+    存量卷一律 v1；内容变更后由 store.save_volume 自动快照旧版并递增。
+    与 rpm 同理：新库由 SCHEMA_SQL 建全，幂等检查防 duplicate column name。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(volumes)")}
+    if "version" not in columns:
+        conn.execute("ALTER TABLE volumes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")

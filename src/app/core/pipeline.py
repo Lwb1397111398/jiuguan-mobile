@@ -143,6 +143,7 @@ _DEFAULT_MAX_TOKENS = {
     "prose": 60000, "prose_rewrite": 60000,
     "check": 60000, "style": 60000,
     "synopsis": 60000, "volume": 60000, "outline": 60000, "detail": 60000,
+    "volume_iter": 60000,
     "memory": 60000,
     # 辅助任务（AI 识别/整理/提取破甲）此前只有 20000，长预设一压就被截断；
     # 与创作类统一拉满，渠道不接受时 api.py 会自动减半降级。
@@ -340,7 +341,7 @@ UPSTREAM_GUARD_RETRY_GAP = 8.0
 # 只对长文本创作角色启用：JSON 类角色（memory/check/style/ai_task）请求形态保持原样，
 # 避免给结构化输出任务塞入无关标题行。
 UPSTREAM_GUARD_ROLES = ("prose", "prose_rewrite",
-                        "outline", "detail", "volume", "synopsis")
+                        "outline", "detail", "volume", "synopsis", "volume_iter")
 
 # 流式回调内的「重置」哨兵：上游拦截后自动重试时，通知界面丢弃上一轮残留
 # （那段英文拦截说明不是正文，不能和新一轮的真实输出拼在一起）。
@@ -467,7 +468,7 @@ CONTINUABLE_ROLES = ("prose", "prose_rewrite")
 # 输出是人类可读的结构化文本（而非 JSON）的结构化阶段：同样会被破甲开场白 /
 # Step 规划段污染，要走 strip_jailbreak_residue（但不能剥章节名行，那是数据）。
 # JSON 类角色（memory/check/style/ai_task）不在其中——走 jsonx 自己的清洗路径。
-TEXT_OUTPUT_ROLES = ("outline", "detail", "volume", "synopsis")
+TEXT_OUTPUT_ROLES = ("outline", "detail", "volume", "synopsis", "volume_iter")
 
 # 续写指令：要求从断开处无缝接着写，杜绝重复/总结/附加说明
 CONTINUE_INSTRUCTION = (
@@ -3104,6 +3105,22 @@ class Pipeline:
         if _split_bare_synopsis_volumes(text) is not None:
             return [{"title": "总纲", "content": text}], None
         return [], "未识别到总纲候选（既无 Markdown 标题也无 JSON）"
+
+    @staticmethod
+    def parse_volume_candidates(text: str, limit: int = 4):
+        """解析分卷迭代候选 → (cands, err)。
+
+        复用总纲候选的『# 方案N：修订后卷名』一级标题切分（title=新卷名、
+        content=修订后的本卷描述）；模型没按方案分隔时整篇作单一候选
+        （卷名沿用现状，由 UI 决定回退）。
+        """
+        cands, err = Pipeline.parse_synopsis_candidates(text, limit)
+        if cands:
+            return cands, None
+        body = strip_model_output((text or "").strip())[0].strip()
+        if body:
+            return [{"title": "", "content": body}], None
+        return [], err or "分卷修订结果为空"
 
     @staticmethod
     def parse_outline_batch(text: str, count: int = 50, field_defs=None):

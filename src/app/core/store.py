@@ -617,13 +617,64 @@ class ProjectStore(QObject):
     def get_volume(self, volume_id: int) -> dict | None:
         return self._one("SELECT * FROM volumes WHERE id=?", (volume_id,))
 
+    def _snapshot_volume(self, conn, volume: dict) -> None:
+        """把分卷当前内容存档为一版历史（volume_versions）。
+
+        与 text_block_snapshots 同模式：旧版在被替换前自动存档。
+        只供持锁路径调用（事务内 conn=self.conn；独立调用走 _update_volume_row 的事务）。
+        """
+        conn.execute(
+            "INSERT INTO volume_versions(volume_id,version,title,summary,target_chapters,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (volume["id"], int(volume.get("version") or 1),
+             volume.get("title", ""), volume.get("summary", ""),
+             volume.get("target_chapters"), db.now()))
+
+    def _update_volume_row(self, volume: dict, title: str, summary: str,
+                           target_chapters, conn=None) -> None:
+        """更新一卷内容；内容真的变了才快照旧版并升版本（幂等：原样保存不留空版本）。
+
+        volume 需为改前完整行（含 version）。conn 传入表示在调用方事务里执行
+        （lock_synopsis_with_volumes 用）；不传则自开单事务，快照与更新原子落库。
+        """
+        old_title = (volume.get("title") or "").strip()
+        old_summary = (volume.get("summary") or "").strip()
+        changed = ((title or "").strip() != old_title
+                   or (summary or "").strip() != old_summary
+                   or target_chapters != volume.get("target_chapters"))
+        version = int(volume.get("version") or 1)
+        if changed:
+            version += 1
+        stamp = db.now()
+        sql = ("UPDATE volumes SET title=?, summary=?, target_chapters=?, version=?,"
+               " updated_at=? WHERE id=?")
+        params = (title, summary, target_chapters, version, stamp, volume["id"])
+        if conn is not None:
+            if changed:
+                self._snapshot_volume(conn, volume)
+            conn.execute(sql, params)
+            return
+        with self._transaction():
+            if changed:
+                self._snapshot_volume(self.conn, volume)
+            self.conn.execute(sql, params)
+
     def save_volume(self, data: dict) -> dict:
-        """新建或更新分卷。data 可含 id/title/summary/target_chapters。"""
+        """新建或更新分卷。data 可含 id/title/summary/target_chapters。
+
+        更新时：data 未带 target_chapters 则保留原值（分卷页只编辑卷名+描述）；
+        内容有任何变化自动把旧版存入 volume_versions 并递增 version
+        （分卷迭代/手改都走此入口，历史可回看、可载入）。
+        """
         created = db.now()
         if data.get("id"):
-            self._exec("UPDATE volumes SET title=?, summary=?, target_chapters=?, updated_at=? WHERE id=?",
-                       (data.get("title", ""), data.get("summary", ""),
-                        data.get("target_chapters"), created, data["id"]))
+            old = self.get_volume(data["id"])
+            if old is None:
+                return None
+            target = (data["target_chapters"] if "target_chapters" in data
+                      else old.get("target_chapters"))
+            self._update_volume_row(old, data.get("title", ""),
+                                    data.get("summary", ""), target)
             return self.get_volume(data["id"])
         maxidx = self._one("SELECT COALESCE(MAX(order_index),0) AS m FROM volumes")
         order = int(maxidx["m"]) + 1 if maxidx else 1
@@ -634,11 +685,30 @@ class ProjectStore(QObject):
              data.get("target_chapters"), created, created))
         return self.get_volume(cur.lastrowid)
 
+    def list_volume_versions(self, volume_id: int) -> list[dict]:
+        """本卷历史版本（被替换下来的旧版，按版本号降序；无则空表）。"""
+        return self._rows("SELECT * FROM volume_versions WHERE volume_id=?"
+                          " ORDER BY version DESC", (volume_id,))
+
+    def get_volume_version(self, volume_id: int, version: int) -> dict | None:
+        return self._one("SELECT * FROM volume_versions WHERE volume_id=? AND version=?",
+                         (volume_id, version))
+
+    def restore_volume_version(self, volume_id: int, version: int) -> dict | None:
+        """载入历史版本为当前内容（旧当前版先入历史，与总纲「载入历史→保存出新版本」同语义）。"""
+        snap = self.get_volume_version(volume_id, version)
+        vol = self.get_volume(volume_id)
+        if not snap or not vol:
+            return None
+        return self.save_volume({"id": volume_id, "title": snap.get("title", ""),
+                                 "summary": snap.get("summary", "")})
+
     def sync_volumes_from_synopsis(self, volumes: list[dict]) -> list[dict]:
         """按 order_index 幂等对齐导入总纲分卷：更新已有卷 / 追加缺失卷，不删除多余卷。
 
         volumes: [{index, title, content}]，index 从 1 开始（总纲「■ 分卷N」序号）。
         保护章节归属：只动 volumes 表，不改 chapters 的 volume_id。
+        已有卷内容被总纲覆盖时旧版自动入 volume_versions（总纲迭代重锁可回溯）。
         """
         if not volumes:
             return []
@@ -652,8 +722,8 @@ class ProjectStore(QObject):
             exist = rows.get(idx)
             if exist:
                 # 已有卷：更新标题/描述（保留 target_chapters），内容变则以新总纲为准
-                self._exec("UPDATE volumes SET title=?, summary=?, updated_at=? WHERE id=?",
-                           (title, summary, created, exist["id"]))
+                self._update_volume_row(exist, title, summary,
+                                        exist.get("target_chapters"))
                 saved.append(self.get_volume(exist["id"]))
             else:
                 cur = self._exec(
@@ -773,6 +843,9 @@ class ProjectStore(QObject):
                     ).fetchall()
                 ]
                 self._purge_chapters_in_transaction(chapter_ids)
+                # 换纲重锁 = 整层推倒重建：旧卷及其版本历史一并清除
+                # （与「永久清除旧分卷创作数据」的确认文案一致，不留孤儿快照）
+                self.conn.execute("DELETE FROM volume_versions")
                 self.conn.execute("DELETE FROM volumes")
                 for i, volume in enumerate(volumes, 1):
                     cursor = self.conn.execute(
@@ -793,11 +866,12 @@ class ProjectStore(QObject):
                     index = int(volume.get("index") or 0)
                     existing = rows.get(index)
                     if existing:
-                        self.conn.execute(
-                            "UPDATE volumes SET title=?,summary=?,updated_at=? WHERE id=?",
-                            (volume.get("title", ""), volume.get("content", ""), created,
-                             existing["id"]),
-                        )
+                        # 与 sync_volumes_from_synopsis 同口径：内容被总纲覆盖时
+                        # 旧版自动入 volume_versions 并升版本（保留 target_chapters）
+                        self._update_volume_row(
+                            existing, volume.get("title", ""),
+                            volume.get("content", ""), existing.get("target_chapters"),
+                            conn=self.conn)
                         row = self.conn.execute(
                             "SELECT * FROM volumes WHERE id=?", (existing["id"],)
                         ).fetchone()
@@ -824,11 +898,12 @@ class ProjectStore(QObject):
         return saved
 
     def delete_volume(self, volume_id: int):
-        """删除分卷：其下章节归入未分卷（volume_id=NULL）。"""
+        """删除分卷：其下章节归入未分卷（volume_id=NULL）；版本历史一并清除。"""
         # 事务内必须用 self.conn.execute：_exec 自带 commit 会提前结束事务，
         # 导致「章节已脱离卷」先落库而「删卷」失败时留下孤儿数据。
         with self._transaction():
             self.conn.execute("UPDATE chapters SET volume_id=NULL WHERE volume_id=?", (volume_id,))
+            self.conn.execute("DELETE FROM volume_versions WHERE volume_id=?", (volume_id,))
             self.conn.execute("DELETE FROM volumes WHERE id=?", (volume_id,))
         self.chapters_changed.emit()
 

@@ -73,13 +73,18 @@ COGNITION_RULES = (
 #   干扰它的低温纪律
 JAILBREAK_MODES = {
     "synopsis": "full",
-    "volume": "full",
+    "volume": "full", "volume_iter": "full",
     "outline": "full", "detail": "full",
     "prose": "full", "prose_rewrite": "full",
     "check": "light", "style": "light",
     "memory": "off",
 }
 _DEFAULT_JB_MODE = "full"
+
+# 总纲局部注入（2026-10-08）用：识别「#~#### 分卷N」标题行，把 parse 吞进整体层
+# body 的卷段落裁掉（_MD_H2_RE 只按 H2 切，### 分卷不截断）。
+_SYNOPSIS_VOL_HEADING_RE = re.compile(
+    r"^\s*#{1,4}\s*分卷\s*[0-9〇一二三四五六七八九十百千]+", re.M)
 
 # ---------- 协议栈增强（2026-09-23，可开关）----------
 # 来源：「酒馆能过我们不能」对照实验（完整链路见 docs/酒馆破限对照排查SOP.md §4.9）。
@@ -1459,11 +1464,83 @@ class Assembler:
             lines.append("细纲中的时间推进须与当前故事时间衔接；涉及伤势的块须符合恢复进度。")
         return "\n".join(lines)
 
-    def _synopsis_text(self) -> str:
+    def _synopsis_text(self, volume_id=None) -> str:
+        """已确认总纲注入文本（2026-10-08 起默认局部注入）。
+
+        默认只注入「整体层 + 当前卷及其前后各一卷」：各环节不再全书逐卷展开，
+        省 token、防止远处卷剧情干扰本次生成。被裁掉的卷以一行清单留名，
+        AI 仍知道全书卷数与卷名，衔接不断桥。
+        总纲页勾选「总纲全文注入」（项目设置 synopsis_full_inject=1）、
+        或当前任务无法定位所在卷（无 volume_id / 未分卷章节）时注入完整总纲；
+        总纲里解析不出分卷段落时同样回退全文（宁多勿缺，不静默丢设定）。
+        """
         s = self.store.current_synopsis()
         if not s:
             return ""
-        return f"【已确认总纲（不可违背的基础设定）】\n标题：{s.get('title','')}\n{s['content']}"
+        content = s["content"]
+        full_on = str(self.store.get_setting("synopsis_full_inject", "0")).strip() == "1"
+        if volume_id and not full_on:
+            part = self._synopsis_partial(content, int(volume_id))
+            if part:
+                content = part
+        return f"【已确认总纲（不可违背的基础设定）】\n标题：{s.get('title','')}\n{content}"
+
+    def _synopsis_partial(self, content: str, volume_id: int) -> str:
+        """把总纲裁到「本卷±一卷」；裁不动（解析不出分卷/卷定位不到）返回空串=用全文。"""
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        parsed = Pipeline.parse_synopsis_volumes(content)
+        vols = parsed.get("volumes") or []
+        all_vols = self.store.list_volumes()
+        idx = next((i for i, x in enumerate(all_vols) if x["id"] == volume_id), None)
+        if idx is None or not vols:
+            return ""
+        cur = idx + 1  # 库中卷序（第几卷）；总纲「分卷N」段落序号同为 1-based
+        keep = {cur - 1, cur, cur + 1}
+        kept = [v for v in vols if int(v.get("index") or 0) in keep]
+        if not kept or len(kept) == len(vols):
+            return ""  # 本卷附近无段落可裁 / 全书本就没超出窗口：全文更忠实
+        parts = []
+        overview = (parsed.get("overview") or "").strip()
+        if overview:
+            # Markdown 分卷用 ### 时，parse 的「## 整体层」body 会吞进全部卷段落
+            # （_md_split 按 H2 切，### 不截断）——拼局部版前必须裁到第一个卷标题行，
+            # 否则局部注入反而比全文还长且重复。裸/■格式的 overview 本就干净，正则不中。
+            m = _SYNOPSIS_VOL_HEADING_RE.search(overview)
+            if m:
+                overview = overview[:m.start()].strip()
+        else:
+            # 「# 整体层」(H1) + 「### 分卷N」写法：parse 不认 H1 overview 置空，
+            # 从原文取第一个卷标题之前的段落补上，局部注入不丢全书设定
+            m2 = _SYNOPSIS_VOL_HEADING_RE.search(content or "")
+            if m2:
+                overview = content[:m2.start()].strip()
+        if overview:
+            parts.append("## 整体层\n" + overview)
+        omitted = [v for v in vols if int(v.get("index") or 0) not in keep]
+        if omitted:
+            names = "、".join(f"分卷{v['index']}《{(v.get('title') or '').strip()}》"
+                              for v in omitted)
+            parts.append(f"（全书共 {len(vols)} 卷。其余分卷未注入正文，仅列名供定位："
+                         f"{names}；本次只涉及相邻分卷，被略分卷不得与本次产出矛盾，"
+                         f"也无需展开其剧情）")
+        for v in vols:
+            n = int(v.get("index") or 0)
+            if n not in keep:
+                continue
+            head = f"### 分卷{n}：{(v.get('title') or '').strip()}" if v.get("title") \
+                else f"### 分卷{n}"
+            parts.append(head + "\n" + (v.get("content") or "").strip())
+        return "\n\n".join(parts)
+
+    def _synopsis_vol_id(self, context: dict, chapter) -> int | None:
+        """当前任务所在卷 id：context.volume_id 优先，退回章节归属；未分卷 = None（注入全文）。"""
+        vid = context.get("volume_id")
+        if vid is None and chapter:
+            vid = chapter.get("volume_id")
+        try:
+            return int(vid) if vid else None
+        except (TypeError, ValueError):
+            return None
 
     def _prior_chapters(self, chapter_id: int) -> str:
         """前文注入：按项目配置（K、模式、截取字数）取本章之前的章节。
@@ -1762,9 +1839,13 @@ class Assembler:
         if not route:
             raise ValueError(f"未知任务角色: {role}")
         # 总纲生成/迭代统一走 synopsis 角色（brainstorm 已废弃删除）
+        # volume_iter（分卷迭代，2026-10-08）复用「分卷」阶段：偏好/阶段卡/语义召回
+        # 口径与切章任务一致（迭代的就是分卷描述），只是任务模板与注入内容不同。
         stage = role if role in ("synopsis", "volume", "outline", "detail",
                                  "prose", "prose_rewrite",
                                  "check", "style") else ""
+        if role == "volume_iter":
+            stage = "volume"
         chapter = context.get("chapter")
         block = context.get("block")
         # 2.5 语义检索（向量召回）提前到 _split_cast 之前计算：结果两用——
@@ -1873,9 +1954,11 @@ class Assembler:
             # 重复注入既费上下文又诱导模型把整卷剧情写进单章大纲
             add("本分卷", "volume", self._volume_pointer_text(context.get("volume_id")),
                 4, order=4)
-            add("已确认总纲", "synopsis", self._synopsis_text(), 3, order=5)
+            # 总纲局部注入（2026-10-08）：只带本卷及前后一卷（可被「总纲全文注入」关掉）
+            add("已确认总纲", "synopsis",
+                self._synopsis_text(self._synopsis_vol_id(context, chapter)), 3, order=5)
         elif role == "volume":
-            # 切分一卷：注入 总纲（含全部卷定义）+ 本卷分卷（仅卷序+卷名）+ 前一卷最后一章（衔接）。
+            # 切分一卷：注入 总纲（默认局部：本卷±一卷）+ 本卷分卷（仅卷序+卷名）+ 前一卷最后一章（衔接）。
             # 前一卷最后一章比整卷概要更省上下文、衔接更精确；本卷分卷模块只声明卷序，避免与总纲重复。
             # 本卷指针置顶（本次要切的卷最先入眼），总纲殿后作全书定位参考。
             vol = self.store.get_volume(context.get("volume_id"))
@@ -1885,14 +1968,23 @@ class Assembler:
                 add("本卷分卷（待切分）", "volume",
                     f"【本卷分卷（第{idx}卷，当前要切分的卷）】\n卷名：{title}\n"
                     f"（本卷具体内容见下方总纲「分卷{idx}」，此处不再重复）", 4, order=0)
-            add("已确认总纲", "synopsis", self._synopsis_text(), 3, order=1)
+            add("已确认总纲", "synopsis", self._synopsis_text(context.get("volume_id")),
+                3, order=1)
             add("前一卷最后一章（衔接）", "prior_volume",
                 self.store.get_prev_volume_last_chapter(context.get("volume_id")), 7)
+        elif role == "volume_iter":
+            # 分卷迭代（2026-10-08）：修订一卷的分卷描述。注入 本卷现状+修改意见
+            # （置顶，直接施工对象）+ 总纲局部（本卷±一卷，衔接与整体层依据）。
+            # 本卷现状/意见同时随 volume_iter 模板发出（与总纲迭代双通道同口径）。
+            add("本卷迭代（现状与修改意见）", "user", context.get("user_req", ""),
+                5, order=0)
+            add("已确认总纲", "synopsis", self._synopsis_text(context.get("volume_id")),
+                3, order=1)
         elif role == "detail":
             # 本章大纲是本次任务的直接施工对象，置顶（同大纲阶段顺序原则）
             add("本章大纲", "outline", self._chapter_text(chapter) if chapter else "",
                 4, order=0)
-            add("已确认总纲", "synopsis", self._synopsis_text(), 3)
+            add("已确认总纲", "synopsis", self._synopsis_text(self._synopsis_vol_id(context, chapter)), 3)
             add("认知规则", "cognition", COGNITION_RULES, 5)
             add("人物状态卡（不可违背）", "cards", self._character_cards(cast_full, include_sealed=True,
                                    cur_order=(chapter or {}).get("order_index") or 0), 9, critical=True)
@@ -1916,7 +2008,8 @@ class Assembler:
             add("设定资料", "lore", self._lore_text(char_names, context), 5)
             add("风格样本", "sample", self._style_samples(), 2)
             # 正文阶段注入总纲（全书基础设定）而非本章大纲，防止写正文时跑偏全书设定
-            add("已确认总纲", "synopsis", self._synopsis_text(), 4)
+            # （2026-10-08：默认局部注入——本卷±一卷；总纲页可勾「总纲全文注入」恢复全量）
+            add("已确认总纲", "synopsis", self._synopsis_text(self._synopsis_vol_id(context, chapter)), 4)
             plan = context.get("chapter_plan")
             if plan:
                 # 整章/分批正文生成：注入全章施工单（含已写块衔接），而非单块细纲；
