@@ -56,31 +56,33 @@ def run_whole_call(store, chapter: dict, draft: str, runner,
     差量替换：模型只回传「P段号：改写后的整段」条目，这里解析后由
     apply_diff 替换进初稿——没有条目的段落原样保留（不经模型）。
     返回 {ok, text(整章成稿), changed(替换段号), skipped(越界段号),
-    none_declared(模型声明全章无病灶), error, stopped}。
+    none_declared(模型声明全章无病灶), meta_dropped(模型只回「已删除」类标记、
+    被丢弃的段号——原段保留，绝不写进正文), error, stopped}。
     """
+    _empty = {"text": "", "changed": [], "skipped": [], "none_declared": False,
+              "meta_dropped": []}
     if stop_event is not None and stop_event.is_set():
-        return {"ok": False, "stopped": True, "error": "已停止", "text": "",
-                "changed": [], "skipped": [], "none_declared": False}
+        return {"ok": False, "stopped": True, "error": "已停止", **_empty}
     ctx, task = build_whole(store, chapter, draft)
     r = runner("prose_rewrite", ctx, task)
     if r.get("status") == "stopped":
         return {"ok": False, "stopped": True, "error": r.get("error") or "已停止",
-                "text": "", "changed": [], "skipped": [], "none_declared": False}
+                **_empty}
     if not r.get("ok"):
         return {"ok": False, "stopped": False, "error": r.get("error") or "改写调用失败",
-                "text": "", "changed": [], "skipped": [], "none_declared": False}
+                **_empty}
     text = (r.get("text") or "").strip()
     if not text:
-        return {"ok": False, "stopped": False, "error": "改写输出为空", "text": "",
-                "changed": [], "skipped": [], "none_declared": False}
+        return {"ok": False, "stopped": False, "error": "改写输出为空", **_empty}
     info: dict = {}
     repl = Pipeline.parse_style_rewrite_diff(text, info)
     if not repl and not info.get("none_declared") and info.get("noise_lines"):
         # 一条条目都没认出来，还净是噪声行 → 大概率没按格式输出（如重抄了全文）
         return {"ok": False, "stopped": False,
                 "error": "未识别到任何替换条目（P段号：改写后的段落），输出可能不符合格式",
-                "text": "", "changed": [], "skipped": [], "none_declared": False}
+                **_empty}
     merged, applied, skipped = apply_diff(draft, repl)
     return {"ok": True, "stopped": False, "error": "", "text": merged,
             "changed": applied, "skipped": skipped,
-            "none_declared": bool(info.get("none_declared"))}
+            "none_declared": bool(info.get("none_declared")),
+            "meta_dropped": list(info.get("meta_dropped") or [])}

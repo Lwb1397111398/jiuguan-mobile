@@ -73,6 +73,20 @@ _FORMAL_HEAD_RE = re.compile(
     r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*{0,2})?(?:[【\[][ \t]*)?[^\n]{0,8}?"
     r"(?:正式输出|正文输出)[^\n]{0,16}?[ \t]*[:：]?[ \t]*(?:[】\]])?(?:\*{0,2})?[ \t]*$", re.M)
 
+# 协议分隔行「窄形态」（2026-10-12《散打》总纲 log15 实测）：模型按模板把分隔行转写成
+# 「正式输出如下。」——带句读被通用形态的 head_like 挡掉；思考段占比超过 60% 位置区
+# （该书思考框架 P0~P6 占到 64%）又被位置区挡掉，两头卡死 → 整篇当总纲进识别、
+# 报「未识别到总纲候选」。窄形态整行只允许「前缀 + 核心词 + 固定引导后缀 +
+# 括号内注解 + 一个结尾标点」，没有 [^\n] 兜底位——正常行文不可能整行恰是这一句，
+# 所以豁免位置区与标点校验。模板正体「正式输出（严格按 Markdown 输出，…）：」
+# 括号注解超通用形态 16 字窗口，同走此路。
+_FORMAL_NARROW_RE = re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*{0,2})?(?:[【\[][ \t]*)?"
+    r"(?:以下是|接下来是|现在)?[ \t]*(?:正式输出|正文输出)"
+    r"(?:[ \t]*(?:如下所示|如下|现在开始))?"
+    r"(?:[ \t]*[（(][^（）()\n]{1,40}[）)])?"
+    r"[ \t]*(?:[】\]])?(?:\*{0,2})?[ \t]*(?:[。．]|[：:])?[ \t]*$", re.M)
+
 # 任意 Markdown 标题（用于定位思考段的结束边界）
 _MD_ANY_HEAD_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]*[^\n]*$", re.M)
 # 任意独立成行的【…】标记
@@ -160,14 +174,26 @@ def _line_is_head_like(line: str) -> bool:
 
 
 def _formal_anchor(text: str) -> int | None:
-    """定位「正式输出」锚点行，返回该行之后的起始下标；拿不准返回 None。"""
+    """定位「正式输出」锚点行，返回该行之后的起始下标；拿不准返回 None。
+
+    两类候选**按位置取最早**（锚点在正文起点，更早的才是真分隔行；若窄形态
+    整体优先，「浅处合法宽锚 + 深处正文恰好一行『正式输出如下。』」会把正文开头
+    切进思考段）：
+    - 宽形态：受 60% 位置区 + head_like（无句读、≤40 字）双重限制；
+    - 窄形态协议分隔行（「正式输出如下。」，见 _FORMAL_NARROW_RE 注释）：
+      整行恰为模板规定的分隔语，形态本身即强信号，豁免两项校验。
+    """
     zone = len(text) * _FORMAL_ANCHOR_ZONE
+    cands: list[tuple[int, int]] = [(m.start(), m.end())
+                                    for m in _FORMAL_NARROW_RE.finditer(text)]
     for m in _FORMAL_HEAD_RE.finditer(text):
         if m.start() > zone:
             continue
         if not _line_is_head_like(m.group(0)):
             continue
-        nxt = text.find("\n", m.end())
+        cands.append((m.start(), m.end()))
+    for pos, end in sorted(cands):
+        nxt = text.find("\n", end)
         start = nxt + 1 if nxt >= 0 else len(text)
         if text[start:].strip():
             return start
@@ -593,6 +619,24 @@ _BODY_MARKER_LINE_RE = re.compile(
     r"[\s*＊#＃~～\-—–【】\[\]〔〕（）()]*$")
 
 
+# 整行被成对伪标签包裹（<Time>…</Time> / <场景>…</场景>）：RP 预设常把场景头
+# 套在 <Time> 标签里。实测《极限体能》ch3 输出首行
+# 『<Time>『2024年-10月19日-星期六–17:50-市郊廉租公寓-暮色』</Time>』——旧判定
+# 只认内层『』/【】，标签挡在开头 → 该行不剥、其后紧邻的章名行也剥不掉
+# （_strip_leading_prose_junk 只剥「开头连续」junk）。2026-10-10 扩。
+_WRAPPED_TAG_LINE_RE = re.compile(
+    r"^<([A-Za-z][A-Za-z0-9_\-:]{0,20})>\s*(.+?)\s*</\1>\s*$", re.S)
+
+
+def _unwrap_tag_line(line: str) -> tuple[str, bool]:
+    """剥掉整行的成对伪标签包裹 → (内部文本, 是否剥过)。"""
+    core = (line or "").strip()
+    m = _WRAPPED_TAG_LINE_RE.match(core)
+    if m:
+        return m.group(2).strip(), True
+    return core, False
+
+
 def _scene_header_inner(line: str) -> str:
     """整行被『』/【】包裹时返回内部文本，否则返回空串。"""
     core = line.strip().strip("*＊").strip()
@@ -605,23 +649,31 @@ def _scene_header_inner(line: str) -> str:
 def _is_scene_header_line(line: str) -> bool:
     """该行是否像场景头（日期-星期-时间-地点-天气 一类的多字段行）。
 
-    两种形态：
-    1. 整行『…』/【…】包裹，内部按分隔符切 ≥3 段且至少 2 段不同
-       （日期-星期-时间-地点-天气；『走-走-走』式重复短对白不会命中）；
-    2. 短行内出现 ≥2 个「时间：/日期：/地点：/天气：/场景：」标签。
+    形态：
+    1. 整行『…』/【…】包裹（**可再被 <Time> 等伪标签包一层**，2026-10-10 扩），
+       内部按分隔符切 ≥3 段且至少 2 段不同（日期-星期-时间-地点-天气；
+       『走-走-走』式重复短对白不会命中）；
+    2. 被伪标签整行包裹的多字段串（无内层括号，如 <Time>2024-10-19-…-晴</Time>）；
+    3. 短行内出现 ≥2 个「时间：/日期：/地点：/天气：/场景：」标签。
     句末标点（。！？…）一票否决——场景头是字段串不是句子，对白几乎必带标点。
     """
-    core = line.strip()
-    if not core or len(core) > _SCENE_HEADER_MAX_INNER + 2:
+    body, wrapped = _unwrap_tag_line(line)
+    if not body or len(body) > _SCENE_HEADER_MAX_INNER + 2:
         return False
-    if _SENTENCE_END_RE.search(core):
+    if _SENTENCE_END_RE.search(body):
         return False
-    inner = _scene_header_inner(core)
+    inner = _scene_header_inner(body)
     if inner:
         segs = [s for s in re.split("[" + re.escape(_SCENE_HEADER_SEPS) + "]",
                                     inner) if s.strip()]
         return len(segs) >= 3 and len(set(segs)) >= 2
-    return len(set(_SCENE_LABEL_HEADS_RE.findall(core))) >= 2
+    if wrapped:
+        # 标签包裹但无内层括号：只有「伪标签包裹」这个强信号才敢按分隔符判，
+        # 裸行同形态（『他突然想起-昨天-的事』）不在此路，避免误伤正文行文。
+        segs = [s for s in re.split("[" + re.escape(_SCENE_HEADER_SEPS) + "]",
+                                    body) if s.strip()]
+        return len(segs) >= 3 and len(set(segs)) >= 2
+    return len(set(_SCENE_LABEL_HEADS_RE.findall(body))) >= 2
 
 
 def _is_body_marker_line(line: str) -> bool:
@@ -698,6 +750,42 @@ def strip_jailbreak_residue(text: str) -> str:
     return text
 
 
+def strip_stray_scene_lines(text: str) -> tuple[str, int]:
+    """全文剥离「独立成行的场景头」（含 <Time> 伪标签包装变体）→ (文本, 处数)。
+
+    背景（2026-10-10 老板反馈「分批写作时正文里总出现时间戳」）：分批续批时模型
+    习惯在**场景切换处**（正文中段，不在章首）再打一行场景头，实测《校霸》
+    ch4/ch5/ch7：
+        ……背着沉重的枷锁，硬生生熬穿了漫长的黑夜。
+        『2012-10月26日-星期六–06:15-青川市中心涂玫高档公寓-晴』   ← 中段场景头
+        晨曦把窗帘缝隙染成灰白的时候，房门再次被推开。
+    开头的场景头由 `_strip_leading_prose_junk` 收走，**中段的全部漏进正文落库**
+    （并随初稿喂给改写模型，被照抄成 `P185：『…』`）。
+
+    判定复用 `_is_scene_header_line`（严格：成对『』/【】或多字段标签、去分隔符
+    ≥3 段且 ≥2 段不同、无句末标点、长度受限度；正文对白『你要去哪？』、
+    重复短句『走-走-走』、单字段『天啊』都不会命中）。删除只针对**整行**，
+    正文行一个字不动；删完只剩这些行时回退原文（绝不丢正文）。幂等。
+    """
+    raw = (text or "")
+    if not raw.strip():
+        return raw, 0
+    lines = raw.split("\n")
+    out: list[str] = []
+    removed = 0
+    for ln in lines:
+        if ln.strip() and _is_scene_header_line(ln):
+            removed += 1
+            continue
+        out.append(ln)
+    if not removed:
+        return raw, 0
+    new = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    if not new:
+        return raw, 0          # 全是场景头 → 回退原文（绝不把正文剥成空）
+    return new, removed
+
+
 def strip_prose_residue(text: str, scene_captured: list[str] | None = None) -> str:
     """正文终清洗（幂等）：剥破甲回显标签、思考起始块、开场白引导行、章节名行、
     场景头行、正文标记行。
@@ -706,8 +794,10 @@ def strip_prose_residue(text: str, scene_captured: list[str] | None = None) -> s
     - 整行仅由伪标签构成的行删除；
     - 已知破甲锚点（今夜的故事从此处开始）到第一个正文起点之间的整块思考剥离；
     - 开头的场景头（『日期-星期-时间-地点-天气』）、章节名行、正文标记行、
-      冒号引导行逐行剥离（开头连续最多 8 行，不碰正文中部）；
-      scene_captured 非 None 时收集被剥的场景头原文（2026-09-26，交记忆系统）。
+      冒号引导行逐行剥离（开头连续最多 8 行）；
+      scene_captured 非 None 时收集被剥的场景头原文（2026-09-26，交记忆系统）；
+    - **全文**再扫一遍独立成行的场景头（含 <Time> 包装）——分批续批时模型会在
+      场景切换处（正文中段）重复打场景头，只剥开头会漏（2026-10-10）。
 
     拿不准一律不剥；全文只剩残渣时回退原文（绝不丢正文）。
     """
@@ -715,6 +805,7 @@ def strip_prose_residue(text: str, scene_captured: list[str] | None = None) -> s
     original = text
     text = strip_jailbreak_residue(text)
     text = _strip_leading_prose_junk(text, scene_captured)
+    text, _n = strip_stray_scene_lines(text)
     if original.strip() and not text.strip():
         return original
     return text

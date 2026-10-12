@@ -2205,7 +2205,15 @@ class WritingPage:
             if skipped:
                 toast(self.page, "段号 %s 超出本章范围，已忽略"
                       % "、".join(str(s) for s in skipped))
+            dropped = info.get("meta_dropped") or []
+            if dropped:
+                # 模型想「删掉这一段」只回了标记（如【此段落已按指令删除】）：
+                # 解析层已丢弃该条目 → 原段保留，标记绝不落进正文（2026-10-10）。
+                toast(self.page, "模型对第 %s 段只回了「已删除」标记，已保留原段"
+                      % "、".join(str(s) for s in dropped))
             if not applied:
+                if dropped:
+                    return
                 toast(self.page, "AI 判定全章无病灶，无需改写"
                       if info.get("none_declared") else "没有可落地的替换条目")
                 return

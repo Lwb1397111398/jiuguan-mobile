@@ -1596,10 +1596,53 @@ _CHECK_HEAD_LINE_RE = re.compile(
 _CHECK_ITEM_LINE_RE = re.compile(
     r"^(?:[ \t]*(?:[①-⑳Ⓐ-Ⓩ]|[0-9]{1,2}\s*[、.．)）]|[（(][0-9]{1,2}[）)]|[-–—•●○◇◆＊*]\s)"
     r"|[ \t]{2,}\S|拍\s*[0-9]+\s*[.．]\s*[0-9]+)")
-# 模型自己补的占位说明回显行（实测极寒末日 ch10：检查块后孤悬两行『（删除此行）』）。
-# 只认整行括号包裹 ≤22 字且命中 删除/占位/此行/替换/不输出 词，正常正文不会独有这样一行
+# 模型自己补的占位说明回显行（实测极寒末日 ch10：检查块后孤悬两行『（删除此行）』；
+# 2026-10-10 扩括号：改写模型把整段替换成『【此段落已按指令删除】』——方头括号形态
+# 同样要收，校霸第 5 章正文实测 3 处）。
+# 只认整行括号包裹 ≤22 字且命中元信息词，正常正文不会独有这样一行。
+_META_PLACEHOLDER_WORDS = ("删除", "已删", "占位", "此行", "替换", "不输出")
+_META_PLACEHOLDER_PAT = "|".join(_META_PLACEHOLDER_WORDS)
+_META_BRACKETS_OPEN = r"（\(【\[〖〔"
+_META_BRACKETS_CLOSE = r"）\)】\]〗〕"
+_META_BRACKETS_ANY = _META_BRACKETS_OPEN + _META_BRACKETS_CLOSE
 _ECHO_INSTRUCTION_LINE_RE = re.compile(
-    r"^[ \t]*[（(][^（()）\n]{0,20}?(?:删除|占位|此行|替换|不输出)[^（()）\n]{0,14}?[)）][ \t]*$")
+    r"^[ \t]*[" + _META_BRACKETS_OPEN + r"][^" + _META_BRACKETS_ANY + r"\n]{0,20}?"
+    r"(?:" + _META_PLACEHOLDER_PAT + r")"
+    r"[^" + _META_BRACKETS_ANY + r"\n]{0,14}?"
+    r"[" + _META_BRACKETS_CLOSE + r"][ \t]*$")
+# 差量改写条目专用的「元信息占位」判据（2026-10-10）：词表比行级判据宽
+# （多认 略去/省略/保留/原为/无需/按指令 等），代价只是「该条目不成立、原段保留」，
+# 绝不丢正文，所以宁可多认。唯一消费点见 Pipeline.parse_style_rewrite_diff。
+_META_PLACEHOLDER_WORDS_WIDE = _META_PLACEHOLDER_WORDS + (
+    "略去", "省略", "保留", "原为", "无需", "按指令", "该段", "本段", "此处")
+_META_SINGLE_LINE_RE = re.compile(
+    r"^[" + _META_BRACKETS_OPEN + r"][^" + _META_BRACKETS_ANY + r"\n]{0,30}?"
+    r"(?:" + "|".join(_META_PLACEHOLDER_WORDS_WIDE) + r")"
+    r"[^" + _META_BRACKETS_ANY + r"\n]{0,20}?"
+    r"[" + _META_BRACKETS_CLOSE + r"]$")
+
+
+def looks_like_meta_placeholder(text: str) -> bool:
+    """一条差量条目正文是否「模型自补的元信息/占位说明」而非正文（2026-10-10）。
+
+    实测诱因：初稿里夹着分批残留（【批内开工检查】块、『日期-地点』场景头）时，
+    改写模型会「顺手」把某段替换成一句说明——gemini-2.5-pro 回
+    `P164：【此段落已按指令删除】`，Old `apply_diff` 照单全收 → 标记写进成书
+    （校霸第 5 章 3 处），并被当上下文回灌给后续调用。
+
+    判据：条目 ≤4 行、每行 ≤30 字、至少一行是「整行括号包裹 + 命中元信息词」。
+    命中即视为该条目不成立（原段保留）——判据宁可多认：误判的代价只是这一段
+    没被改写，误放的代价是标记落进正文。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+    if not lines or len(lines) > 4:
+        return False
+    if any(len(ln) > 30 for ln in lines):
+        return False
+    return any(_META_SINGLE_LINE_RE.match(ln) for ln in lines)
 
 
 def _check_tail_line(line: str) -> bool:
@@ -1617,6 +1660,23 @@ def _check_tail_line(line: str) -> bool:
             or bool(re.search(r"<[^<>\n]{1,30}>\s*$", s)))
 # 分隔线行（*** / --- / ~~~ 等，模型爱打在检查段与正文之间）
 _BATCH_DIVIDER_LINE_RE = re.compile(r"^[ \t]*(?:[-*~＿_]\s*){3,}$")
+
+# 行尾贴着一个完整『…』/【…】场景头（2026-10-10）：『过渡句 + 场景头』粘在同一行
+# 的形态（实测《校霸》ch7 正文中段『开始输出。『2012-十月三十日-星期三–08:25-…』』）。
+_TAIL_SCENE_RE = re.compile(r"[『【][^『』【】\n]{4,60}[』】][ \t]*$")
+
+
+def _glue_scene_line(line: str) -> bool:
+    """整行 = 短前缀（过渡句/破甲标记）+ **行尾一个完整场景头**。
+
+    只认「场景头整体贴在行尾且前面还有前缀」——正文对白把『』夹在句中
+    （如 `他说：“开始吧。『好』”`，行尾是引号）不命中；长度上限 90。
+    """
+    s = (line or "").strip()
+    if not s or len(s) > 90:
+        return False
+    m = _TAIL_SCENE_RE.search(s)
+    return bool(m and m.start() > 0 and _is_scene_header_line(m.group(0)))
 
 
 def _is_batch_head_line(line: str) -> bool:
@@ -3636,6 +3696,22 @@ class Pipeline:
                 i += 1
                 removed += 1
                 continue
+            # 独立成行的场景头（含 <Time> 包装）：分批续批时模型在**正文中段**的
+            # 场景切换处重复打场景头（2026-10-10《校霸》ch4/ch5/ch7 实测：正文中间
+            # 夹一行『2012-10月26日-星期六–06:15-…』），旧清理只收「检查段尾行」与
+            # 「批头行前紧邻」两处，中段的漏进正文与改写初稿。判定严格（见
+            # textclean._is_scene_header_line），正文对白/强调不会命中。
+            if _is_scene_header_line(ln.strip()):
+                i += 1
+                removed += 1
+                continue
+            # 「过渡句 + 场景头」粘在同一行（实测《校霸》ch7 正文中段残留
+            # 『开始输出。『2012-十月三十日-星期三–08:25-…』』）：整行都是垃圾。
+            # 只认「行尾贴着完整场景头」——正文对白（『』夹在句中）不命中。
+            if _glue_scene_line(ln):
+                i += 1
+                removed += 1
+                continue
             out.append(ln)
             i += 1
         if not removed:
@@ -3671,18 +3747,47 @@ class Pipeline:
     # 「全章无病灶」的约定输出（模板要求带句号，末尾标点启发式才不会误判中断）
     _REWRITE_DIFF_NONE_RE = re.compile(r"^\s*无病灶[。.\s]*$")
 
+    @staticmethod
+    def _push_rewrite_entry(repl: dict, info: dict, no: int, lines: list) -> None:
+        """收一条差量条目：空体丢弃；元信息占位（模型自补的「已删除」类说明）
+        也丢弃并记进 info["meta_dropped"]——该条目不成立、原段保留，
+        绝不把标记写进正文（2026-10-10 校霸第 5 章实测 3 处，见
+        looks_like_meta_placeholder）。
+
+        2026-10-10 补同族保护：条目正文是**分批残留行**（场景头，含 <Time> 包装）
+        时同样丢弃——分批写作的初稿夹着中段场景头，改写模型把它当「一段」原样
+        回抄（实测《校霸》ch4 `P185：『2012-10月26日-星期六–02:15-…』`、ch5
+        `P211：『…晴』`）。照单替换会把该段正文换成垃圾 → 删残留行；删完为空
+        则丢弃条目、原段保留（判据严格，正常段落不会命中）。
+        """
+        body = "\n".join(lines).strip()
+        if not body:
+            return
+        kept = [ln for ln in body.split("\n")
+                if not (ln.strip() and _is_scene_header_line(ln))]
+        if not any(ln.strip() for ln in kept):
+            info.setdefault("meta_dropped", []).append(no)
+            return
+        body = "\n".join(kept).strip()
+        if looks_like_meta_placeholder(body):
+            info.setdefault("meta_dropped", []).append(no)
+            return
+        repl[no] = body
+
     @classmethod
     def parse_style_rewrite_diff(cls, text: str,
                                  info_out: dict | None = None) -> dict[int, str]:
         """解析差量替换输出 → {段号: 改写后的整段}（空 dict = 无病灶或无条目）。
 
         条目 = 条目头行 + 其后的续行（改写段落可能折行）；条目间空行可有可无。
-        info_out 写入 {"none_declared": 是否声明无病灶, "noise_lines": 被忽略的行数}
-        供调用方提示。重复段号取后值（模型修正前文时以后一条为准）。
+        info_out 写入 {"none_declared": 是否声明无病灶, "noise_lines": 被忽略的行数,
+        "meta_dropped": 被丢弃的元信息占位条目段号列表} 供调用方提示。
+        重复段号取后值（模型修正前文时以后一条为准）。
         """
         info = info_out if info_out is not None else {}
         info["none_declared"] = False
         info["noise_lines"] = 0
+        info["meta_dropped"] = []
         repl: dict[int, str] = {}
         cur_no = 0
         cur_lines: list[str] = []
@@ -3691,7 +3796,7 @@ class Pipeline:
             m = cls._REWRITE_DIFF_ENTRY_RE.match(s)
             if m:
                 if cur_no:
-                    repl[cur_no] = "\n".join(cur_lines).strip()
+                    cls._push_rewrite_entry(repl, info, cur_no, cur_lines)
                 cur_no = int(m.group(1) or m.group(2))
                 cur_lines = [m.group(3)]
                 continue
@@ -3705,8 +3810,8 @@ class Pipeline:
             else:
                 info["noise_lines"] += 1  # 条目开始前的标题行/引导行：忽略
         if cur_no:
-            repl[cur_no] = "\n".join(cur_lines).strip()
-        return {no: body for no, body in repl.items() if body}
+            cls._push_rewrite_entry(repl, info, cur_no, cur_lines)
+        return repl
 
     # ---------- 多章正文：手动导入批量入库（2026-09-16） ----------
 
