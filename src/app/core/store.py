@@ -567,8 +567,9 @@ class ProjectStore(QObject):
         ver = self.get_synopsis_next_version()
         created = db.now()
         self._exec(
-            "INSERT INTO synopsis(version,title,content,is_locked,created_at) VALUES(?,?,?,?,?)",
-            (ver, title, content, 1 if lock else 0, created))
+            "INSERT INTO synopsis(version,title,content,is_locked,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (ver, title, content, 1 if lock else 0, created, created))
         return self._one("SELECT * FROM synopsis WHERE version=?", (ver,))
 
     def get_synopsis_next_version(self) -> int:
@@ -581,17 +582,65 @@ class ProjectStore(QObject):
             self._exec("UPDATE synopsis SET is_locked=? WHERE id=?", (1 if locked else 0, r["id"]))
 
     def update_synopsis_in_place(self, content: str, title: str = "") -> dict | None:
-        """锁定态就地修改：只更新当前版本的内容/标题（不产生新版本、不触碰分卷）。
+        """锁定态就地修改：只更新当前版本的内容/标题（不产生新版本）。
 
         总纲注入提示词读的是当前版本（current_synopsis），就地更新即时生效；
-        同时同步锁定指纹，避免后续解锁重锁时把本次小改误判为「换纲」（换纲会清分卷）。
+        同时刷新 updated_at（分卷覆盖仲裁）、同步锁定指纹（避免后续解锁重锁把
+        本次小改误判为「换纲」——换纲会清分卷）。
+        分卷同步按卷进行（_resync_volumes_from_synopsis）：总纲页改了哪一卷的
+        『分卷N』段，哪一卷的分卷行就跟着以总纲为准（被覆盖的卷现行自动入
+        版本历史可找回）；没改的卷段不动分卷行，分卷页修订继续经注入覆盖生效。
         """
         r = self.current_synopsis()
         if not r:
             return None
-        self._exec("UPDATE synopsis SET content=?, title=? WHERE id=?", (content, title, r["id"]))
+        self._exec("UPDATE synopsis SET content=?, title=?, updated_at=? WHERE id=?",
+                   (content, title, db.now(), r["id"]))
+        self._resync_volumes_from_synopsis(r["content"], content)
         self.set_meta("last_locked_synopsis_fingerprint", self.synopsis_fingerprint(content))
         return self._one("SELECT * FROM synopsis WHERE id=?", (r["id"],))
+
+    def _resync_volumes_from_synopsis(self, old_content: str, new_content: str) -> None:
+        """总纲就地修改后按卷把「段内容变了」的卷同步回分卷行（总纲是父文档口径）。
+
+        标题/正文分别比对旧总纲段与新总纲段：只回写总纲侧变了的字段，分卷行
+        另一侧的现行修订保留（如分卷迭代改过卷名、总纲就地只改段正文 → 卷名不动）。
+        基线一律推进到新段值，注入覆盖据此继续正确仲裁未动卷的分卷修订。
+        """
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+
+        def _secs(text: str) -> dict:
+            return {int(v.get("index") or 0): v
+                    for v in (Pipeline.parse_synopsis_volumes(text or "").get("volumes") or [])}
+        old_secs, new_secs = _secs(old_content), _secs(new_content)
+        if not new_secs:
+            return
+        for i, row in enumerate(self.list_volumes(), 1):
+            nv = new_secs.get(i)
+            if nv is None:
+                continue
+            t1 = (nv.get("title") or "").strip()
+            b1 = (nv.get("content") or "").strip()
+            ov = old_secs.get(i)
+            if ov is not None:
+                title_changed = t1 != (ov.get("title") or "").strip()
+                body_changed = b1 != (ov.get("content") or "").strip()
+            else:
+                title_changed = body_changed = True  # 总纲新增的段：以新段为准
+            if not (title_changed or body_changed):
+                continue  # 总纲里本卷段没动：分卷行保持（分卷修订继续有效）
+            row_title = (row.get("title") or "").strip()
+            row_summary = (row.get("summary") or "").strip()
+            new_title = t1 if title_changed else row_title
+            new_body = b1 if body_changed else row_summary
+            base = self._volume_synced_base(t1, b1)
+            if row_title == new_title and row_summary == new_body:
+                # 分卷行已与应同步值一致：只推进基线，不升版不快照（幂等）
+                self._exec("UPDATE volumes SET synopsis_synced=? WHERE id=?",
+                           (base, row["id"]))
+            else:
+                self._update_volume_row(row, new_title, new_body,
+                                        row.get("target_chapters"), synced=base)
 
     # ---------- 章节 ----------
 
@@ -631,11 +680,13 @@ class ProjectStore(QObject):
              volume.get("target_chapters"), db.now()))
 
     def _update_volume_row(self, volume: dict, title: str, summary: str,
-                           target_chapters, conn=None) -> None:
+                           target_chapters, conn=None, synced=None) -> None:
         """更新一卷内容；内容真的变了才快照旧版并升版本（幂等：原样保存不留空版本）。
 
         volume 需为改前完整行（含 version）。conn 传入表示在调用方事务里执行
         （lock_synopsis_with_volumes 用）；不传则自开单事务，快照与更新原子落库。
+        synced 传入时一并写 synopsis_synced 基线（=总纲分卷段同步值，覆盖仲裁用）；
+        分卷页手改/AI 迭代不传——基线保留旧同步值，注入时据此识别「分卷侧修订」。
         """
         old_title = (volume.get("title") or "").strip()
         old_summary = (volume.get("summary") or "").strip()
@@ -647,8 +698,13 @@ class ProjectStore(QObject):
             version += 1
         stamp = db.now()
         sql = ("UPDATE volumes SET title=?, summary=?, target_chapters=?, version=?,"
-               " updated_at=? WHERE id=?")
-        params = (title, summary, target_chapters, version, stamp, volume["id"])
+               " updated_at=?")
+        params = [title, summary, target_chapters, version, stamp]
+        if synced is not None:
+            sql += ", synopsis_synced=?"
+            params.append(synced)
+        sql += " WHERE id=?"
+        params.append(volume["id"])
         if conn is not None:
             if changed:
                 self._snapshot_volume(conn, volume)
@@ -658,6 +714,12 @@ class ProjectStore(QObject):
             if changed:
                 self._snapshot_volume(self.conn, volume)
             self.conn.execute(sql, params)
+
+    @staticmethod
+    def _volume_synced_base(title: str, body: str) -> str:
+        """synopsis_synced 基线：上次与该卷总纲段同步时的 {卷名, 段正文}。"""
+        return json.dumps({"t": (title or "").strip(), "b": (body or "").strip()},
+                          ensure_ascii=False)
 
     def save_volume(self, data: dict) -> dict:
         """新建或更新分卷。data 可含 id/title/summary/target_chapters。
@@ -719,17 +781,18 @@ class ProjectStore(QObject):
             idx = int(v.get("index") or 0)
             title = v.get("title") or ""
             summary = v.get("content") or ""
+            base = self._volume_synced_base(title, summary)
             exist = rows.get(idx)
             if exist:
                 # 已有卷：更新标题/描述（保留 target_chapters），内容变则以新总纲为准
                 self._update_volume_row(exist, title, summary,
-                                        exist.get("target_chapters"))
+                                        exist.get("target_chapters"), synced=base)
                 saved.append(self.get_volume(exist["id"]))
             else:
                 cur = self._exec(
-                    "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
-                    " VALUES(?,?,?,?,?,?)",
-                    (idx, title, summary, None, created, created))
+                    "INSERT INTO volumes(order_index,title,summary,target_chapters,"
+                    "synopsis_synced,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (idx, title, summary, None, base, created, created))
                 saved.append(self.get_volume(cur.lastrowid))
         return [s for s in saved if s]
 
@@ -829,8 +892,9 @@ class ProjectStore(QObject):
                     "SELECT COALESCE(MAX(version),0)+1 FROM synopsis"
                 ).fetchone()[0]
                 cursor = self.conn.execute(
-                    "INSERT INTO synopsis(version,title,content,is_locked,created_at) VALUES(?,?,?,?,?)",
-                    (next_version, title, content, 0, created),
+                    "INSERT INTO synopsis(version,title,content,is_locked,created_at,updated_at)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (next_version, title, content, 0, created, created),
                 )
                 synopsis_id = cursor.lastrowid
             else:
@@ -848,11 +912,13 @@ class ProjectStore(QObject):
                 self.conn.execute("DELETE FROM volume_versions")
                 self.conn.execute("DELETE FROM volumes")
                 for i, volume in enumerate(volumes, 1):
+                    base = self._volume_synced_base(volume.get("title", ""),
+                                                    volume.get("content", ""))
                     cursor = self.conn.execute(
-                        "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
-                        " VALUES(?,?,?,?,?,?)",
+                        "INSERT INTO volumes(order_index,title,summary,target_chapters,"
+                        "synopsis_synced,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                         (i, volume.get("title", ""), volume.get("content", ""), None,
-                         created, created),
+                         base, created, created),
                     )
                     saved.append(dict(self.conn.execute(
                         "SELECT * FROM volumes WHERE id=?", (cursor.lastrowid,)
@@ -864,6 +930,8 @@ class ProjectStore(QObject):
                 }
                 for volume in volumes:
                     index = int(volume.get("index") or 0)
+                    base = self._volume_synced_base(volume.get("title", ""),
+                                                    volume.get("content", ""))
                     existing = rows.get(index)
                     if existing:
                         # 与 sync_volumes_from_synopsis 同口径：内容被总纲覆盖时
@@ -871,16 +939,16 @@ class ProjectStore(QObject):
                         self._update_volume_row(
                             existing, volume.get("title", ""),
                             volume.get("content", ""), existing.get("target_chapters"),
-                            conn=self.conn)
+                            conn=self.conn, synced=base)
                         row = self.conn.execute(
                             "SELECT * FROM volumes WHERE id=?", (existing["id"],)
                         ).fetchone()
                     else:
                         cursor = self.conn.execute(
-                            "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
-                            " VALUES(?,?,?,?,?,?)",
+                            "INSERT INTO volumes(order_index,title,summary,target_chapters,"
+                            "synopsis_synced,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                             (index, volume.get("title", ""), volume.get("content", ""), None,
-                             created, created),
+                             base, created, created),
                         )
                         row = self.conn.execute(
                             "SELECT * FROM volumes WHERE id=?", (cursor.lastrowid,)

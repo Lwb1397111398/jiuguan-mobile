@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS synopsis (
   title      TEXT NOT NULL DEFAULT '',
   content    TEXT NOT NULL,
   is_locked  INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT ''  -- 本版内容最后变更时间（分卷覆盖仲裁用，_ensure_synopsis_updated_at 补列）
 );
 
 -- 分卷：总纲与大纲之间的第二层骨架（卷名 + 分卷描述 + 建议章数）
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS volumes (
   title           TEXT NOT NULL DEFAULT '',
   summary         TEXT NOT NULL DEFAULT '',  -- 分卷描述（本卷主线与扩充深化的情节，供大纲锚定与卷间衔接）
   target_chapters INTEGER,                    -- 建议章数（NULL = 未指定/AI 自定）
+  synopsis_synced TEXT NOT NULL DEFAULT '',  -- 上次与总纲分卷段同步的基线 JSON {"t":卷名,"b":段正文}（分卷覆盖仲裁用）
   version         INTEGER NOT NULL DEFAULT 1, -- 当前版本号（每次内容变更旧版自动入 volume_versions）
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
@@ -594,6 +596,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_lore_removed_at(conn)
     _ensure_model_profile_rpm(conn)
     _ensure_volume_version(conn)
+    _ensure_synopsis_updated_at(conn)
+    _ensure_volume_synopsis_synced(conn)
     if current < SCHEMA_VERSION:
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
     conn.commit()
@@ -736,3 +740,32 @@ def _ensure_volume_version(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(volumes)")}
     if "version" not in columns:
         conn.execute("ALTER TABLE volumes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+
+
+def _ensure_synopsis_updated_at(conn: sqlite3.Connection) -> None:
+    """为旧库的 synopsis 补 updated_at 列并回填（2026-10-16 分卷修订生效）。
+
+    updated_at = 该版总纲内容最后一次变更时间：新建版本=created_at，总纲页就地修改
+    （update_synopsis_in_place）会刷新。存量行有 synopsis_synced 基线时按基线仲裁；
+    无基线（老数据）时才用本列兜底：volumes.updated_at 不早于本版时间 → 分卷改在
+    总纲之后 → 注入总纲时用分卷库现行覆盖对应卷段。
+    与 rpm/version 同理走幂等补列，不进 MIGRATIONS（防新库 duplicate column）。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(synopsis)")}
+    if "updated_at" not in columns:
+        conn.execute("ALTER TABLE synopsis ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+    conn.execute("UPDATE synopsis SET updated_at=created_at WHERE updated_at=''")
+
+
+def _ensure_volume_synopsis_synced(conn: sqlite3.Connection) -> None:
+    """为旧库的 volumes 补 synopsis_synced 基线列（2026-10-16 分卷修订生效）。
+
+    基线 = 该卷上次与总纲『分卷N』段同步时的 {卷名, 段正文} JSON：
+    锁定/从总纲导入/总纲就地修改后按卷同步时写入。注入仲裁：分卷行现值≠基线
+    → 分卷侧在同步后又修订过 → 用分卷库覆盖总纲旧段；分卷行现值=基线且
+    总纲段≠基线 → 总纲侧后改（就地修改会同步回分卷行，正常不该出现）→ 以总纲为准。
+    空串 = 无基线老数据 → 回退 updated_at 时间仲裁（见 _ensure_synopsis_updated_at）。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(volumes)")}
+    if "synopsis_synced" not in columns:
+        conn.execute("ALTER TABLE volumes ADD COLUMN synopsis_synced TEXT NOT NULL DEFAULT ''")

@@ -86,6 +86,17 @@ _DEFAULT_JB_MODE = "full"
 _SYNOPSIS_VOL_HEADING_RE = re.compile(
     r"^\s*#{1,4}\s*分卷\s*[0-9〇一二三四五六七八九十百千]+", re.M)
 
+
+def _parse_synced_base(raw) -> tuple[str, str] | None:
+    """解析 volumes.synopsis_synced 基线 JSON {"t":卷名,"b":段正文}；无效/缺省=None。"""
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return (str(d.get("t") or ""), str(d.get("b") or ""))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
 # ---------- 协议栈增强（2026-09-23，可开关）----------
 # 来源：「酒馆能过我们不能」对照实验（完整链路见 docs/酒馆破限对照排查SOP.md §4.9）。
 # 当 system 与请求 body 都逐字同源时，酒馆能出正文、我方 6–13 秒快速拒答 —— 真差异是
@@ -1473,20 +1484,103 @@ class Assembler:
         总纲页勾选「总纲全文注入」（项目设置 synopsis_full_inject=1）、
         或当前任务无法定位所在卷（无 volume_id / 未分卷章节）时注入完整总纲；
         总纲里解析不出分卷段落时同样回退全文（宁多勿缺，不静默丢设定）。
+        2026-10-16：分卷库（volumes 表）现行卷内容覆盖总纲旧卷段——分卷页手改/
+        AI 迭代/载入历史只更新分卷库、不回写总纲正文，不覆盖则各环节注入的
+        「### 分卷N」仍是锁定时的旧词，改分卷对切章/大纲/细纲/正文不生效。
         """
         s = self.store.current_synopsis()
         if not s:
             return ""
         content = s["content"]
         full_on = str(self.store.get_setting("synopsis_full_inject", "0")).strip() == "1"
+        ovr = self._volume_overrides(s)
         if volume_id and not full_on:
-            part = self._synopsis_partial(content, int(volume_id))
+            part = self._synopsis_partial(content, int(volume_id), ovr)
             if part:
-                content = part
+                return (f"【已确认总纲（不可违背的基础设定）】\n标题：{s.get('title','')}\n{part}")
+        if ovr:
+            content = self._apply_volume_overrides(content, ovr)
         return f"【已确认总纲（不可违背的基础设定）】\n标题：{s.get('title','')}\n{content}"
 
-    def _synopsis_partial(self, content: str, volume_id: int) -> str:
-        """把总纲裁到「本卷±一卷」；裁不动（解析不出分卷/卷定位不到）返回空串=用全文。"""
+    def _volume_overrides(self, syn_row: dict) -> dict:
+        """分卷库现行与总纲分卷段不一致、且判定为分卷侧修订的卷：
+        {卷序(1-based): (卷名, 分卷描述)}（2026-10-16）。
+
+        对齐口径与局部注入一致：库中第几卷 ↔ 总纲『分卷N』段落序号。
+        仲裁（哪一侧是现行）：
+        - 有 synopsis_synced 基线（锁定/导入/总纲就地修改都会推进基线）：
+          分卷行现值 ≠ 基线 → 同步后分卷侧又修订过 → 分卷库现行；
+          分卷行现值 = 基线 → 与总纲同步（或总纲就地改时已同步回行）→ 不覆盖。
+        - 无基线（本改动前的老数据）回退时间仲裁：分卷行 updated_at **早于**
+          总纲本版时间 → 总纲就地修改在后 → 以总纲为准；同秒/未记录视为分卷
+          现行优先（锁定时总纲先落、分卷后同步，必须允许覆盖）。
+        """
+        rows = self.store.list_volumes()
+        if not rows:
+            return {}
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        parsed = Pipeline.parse_synopsis_volumes(syn_row.get("content") or "")
+        secs = {int(v.get("index") or 0): v for v in (parsed.get("volumes") or [])}
+        if not secs:
+            return {}
+        syn_ts = (syn_row.get("updated_at") or syn_row.get("created_at") or "").strip()
+        out: dict[int, tuple[str, str]] = {}
+        for i, r in enumerate(rows, 1):
+            sec = secs.get(i)
+            if sec is None:
+                continue
+            title = (r.get("title") or "").strip()
+            summary = (r.get("summary") or "").strip()
+            s_title = (sec.get("title") or "").strip()
+            s_body = (sec.get("content") or "").strip()
+            base = _parse_synced_base(r.get("synopsis_synced"))
+            if base is not None:
+                if summary == base[1] and title == base[0]:
+                    continue  # 与总纲同步过且没再改：以总纲为准
+            else:
+                ru = (r.get("updated_at") or "").strip()
+                if syn_ts and ru and ru < syn_ts:
+                    continue
+            if (summary and summary != s_body) or (title != s_title):
+                out[i] = (title, summary or s_body)
+        return out
+
+    def _apply_volume_overrides(self, content: str, overrides: dict) -> str:
+        """把分卷库现行卷内容就地覆盖进总纲原文的分卷段区域（全文注入/裁不动回退时）。
+
+        只认 Markdown 卷标题形态（###/## 分卷N）：■/裸行形态无法安全定位段落，
+        保持原文——局部注入路径基于解析重建，覆盖不受形态影响。
+        第一个卷标题前的全部原文（整体层及其他 H2 段）原样保留。
+        """
+        if not overrides:
+            return content
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        vols = Pipeline.parse_synopsis_volumes(content).get("volumes") or []
+        if not vols:
+            return content
+        m = _SYNOPSIS_VOL_HEADING_RE.search(content)
+        if not m:
+            return content
+        parts = []
+        for v in vols:
+            n = int(v.get("index") or 0)
+            if n in overrides:
+                title, body = overrides[n]
+            else:
+                title = (v.get("title") or "").strip()
+                body = (v.get("content") or "").strip()
+            head = f"### 分卷{n}：{title}" if title else f"### 分卷{n}"
+            parts.append(head + "\n" + body)
+        prefix = content[:m.start()].rstrip()
+        return (prefix + "\n\n" if prefix else "") + "\n\n".join(parts)
+
+    def _synopsis_partial(self, content: str, volume_id: int,
+                          overrides: dict | None = None) -> str:
+        """把总纲裁到「本卷±一卷」；裁不动（解析不出分卷/卷定位不到）返回空串=用全文。
+
+        overrides（_volume_overrides 产出）非空的卷段以分卷库现行为准重建，
+        其余卷段仍取总纲原文；窗外卷名清单同口径。
+        """
         from .pipeline import Pipeline  # 延迟导入避免循环依赖
         parsed = Pipeline.parse_synopsis_volumes(content)
         vols = parsed.get("volumes") or []
@@ -1496,9 +1590,20 @@ class Assembler:
             return ""
         cur = idx + 1  # 库中卷序（第几卷）；总纲「分卷N」段落序号同为 1-based
         keep = {cur - 1, cur, cur + 1}
+        ovr = overrides or {}
         kept = [v for v in vols if int(v.get("index") or 0) in keep]
-        if not kept or len(kept) == len(vols):
-            return ""  # 本卷附近无段落可裁 / 全书本就没超出窗口：全文更忠实
+        if not kept:
+            return ""
+        if len(kept) == len(vols) and not any(
+                int(v.get("index") or 0) in ovr for v in kept):
+            return ""  # 本卷附近无段落可裁 / 全书本就没超出窗口且无分卷修订：全文更忠实
+
+        def _merged(v: dict) -> tuple[str, str]:
+            n = int(v.get("index") or 0)
+            if n in ovr:
+                return ovr[n]
+            return ((v.get("title") or "").strip(), (v.get("content") or "").strip())
+
         parts = []
         overview = (parsed.get("overview") or "").strip()
         if overview:
@@ -1518,7 +1623,7 @@ class Assembler:
             parts.append("## 整体层\n" + overview)
         omitted = [v for v in vols if int(v.get("index") or 0) not in keep]
         if omitted:
-            names = "、".join(f"分卷{v['index']}《{(v.get('title') or '').strip()}》"
+            names = "、".join(f"分卷{int(v.get('index') or 0)}《{_merged(v)[0]}》"
                               for v in omitted)
             parts.append(f"（全书共 {len(vols)} 卷。其余分卷未注入正文，仅列名供定位："
                          f"{names}；本次只涉及相邻分卷，被略分卷不得与本次产出矛盾，"
@@ -1527,9 +1632,9 @@ class Assembler:
             n = int(v.get("index") or 0)
             if n not in keep:
                 continue
-            head = f"### 分卷{n}：{(v.get('title') or '').strip()}" if v.get("title") \
-                else f"### 分卷{n}"
-            parts.append(head + "\n" + (v.get("content") or "").strip())
+            title, body = _merged(v)
+            head = f"### 分卷{n}：{title}" if title else f"### 分卷{n}"
+            parts.append(head + "\n" + body)
         return "\n\n".join(parts)
 
     def _synopsis_vol_id(self, context: dict, chapter) -> int | None:
