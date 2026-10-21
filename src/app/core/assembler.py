@@ -73,7 +73,7 @@ COGNITION_RULES = (
 #   干扰它的低温纪律
 JAILBREAK_MODES = {
     "synopsis": "full",
-    "volume": "full", "volume_iter": "full",
+    "volume": "full", "volume_iter": "full", "volume_chapters_iter": "full",
     "outline": "full", "detail": "full",
     "prose": "full", "prose_rewrite": "full",
     "check": "light", "style": "light",
@@ -1946,10 +1946,11 @@ class Assembler:
         # 总纲生成/迭代统一走 synopsis 角色（brainstorm 已废弃删除）
         # volume_iter（分卷迭代，2026-10-08）复用「分卷」阶段：偏好/阶段卡/语义召回
         # 口径与切章任务一致（迭代的就是分卷描述），只是任务模板与注入内容不同。
+        # volume_chapters_iter（切章迭代，2026-10-17）同理：修订本卷章节切分。
         stage = role if role in ("synopsis", "volume", "outline", "detail",
                                  "prose", "prose_rewrite",
                                  "check", "style") else ""
-        if role == "volume_iter":
+        if role in ("volume_iter", "volume_chapters_iter"):
             stage = "volume"
         chapter = context.get("chapter")
         block = context.get("block")
@@ -2085,6 +2086,23 @@ class Assembler:
                 5, order=0)
             add("已确认总纲", "synopsis", self._synopsis_text(context.get("volume_id")),
                 3, order=1)
+        elif role == "volume_chapters_iter":
+            # 切章迭代（2026-10-17）：修订本卷已切的章节列表。注入 本卷现状+意见
+            # （置顶，施工对象）+ 总纲局部 + 前一卷最后一章（衔接，与切章同口径）。
+            # 本卷现状/意见随模板双通道发出；章指针供模型定位「本卷是第几卷」。
+            vol = self.store.get_volume(context.get("volume_id"))
+            if vol:
+                add("本卷分卷（待修订切分）", "volume",
+                    f"【本卷分卷（第{vol.get('order_index') or '?'}卷，"
+                    f"当前要修订切分的卷）】\n卷名：{vol.get('title') or ''}\n"
+                    f"（本卷具体内容见下方总纲「分卷{vol.get('order_index') or '?'}，"
+                    f"本卷现有章节切分见下条）", 4, order=0)
+            add("本卷切分迭代（现状与修改意见）", "user", context.get("user_req", ""),
+                5, order=1)
+            add("已确认总纲", "synopsis", self._synopsis_text(context.get("volume_id")),
+                3, order=2)
+            add("前一卷最后一章（衔接）", "prior_volume",
+                self.store.get_prev_volume_last_chapter(context.get("volume_id")), 7)
         elif role == "detail":
             # 本章大纲是本次任务的直接施工对象，置顶（同大纲阶段顺序原则）
             add("本章大纲", "outline", self._chapter_text(chapter) if chapter else "",
@@ -2124,6 +2142,16 @@ class Assembler:
                     10, critical=True)
             elif block:
                 add("本块细纲", "block", self._block_text(block), 10, critical=True)
+            elif context.get("outline_only"):
+                # 按大纲直写（2026-10-17）：老板要的「不生成细纲，直接按本章大纲写」。
+                # 即使本章库里已有细纲块也一律不注入——本模式的意义就是摆脱细纲
+                # 逐拍规定、把镜头与细节交还给模型。分批时 outline_batch_text 是
+                # 带【本批】/【后续批次（勿写）】标注的大纲全文
+                # （pipeline.outline_batch_scope_text 生成）；整章时为空串走完整大纲。
+                add("本章大纲（写作依据）", "block",
+                    context.get("outline_batch_text")
+                    or (self._chapter_prose_brief(chapter) if chapter else ""),
+                    10, critical=True)
             else:
                 # 整章 Markdown 模式（不分块）：细纲由本章大纲逐点展开而来，
                 # 有细纲块时细纲即唯一施工单（再注入大纲纯属重复，2026-08-28 删）；

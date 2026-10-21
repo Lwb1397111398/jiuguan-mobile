@@ -128,13 +128,23 @@ class AutoPilot:
         ch = store.get_chapter(ch["id"])
         if not ch:
             return None
-        if (ch.get("status") or "未规划") in ("未规划", "有大纲"):
+        status = ch.get("status") or "未规划"
+        if status == "未规划":
             return {"kind": "outline", "chapter": ch}
-        if ch.get("status") == "有细纲":
+        # 与桌面 _chapter_todo 同口径：看 outline_refined（细化只置这个标记、
+        # 不动 status），否则「有大纲 + 已细化」会无限重排细化步骤。
+        if status == "有大纲" and not ch.get("outline_refined"):
+            return {"kind": "outline", "chapter": ch}
+        # 按大纲直写（2026-10-17）：不生成细纲，大纲细化后直接写正文
+        if store.get_prose_mode() == "outline":
+            if status in ("有大纲", "有细纲", "写作中"):
+                return {"kind": "prose", "chapter": ch}
+            if status == "已完成" and not store.memory_snapshot_for_chapter(ch["id"]):
+                return {"kind": "archive", "chapter": ch}
+            return None
+        if status in ("有细纲", "写作中"):
             return {"kind": "prose", "chapter": ch}
-        if ch.get("status") == "写作中":
-            return {"kind": "prose", "chapter": ch}
-        if ch.get("status") == "已完成":
+        if status == "已完成":
             if not store.memory_snapshot_for_chapter(ch["id"]):
                 return {"kind": "archive", "chapter": ch}
         return None
@@ -380,8 +390,12 @@ class AutoPilot:
         store = self.session.store
         ch = store.get_chapter(step["chapter"]["id"])
         cid = ch["id"]
-        if store.get_prose_mode() == "batch":
+        mode = store.get_prose_mode()
+        if mode == "batch":
             self._do_prose_batch(step, ch, cid)
+            return
+        if mode == "outline" and store.get_outline_batch_split() != "whole":
+            self._do_prose_outline_batch(step, ch, cid)
             return
         task = render_task("prose_chapter_md", store,
                            chapter_index=ch.get("order_index", "?"),
@@ -393,6 +407,9 @@ class AutoPilot:
             "notes": store.list_notes(cid),
             "previous_end_override": Assembler(store).prev_chapter_end(cid),
         }
+        if mode == "outline":
+            # 按大纲直写（整章）：组装器跳过细纲，只用本章大纲
+            context["outline_only"] = True
         # 输出上限不按目标字数估算（与桌面 auto_pilot._prose_whole 同口径）：
         # 思考链与正文共享 max_tokens 预算，紧凑估算会被思考先耗掉、正文必截断；
         # 走 pipeline 的角色默认（prose 60000），渠道不接受大值时自动减半降级。
@@ -457,6 +474,81 @@ class AutoPilot:
             context["previous_end_override"] = Assembler(store).prev_chapter_end(cid)
         else:
             task = render_task("prose_batch_next", store, batch_no=next_idx, **common)
+            context["batch_state"] = store.prose_batch_state_package(cid)
+            context["previous_end_override"] = (
+                "【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"
+                "不要重复这段内容】\n" + batch_tail_two_paras(rows[-1].get("content") or ""))
+        self._run_gen("prose", context, task, step)
+
+    def _do_prose_outline_batch(self, step, ch: dict, cid: int):
+        """按大纲分批（2026-10-17，对齐桌面）：切段依据是本章大纲节拍，
+        不需要细纲块；滚动状态包与细纲分批共用。
+
+        步骤机按章状态评估进度：非末批落批后章仍是「写作中」→ 重新排出
+        prose 步骤，自然接力；末批合并接受后进入归档。
+        """
+        from app.core.chapter_outline import chapter_outline_text
+        from app.core.pipeline import (plan_outline_batches, batch_tail_two_paras,
+                                       outline_batch_scope_text)
+        from app.core.task_templates import (render as render_task,
+                                             OUTLINE_BATCH_FINAL_NOTE)
+        store = self.session.store
+        outline = chapter_outline_text(ch)
+        if not outline.strip():
+            self._fail(step, "本章还没有大纲，无法按大纲写正文")
+            return
+        free = store.get_outline_batch_split() == "free"
+        plans = plan_outline_batches(outline,
+                                     store.get_setting_int("outline_batch_size", 2))
+        if not plans:
+            self._fail(step, "本章大纲为空，无法分批")
+            return
+        rows = store.list_prose_batches(cid)
+        next_idx = len(rows) + 1
+        if next_idx > len(plans):
+            # 批全齐但正文未接受（上次中断在合并前）→ 直接合并收尾
+            merged = store.prose_batch_merged(cid)
+            if not merged.strip():
+                self._fail(step, "批次记录为空且无已写正文")
+                return
+            store.accept_chapter_prose(cid, merged)
+            store.set_chapter_status(cid, "已完成")
+            self._tick()
+            return
+        is_final = next_idx == len(plans)
+        if free:
+            scope_brief = (f"本章共 {len(plans)} 批，本批是第 {next_idx} 批："
+                           f"推进到全章约 {next_idx}/{len(plans)} 处，"
+                           "停在一个自然场景的收束点，后面的内容留给下一批。")
+        else:
+            cur = plans[next_idx - 1]
+            scope_brief = (f"本批覆盖：{cur['label']}"
+                           f"（全章 {cur['total_beats']} 个节拍中的第 {cur['first']}~{cur['last']} 个）。"
+                           "只写这一段，后面的节拍留给下一批。")
+        if is_final:
+            scope_brief += "本批是最后一批：把大纲剩下的内容全部写完，并收好章尾。"
+        # 本模式没有细纲块：ids 存空数组（_apply_step 落批逻辑通用）
+        step["_batch"] = {"index": next_idx, "ids": [], "final": is_final}
+        context = {
+            "chapter": ch,
+            "character_names": ch.get("characters") or [],
+            "outline_only": True,
+            "outline_batch_text": outline_batch_scope_text(plans, next_idx, free=free),
+            "notes": store.list_notes(cid),
+            "batch_index": next_idx,
+            "batch_total": len(plans),
+        }
+        common = dict(chapter_no=ch.get("order_index", "?"),
+                      chapter_title=ch.get("title") or "未命名",
+                      batch_no=next_idx,
+                      batch_total=len(plans),
+                      batch_scope=scope_brief,
+                      final_note=OUTLINE_BATCH_FINAL_NOTE if is_final else "")
+        task = render_task("prose_outline_first" if next_idx == 1 else "prose_outline_next",
+                           store, **common)
+        if next_idx == 1:
+            context["previous_end_override"] = Assembler(store).prev_chapter_end(cid)
+        else:
             context["batch_state"] = store.prose_batch_state_package(cid)
             context["previous_end_override"] = (
                 "【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"

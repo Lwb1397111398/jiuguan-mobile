@@ -24,8 +24,10 @@ STAGE_TPL_KEYS = {
     "volume": ["volume"],
     "outline": ["outline_chapter", "outline_single"],
     "detail": ["detail", "detail_block"],
-    # 一次性主模板 prose_chapter_md；分批模板 prose_batch_first/next 与桌面同步
-    "prose": ["prose_chapter_md", "prose_batch_first", "prose_batch_next", "prose"],
+    # 一次性主模板 prose_chapter_md；分批模板 prose_batch_first/next；
+    # 按大纲直写分批 prose_outline_first/next（2026-10-17，与桌面同步）
+    "prose": ["prose_chapter_md", "prose_batch_first", "prose_batch_next",
+              "prose_outline_first", "prose_outline_next", "prose"],
     # 2026-10-07 旧 rewrite 模板删除（桌面同步），改写阶段卡指向整章差量模板
     "rewrite": ["prose_rewrite_whole"],
     "check": ["check", "check_selection"],

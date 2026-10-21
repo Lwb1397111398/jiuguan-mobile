@@ -50,8 +50,10 @@ GLOBAL_SETTING_DEFAULTS = {
     "embed_base_url": "",                # 嵌入（向量）接口地址：文风审校语义查重 + 记忆语义检索
     "embed_api_key": "",                 # 嵌入接口 API Key（密文存储）
     "embed_model": "",                   # 嵌入模型名
-    "prose_mode": "chapter",             # 正文写法：chapter=一次性（整章一次写完，默认）/ batch=分批（接力写作）；旧值 block 已并入 chapter
+    "prose_mode": "chapter",             # 正文写法：chapter=一次性（整章一次写完，默认）/ batch=分批（按细纲块接力）/ outline=按大纲直写（不生成细纲，2026-10-17）
     "prose_batch_size": "3",             # 分批模式每批覆盖的细纲块数（1~8，末批可少；仅 prose_mode=batch 生效）
+    "outline_batch_split": "beat",       # 按大纲直写模式的分批方式：whole=整章一次写完 / beat=按大纲节拍分批 / free=AI 自由划分
+    "outline_batch_size": "2",           # 按大纲直写·分批时每批覆盖的大纲节拍数（1~8，末批可少；free 模式用它估算总批数）
     "auto_archive": "1",                 # 正文接受后自动归档记忆（重新接受=重归档）
     "keep_awake": "1",                   # 防休眠：0=关 / 1=应用运行期间 / 2=仅自动模式运行时
     "keep_awake_display": "0",           # 防休眠时是否同时阻止屏幕关闭（1=屏幕常亮，笔记本更耗电）

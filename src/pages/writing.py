@@ -851,10 +851,13 @@ class WritingPage:
         controls.append(ft.Dropdown(
             label="正文写法", value=mode, dense=True,
             options=[ft.dropdown.Option("chapter", "一次性（整章写完）"),
-                     ft.dropdown.Option("batch", "分批（接力写作）")],
+                     ft.dropdown.Option("batch", "分批（按细纲接力）"),
+                     ft.dropdown.Option("outline", "按大纲直写（不用细纲）")],
             on_select=self._on_mode_change))
         if mode == "batch":
             controls += self._batch_desk_controls(ch)
+        elif mode == "outline":
+            controls += self._outline_desk_controls(ch)
         else:
             controls += self._chapter_desk_controls(ch)
         controls.append(self._more_row(ch))
@@ -935,8 +938,10 @@ class WritingPage:
     def _on_mode_change(self, e):
         mode = (e.control.value or "chapter")
         self.session.store.set_prose_mode(mode)
-        toast(self.page, "已切到「分批」写法"
-              if mode == "batch" else "已切到「一次性」写法")
+        names = {"batch": "分批（按细纲接力）",
+                 "outline": "按大纲直写（不用细纲）",
+                 "chapter": "一次性（整章写完）"}
+        toast(self.page, f"已切到「{names.get(mode, mode)}」写法")
         self.refresh()
 
     # ---------- 写作台：编辑器区（一次性 / 分批共用） ----------
@@ -1086,10 +1091,13 @@ class WritingPage:
             nb = len(store.prose_batch_block_ids(row))
         except Exception:
             nb = 0
+        # 按大纲直写的批次没有细纲块（block_ids 空数组）→ 副标题写明批次类型
+        scope = (f"覆盖 {nb} 个细纲块" if nb else
+                 ("按大纲分批" if store.get_prose_mode() == "outline" else "本批范围未登记"))
         return ft.Card(ft.Container(ft.Column([
             ft.Row([
                 ft.Text(f"🧩 第 {idx} 批", size=12, weight=ft.FontWeight.W_600),
-                ft.Text(f"{len(text)} 字 · 覆盖 {nb} 个细纲块", size=10,
+                ft.Text(f"{len(text)} 字 · {scope}", size=10,
                         color=ft.Colors.ON_SURFACE_VARIANT, expand=True),
                 ft.Container(ft.Text("已生成", size=10),
                              bgcolor=ft.Colors.with_opacity(0.14, ft.Colors.GREEN),
@@ -1407,7 +1415,12 @@ class WritingPage:
         def _yes():
             store.truncate_prose_batches(row["chapter_id"], idx)
             self.refresh()
-            self._generate_next_batch(ch)
+            # 按大纲直写的批次没有细纲块，重跑要走大纲分批入口（对齐桌面）
+            if (store.get_prose_mode() == "outline"
+                    and store.get_outline_batch_split() != "whole"):
+                self._generate_outline_batch(ch)
+            else:
+                self._generate_next_batch(ch)
         confirm(self.page, "从本批重新生成",
                 f"会丢弃第 {idx} 批及其后的全部批次（更早的批次保留，作为衔接基础），"
                 "然后重新生成本批。继续？", _yes, yes_text="重新生成")
@@ -1427,6 +1440,191 @@ class WritingPage:
         confirm(self.page, "清空分批重新开始",
                 f"删除本章已生成的 {len(rows)} 批正文工作区？"
                 "已接受的整章正文不受影响。此操作不可撤销。", _yes, yes_text="清空")
+
+    # ---------- 写作台：按大纲直写（2026-10-17，对齐桌面） ----------
+
+    def _outline_desk_controls(self, ch: dict) -> list:
+        """按大纲直写：整章一次写完 / 按大纲节拍分批 / AI 自由划分。
+
+        与细纲分批的区别：不读细纲块，切段依据是本章大纲的「…展开分卷节拍①」
+        或 ①②③ 序号点；批次仍落在 prose_batches（block_ids 为空数组）。
+        """
+        from app.core.chapter_outline import chapter_outline_text
+        from app.core.pipeline import plan_outline_batches
+        store = self.session.store
+        split = store.get_outline_batch_split()
+        controls = [ft.Dropdown(
+            label="分批划分", value=split, dense=True,
+            options=[ft.dropdown.Option("whole", "整章一次写完"),
+                     ft.dropdown.Option("beat", "按大纲节拍分批"),
+                     ft.dropdown.Option("free", "AI 自由划分")],
+            on_select=self._on_outline_split_change)]
+        if split == "whole":
+            controls += self._desk_editor_block(ch, whole=True)
+            return controls
+        outline = chapter_outline_text(ch)
+        if not outline.strip():
+            controls.append(hint("本章还没有大纲：先到「大纲」页生成，再按大纲写正文。"))
+            return controls
+        plans = plan_outline_batches(outline,
+                                     store.get_setting_int("outline_batch_size", 2))
+        rows = store.list_prose_batches(ch["id"])
+        n, total = len(rows), len(plans)
+        btn_text = ("开始按大纲分批" if n == 0 else
+                    ("合并批次写入正文" if n >= total else f"继续第 {n + 1} 批"))
+        controls.append(ft.Row([
+            ft.FilledButton(btn_text, icon=ft.Icons.AUTO_AWESOME,
+                            on_click=lambda e: self._generate_outline_batch(ch)),
+            ft.TextButton("停止", on_click=self._prose_stop,
+                          disabled=self._task is None or self._task.stopped),
+            ft.TextButton("清空分批", on_click=lambda e: self._clear_batches(ch),
+                          disabled=not rows),
+        ], spacing=6, wrap=True))
+        controls.append(ft.Dropdown(
+            label="每批节拍数", dense=True,
+            value=str(store.get_setting_int("outline_batch_size", 2)),
+            options=[ft.dropdown.Option(str(i)) for i in range(1, 9)],
+            on_select=self._on_outline_size_change))
+        for i, r in enumerate(rows, start=1):
+            controls.append(self._batch_card(ch, r, i))
+        controls += self._desk_editor_block(ch, whole=False)
+        controls.append(hint(
+            f"按大纲直写：不生成细纲，全章共 {total} 批。"
+            "分批方式在「分批划分」里切换；每批生成后确认落批，全部批完成合并成整章。"))
+        controls.append(ft.Container(
+            ft.Text(outline[:600] + ("…" if len(outline) > 600 else ""), size=10,
+                    color=ft.Colors.ON_SURFACE_VARIANT),
+            bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
+            border_radius=8, padding=8))
+        return controls
+
+    def _on_outline_split_change(self, e):
+        split = (e.control.value or "beat")
+        self.session.store.set_outline_batch_split(split)
+        names = {"whole": "整章一次写完", "beat": "按大纲节拍分批", "free": "AI 自由划分"}
+        toast(self.page, f"分批划分已切为「{names.get(split, split)}」")
+        self.refresh()
+
+    def _on_outline_size_change(self, e):
+        raw = str(getattr(e.control, "value", "") or "").strip()
+        size = int(raw) if raw.isdigit() and 1 <= int(raw) <= 8 else 2
+        self.session.store.set_setting("outline_batch_size", str(size))
+        toast(self.page, f"每批 {size} 个大纲节拍（对下一批生效）")
+        self.refresh()
+
+    def _generate_outline_batch(self, ch: dict):
+        """按大纲分批：下一批 = 已存批次数 + 1；批全齐则合并接受落库。"""
+        from app.core.chapter_outline import chapter_outline_text
+        from app.core.pipeline import plan_outline_batches
+        store = self.session.store
+        cid = ch["id"]
+        outline = chapter_outline_text(ch)
+        if not outline.strip():
+            toast(self.page, "本章还没有大纲：先到「大纲」页生成", error=True)
+            return
+        plans = plan_outline_batches(outline,
+                                     store.get_setting_int("outline_batch_size", 2))
+        if not plans:
+            toast(self.page, "本章大纲为空，无法分批", error=True)
+            return
+        rows = store.list_prose_batches(cid)
+        next_idx = len(rows) + 1
+        if next_idx > len(plans):
+            merged = store.prose_batch_merged(cid)
+            if not merged.strip():
+                toast(self.page, "还没有任何批次，无法合并", error=True)
+                return
+            self._accept_merged_batches(cid, merged, len(rows))
+            return
+        if next_idx > 1:
+            def _go():
+                self._run_outline_batch_gen(ch, plans, next_idx)
+            confirm(self.page, f"继续第 {next_idx} 批",
+                    f"已按大纲生成 {len(rows)} 批，继续写第 {next_idx}/{len(plans)} 批？",
+                    _go)
+            return
+        self._run_outline_batch_gen(ch, plans, next_idx)
+
+    def _run_outline_batch_gen(self, ch: dict, plans: list, next_idx: int):
+        """发出第 next_idx 批的按大纲生成请求（带【本批】/【后续批次】标注）。"""
+        from app.core.pipeline import (Pipeline, batch_tail_two_paras,
+                                       outline_batch_scope_text)
+        from app.core.assembler import Assembler
+        from app.core.task_templates import (render as render_task,
+                                             OUTLINE_BATCH_FINAL_NOTE)
+        store = self.session.store
+        cid = ch["id"]
+        rows = store.list_prose_batches(cid)
+        free = store.get_outline_batch_split() == "free"
+        is_final = next_idx == len(plans)
+        if free:
+            scope_brief = (f"本章共 {len(plans)} 批，本批是第 {next_idx} 批："
+                           f"推进到全章约 {next_idx}/{len(plans)} 处，"
+                           "停在一个自然场景的收束点，后面的内容留给下一批。")
+        else:
+            cur = plans[next_idx - 1]
+            scope_brief = (f"本批覆盖：{cur['label']}"
+                           f"（全章 {cur['total_beats']} 个节拍中的第 {cur['first']}~{cur['last']} 个）。"
+                           "只写这一段，后面的节拍留给下一批。")
+        if is_final:
+            scope_brief += "本批是最后一批：把大纲剩下的内容全部写完，并收好章尾。"
+        context = {
+            "chapter": ch,
+            "character_names": ch.get("characters") or [],
+            "outline_only": True,
+            "outline_batch_text": outline_batch_scope_text(plans, next_idx, free=free),
+            "notes": store.list_notes(cid),
+            "batch_index": next_idx,
+            "batch_total": len(plans),
+        }
+        common = dict(chapter_no=ch.get("order_index", "?"),
+                      chapter_title=ch.get("title") or "未命名",
+                      batch_no=next_idx,
+                      batch_total=len(plans),
+                      batch_scope=scope_brief,
+                      final_note=OUTLINE_BATCH_FINAL_NOTE if is_final else "")
+        task = render_task("prose_outline_first" if next_idx == 1 else "prose_outline_next",
+                           store, **common)
+        if next_idx == 1:
+            context["previous_end_override"] = Assembler(store).prev_chapter_end(cid)
+        else:
+            context["batch_state"] = store.prose_batch_state_package(cid)
+            context["previous_end_override"] = (
+                "【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"
+                "不要重复这段内容】\n" + batch_tail_two_paras(rows[-1].get("content") or ""))
+        close_running = None
+
+        def on_started(tk):
+            nonlocal close_running
+            self._task = tk
+            close_running = self._running(tk, f"按大纲生成第 {next_idx} 批…")
+
+        def on_done(result):
+            nonlocal close_running
+            self._task = None
+            if close_running:
+                close_running()
+                close_running = None
+            if not result.get("ok"):
+                toast(self.page, result.get("error", "生成失败"), error=True)
+                return
+            if result.get("status") == "stopped":
+                toast(self.page, "已停止")
+                return
+            info: dict = {}
+            prose, state, err = Pipeline.parse_batch_prose(result.get("text") or "", info)
+            if err or not (prose or "").strip():
+                toast(self.page, err or "本批正文为空", error=True)
+                return
+            if info.get("note"):
+                toast(self.page, info["note"])
+            self._apply_diag(result, "prose", prose, batch_continue=not is_final)
+            self._confirm_batch(ch, next_idx, [], is_final, prose, state)
+
+        start_generation(self.page, self.session, role="prose", context=context,
+                         task=task,
+                         title=f"按大纲生成第{next_idx}/{len(plans)}批",
+                         on_done=on_done, on_started=on_started)
 
     def _accept_merged_batches(self, cid: int, merged: str, n: int):
         """全部批次合并接受为整章正文（旧版自动存快照）→ 章状态推进 + 自动归档。
@@ -1491,6 +1689,9 @@ class WritingPage:
             "notes": store.list_notes(cid),
             "previous_end_override": Assembler(store).prev_chapter_end(cid),
         }
+        # 按大纲直写：组装器跳过细纲，只用本章大纲（对齐桌面，2026-10-17）
+        if store.get_prose_mode() == "outline":
+            context["outline_only"] = True
         self._task = None
         prose_holder = {"text": ""}
 

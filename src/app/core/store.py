@@ -642,6 +642,38 @@ class ProjectStore(QObject):
                 self._update_volume_row(row, new_title, new_body,
                                         row.get("target_chapters"), synced=base)
 
+    def push_volume_to_synopsis(self, volume_id: int) -> bool:
+        """分卷侧变更（手改/AI 迭代/载入历史保存）后，把卷名+描述写回总纲『分卷N』段。
+
+        各分卷是相对独立段落：只原位改写本卷段，其他卷与整体层逐字不动
+        （Pipeline.replace_synopsis_volume）。走 update_synopsis_in_place——
+        不产生总纲新版本、刷新 updated_at 与锁定指纹，其按卷 resync 会把本卷
+        synopsis_synced 基线自动推进到新段值：写回后总纲与分卷一致，
+        注入仲裁自然收敛（不再需要覆盖）。
+        以下情形返回 False、总纲不动（调用方提示用户）：无总纲/本卷描述为空/
+        总纲用 ■ 或裸行形态卷段无法定位/总纲里没有本卷『分卷N』段。
+        """
+        s = self.current_synopsis()
+        if not s or not (s.get("content") or "").strip():
+            return False
+        rows = self.list_volumes()
+        idx = next((i for i, x in enumerate(rows, 1) if x["id"] == volume_id), None)
+        if idx is None:
+            return False
+        row = rows[idx - 1]
+        title = (row.get("title") or "").strip()
+        body = (row.get("summary") or "").strip()
+        if not body:
+            return False
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        new_content = Pipeline.replace_synopsis_volume(s["content"], idx, title, body)
+        if new_content is None:
+            return False
+        if new_content == (s.get("content") or ""):
+            return True  # 总纲该卷段已是现行值：幂等无写
+        self.update_synopsis_in_place(new_content, s.get("title") or "")
+        return True
+
     # ---------- 章节 ----------
 
     def list_chapters(self, include_trash: bool = False) -> list[dict]:
@@ -1426,16 +1458,26 @@ class ProjectStore(QObject):
     # ---------- 整章正文（一章一条 kind='chapter'，两种写法最终都落到这里） ----------
 
     def get_prose_mode(self) -> str:
-        """正文写法：'chapter'=一次性整章写完（默认）/ 'batch'=分批接力写作。
+        """正文写法：'chapter'=一次性整章写完（默认）/ 'batch'=按细纲块分批接龙
+        / 'outline'=按大纲直写（不生成细纲，整章或分批均按本章大纲）。
 
         旧值 'block'（按细纲块逐块，已删除的写法）读入时归一为 'chapter'。
         """
         mode = self.get_setting("prose_mode", "chapter") or "chapter"
-        return mode if mode in ("chapter", "batch") else "chapter"
+        return mode if mode in ("chapter", "batch", "outline") else "chapter"
 
     def set_prose_mode(self, mode: str):
         self.set_setting("prose_mode",
-                         "batch" if mode == "batch" else "chapter")
+                         mode if mode in ("chapter", "batch", "outline") else "chapter")
+
+    def get_outline_batch_split(self) -> str:
+        """按大纲直写模式的分批方式：'whole'=整章一次 / 'beat'=按大纲节拍 / 'free'=AI 自由划分。"""
+        split = self.get_setting("outline_batch_split", "beat") or "beat"
+        return split if split in ("whole", "beat", "free") else "beat"
+
+    def set_outline_batch_split(self, split: str):
+        self.set_setting("outline_batch_split",
+                         split if split in ("whole", "beat", "free") else "beat")
 
     def get_chapter_prose_block(self, chapter_id: int) -> dict | None:
         """本章整章正文块（kind='chapter'）；未写过返回 None。

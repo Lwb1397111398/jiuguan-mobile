@@ -10,7 +10,8 @@ import time
 
 from .api import LLMClient, ApiError, estimate_cost
 from .assembler import Assembler
-from .chapter_outline import chapter_outline_text, outline_draft_text
+from .chapter_outline import (chapter_outline_text, outline_draft_text,
+                              split_outline_points)
 from .completeness import (END_PUNCTUATION, TAIL_DECOR, detail_complete,
                            numbered_max_index, outline_complete, prose_complete,
                            synopsis_complete, volume_complete)
@@ -144,7 +145,7 @@ _DEFAULT_MAX_TOKENS = {
     "prose": 60000, "prose_rewrite": 60000,
     "check": 60000, "style": 60000,
     "synopsis": 60000, "volume": 60000, "outline": 60000, "detail": 60000,
-    "volume_iter": 60000,
+    "volume_iter": 60000, "volume_chapters_iter": 60000,
     "memory": 60000,
     # 辅助任务（AI 识别/整理/提取破甲）此前只有 20000，长预设一压就被截断；
     # 与创作类统一拉满，渠道不接受时 api.py 会自动减半降级。
@@ -342,7 +343,8 @@ UPSTREAM_GUARD_RETRY_GAP = 8.0
 # 只对长文本创作角色启用：JSON 类角色（memory/check/style/ai_task）请求形态保持原样，
 # 避免给结构化输出任务塞入无关标题行。
 UPSTREAM_GUARD_ROLES = ("prose", "prose_rewrite",
-                        "outline", "detail", "volume", "synopsis", "volume_iter")
+                        "outline", "detail", "volume", "synopsis", "volume_iter",
+                        "volume_chapters_iter")
 
 # 流式回调内的「重置」哨兵：上游拦截后自动重试时，通知界面丢弃上一轮残留
 # （那段英文拦截说明不是正文，不能和新一轮的真实输出拼在一起）。
@@ -469,7 +471,8 @@ CONTINUABLE_ROLES = ("prose", "prose_rewrite")
 # 输出是人类可读的结构化文本（而非 JSON）的结构化阶段：同样会被破甲开场白 /
 # Step 规划段污染，要走 strip_jailbreak_residue（但不能剥章节名行，那是数据）。
 # JSON 类角色（memory/check/style/ai_task）不在其中——走 jsonx 自己的清洗路径。
-TEXT_OUTPUT_ROLES = ("outline", "detail", "volume", "synopsis", "volume_iter")
+TEXT_OUTPUT_ROLES = ("outline", "detail", "volume", "synopsis", "volume_iter",
+                     "volume_chapters_iter")
 
 # 续写指令：要求从断开处无缝接着写，杜绝重复/总结/附加说明
 CONTINUE_INSTRUCTION = (
@@ -558,6 +561,13 @@ _DETAIL_TO_GROUPS = [["to_state", "结束状态", "结果状态", "末状态"], 
 _MD_H1_RE = re.compile(r"^\s*#(?!#)\s+(.*)$", re.M)
 _MD_H2_RE = re.compile(r"^\s*##(?!#)\s+(.*)$", re.M)
 _MD_H3_RE = re.compile(r"^\s*###(?!#)\s*(.*)$", re.M)
+
+# 总纲分卷段原位替换（2026-10-17 分卷写回总纲）用：识别 #~#### 卷标题行，
+# 捕获级别/序号/卷名（与 assembler._SYNOPSIS_VOL_HEADING_RE 同口径，多捕获组）。
+# ■/裸行形态无法安全定位段落边界，不参与原位替换（调用方回退注入覆盖机制）。
+_SYN_VOL_HEADING_NUM_RE = re.compile(
+    r"^[ \t]*(#{1,4})\s*分卷\s*([0-9〇一二三四五六七八九十百千]+)"
+    r"(?:\s*[：:]\s*(.*))?$", re.M)
 
 # 章标题前缀：『第1章：入城』/『第一章 入城』→ 剥前缀后取分隔后核心章名
 # 章号前缀（2026-09-05 收紧）：旧版「章?」可选，『十六磅』会被误剥成『磅』
@@ -1556,6 +1566,142 @@ def plan_batches(blocks: list[dict], size: int) -> list[list[dict]]:
     """
     size = max(1, min(8, int(size or 1)))
     return [blocks[i:i + size] for i in range(0, len(blocks), size)]
+
+
+# ---------------------------------------------------------------- 按大纲分批（2026-10-17）
+# 老板反馈：细纲把每一拍都规定死了，正文写出来偏僵；本章大纲本身已有完整剧情线，
+# 直接按大纲写（不生成细纲）自由发挥空间更大。分批仍要保留（长章一次写完容易截断）。
+#
+# 分批边界认两种结构，优先级从高到低：
+#   ① 节拍行：老板的分卷模板产出「…展开分卷节拍①」「——展开分卷节拍①」；
+#   ② 序号点：①②③ / 1. / 一、（chapter_outline.split_outline_points）；
+#   ③ 都没有 → 整段作为 1 批（等于整章一次写完）。
+# 只认行首结构，正文里的「节拍」二字不会被误切。
+
+_OUTLINE_BEAT_RE = re.compile(
+    r"^\s*[—…\-–·．\.]{0,3}\s*(?:展开分卷节拍|分卷节拍|本章节拍|节拍)\s*"
+    r"([①-⑳]|\d{1,2}|[一二两三四五六七八九十]{1,3})"
+)
+
+
+def _beat_label(raw: str) -> str:
+    """节拍编号 → 展示标签（数字/汉字统一成原文编号）。"""
+    return f"节拍{str(raw).strip()}"
+
+
+def split_outline_beats(text: str) -> list[dict]:
+    """把章节大纲切成节拍段，返回 ``[{"label", "text", "kind"}]``。
+
+    - 首个节拍行之前的文本（如【本章声口总表】）并入第 1 个节拍——绝不丢内容；
+    - 无节拍行时退回大纲序号点（①②③ / 1. / 一、），无编号的【】块标题行
+      并入前一点，不单独成批；
+    - 完全没有结构时整段作为 1 个节拍（kind="whole"）。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    beats: list[dict] = []
+    cur_label = ""
+    cur_lines: list[str] = []
+    preface: list[str] = []
+    for line in raw.splitlines():
+        m = _OUTLINE_BEAT_RE.match(line)
+        if m:
+            if cur_lines:
+                beats.append({"label": cur_label or f"节拍{len(beats) + 1}",
+                              "text": "\n".join(cur_lines).strip(), "kind": "beat"})
+                cur_lines = []
+            cur_label = _beat_label(m.group(1))
+            if not beats and preface:   # 章首声口总表等前言并入第 1 节拍
+                cur_lines = list(preface)
+                preface = []
+            cur_lines.append(line.strip())
+            continue
+        if cur_lines or beats:
+            cur_lines.append(line)
+        else:
+            preface.append(line)
+    if cur_lines:
+        beats.append({"label": cur_label or f"节拍{len(beats) + 1}",
+                      "text": "\n".join(cur_lines).strip(), "kind": "beat"})
+    if beats:
+        if preface:   # 节拍行之前没有正文且没并入（例如只有前言 + 无节拍）
+            beats[0]["text"] = ("\n".join(preface) + "\n" + beats[0]["text"]).strip()
+        return beats
+
+    # 退路：大纲序号点（①②③ / 1. / 一、）；index=0 的无编号块并入前一点
+    points = split_outline_points(raw)
+    merged: list[dict] = []
+    for p in points:
+        idx = int(p.get("index") or 0)
+        body = str(p.get("content") or "").strip()
+        if not body:
+            continue
+        if idx <= 0 and merged:
+            merged[-1]["text"] = (merged[-1]["text"] + "\n" + body).strip()
+            continue
+        label = (chr(0x2460 + idx - 1) if 1 <= idx <= 20 else
+                 (str(idx) if idx > 0 else "全文"))
+        merged.append({"label": label, "text": body, "kind": "point"})
+    if len(merged) > 1:
+        return merged
+    return [{"label": "全文", "text": raw, "kind": "whole"}]
+
+
+def plan_outline_batches(outline_text: str, size: int) -> list[dict]:
+    """把章节大纲按节拍切成分批计划：每批 ``size`` 个节拍，末批可少。
+
+    返回 ``[{"label", "text", "first", "last", "total_beats"}]``；
+    空大纲返回空清单（调用方提示先生成大纲）。
+    """
+    beats = split_outline_beats(outline_text)
+    if not beats:
+        return []
+    size = max(1, min(8, int(size or 1)))
+    plans: list[dict] = []
+    for i in range(0, len(beats), size):
+        group = beats[i:i + size]
+        plans.append({
+            "label": "、".join(b["label"] for b in group),
+            "text": "\n\n".join(b["text"] for b in group).strip(),
+            "first": i + 1,
+            "last": i + len(group),
+            "total_beats": len(beats),
+        })
+    return plans
+
+
+def outline_batch_scope_text(plans: list[dict], index: int, free: bool = False) -> str:
+    """「本章大纲（写作依据）」的注入正文（分批口径）：本批范围 + 后续批次（勿写）。
+
+    - 节拍分批：明确标出【本批】/【后续批次（勿写）】——模型思考可覆盖全章，
+      动笔只写本批；
+    - 自由分批（free）：给完整大纲 + 本批应推进到的比例位置，边界由模型按
+      自然场景收束点自行决定（老板说的「AI 自由划分」）；
+    - index 越界返回空串（调用方改用完整大纲，如整章模式）。
+    """
+    if not plans or index < 1 or index > len(plans):
+        return ""
+    cur = plans[index - 1]
+    if free:
+        full = "\n\n".join(p["text"] for p in plans).strip()
+        return (
+            "【本章大纲（写作依据）｜本章计划分 %d 批写完，本批是第 %d 批】\n"
+            "本批写到哪里由你按大纲的自然节奏决定：推进到全章的约 %d/%d 处，"
+            "停在一个自然场景的收束点；绝不能把后面批次的内容提前写完。\n\n%s"
+            % (len(plans), index, index, len(plans), full)
+        )
+    parts = [
+        "【本章大纲（写作依据）｜分批生成：本批只写标【本批】的部分；"
+        "标【后续批次（勿写）】的部分只作全章了解，不要写进本批。】",
+        f"\n【本批：第{cur['first']}~{cur['last']}段（{cur['label']}）】\n{cur['text']}",
+    ]
+    later = plans[index:]
+    if later:
+        rest = "\n\n".join(p["text"] for p in later).strip()
+        labels = "、".join(p["label"] for p in later)
+        parts.append(f"\n【后续批次（勿写）：{labels}】\n{rest}")
+    return "\n".join(parts)
 
 
 def batch_tail_two_paras(text: str, keep: int = 2) -> str:
@@ -3037,6 +3183,40 @@ class Pipeline:
         if bare is not None:
             return bare
         return {"overview": content, "volumes": []}
+
+    @staticmethod
+    def replace_synopsis_volume(content: str, index: int, title: str,
+                                body: str) -> str | None:
+        """总纲原文里就地替换『分卷N』段为卷名+正文，其余文字逐字不动（2026-10-17）。
+
+        各分卷在总纲里是相对独立的段落：分卷页手改/AI 迭代/载入历史后写回时
+        只改本卷段，其他卷与整体层保持原文。index 按『分卷N』自身序号（1-based，
+        与库中卷序同口径）定位；保留原标题层级（##/###/####）。
+        找不到该卷标题 / 非 Markdown 卷标题形态（■/裸行）/ body 为空 → None，
+        调用方回退（注入侧的分卷覆盖仲裁仍然生效）。
+        """
+        if not content or not (body or "").strip():
+            return None
+        marks = list(_SYN_VOL_HEADING_NUM_RE.finditer(content))
+        target = None
+        for m in marks:
+            if _cn_to_int(m.group(2)) == int(index):
+                target = m
+                break
+        if target is None:
+            return None
+        nxt = next((m for m in marks if m.start() > target.start()), None)
+        end = nxt.start() if nxt else len(content)
+        level = target.group(1)
+        num = target.group(2)
+        t = (title or "").strip()
+        head = f"{level} 分卷{num}：{t}" if t else f"{level} 分卷{num}"
+        seg = content[target.start():end]
+        ws = seg[len(seg.rstrip("\n")):]  # 段尾原有空行分隔，保留给下一段
+        if nxt:
+            return (content[:target.start()] + head + "\n" + body.strip()
+                    + (ws or "\n\n") + content[end:])
+        return (content[:target.start()] + head + "\n" + body.strip()).rstrip() + "\n"
 
     @staticmethod
     def parse_volume_chapters(text: str, limit: int = 50, min_chars: int = 0):
