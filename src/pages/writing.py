@@ -935,13 +935,31 @@ class WritingPage:
                 on_yes, yes_text=yes_text)
         return False
 
+    def _clear_desk_batches(self, why: str) -> str:
+        """设置变更后清掉当前章未合并批次，返回 toast 追加说明（无批次返回空串）。
+
+        批号↔细纲块/大纲节拍的对应关系由设置决定：换写法、改分批划分或改粒度后
+        旧批号与新计划对不上（next_idx = 已存批数+1 会跳批/覆盖），最坏把半截
+        旧稿当整章合并。已接受的整章正文不受影响（对齐桌面同款方法）。
+        """
+        store = self.session.store
+        if not store.list_chapters():
+            return ""
+        ch = self._current_desk_chapter()
+        rows = store.list_prose_batches(ch["id"])
+        if not rows:
+            return ""
+        store.clear_prose_batches(ch["id"])
+        return f"；已清空本章 {len(rows)} 批未合并正文（{why}后旧批次不再沿用）"
+
     def _on_mode_change(self, e):
         mode = (e.control.value or "chapter")
         self.session.store.set_prose_mode(mode)
+        note = self._clear_desk_batches("换写法")
         names = {"batch": "分批（按细纲接力）",
                  "outline": "按大纲直写（不用细纲）",
                  "chapter": "一次性（整章写完）"}
-        toast(self.page, f"已切到「{names.get(mode, mode)}」写法")
+        toast(self.page, f"已切到「{names.get(mode, mode)}」写法{note}")
         self.refresh()
 
     # ---------- 写作台：编辑器区（一次性 / 分批共用） ----------
@@ -1080,7 +1098,8 @@ class WritingPage:
         raw = str(getattr(e.control, "value", "") or "").strip()
         size = int(raw) if raw.isdigit() and 1 <= int(raw) <= 8 else 3
         self.session.store.set_setting("prose_batch_size", str(size))
-        toast(self.page, f"每批 {size} 个细纲块（对下一批生效）")
+        note = self._clear_desk_batches("改每批粒度")
+        toast(self.page, f"每批 {size} 个细纲块（对下一批生效）{note}")
         self.refresh()
 
     def _batch_card(self, ch: dict, row: dict, idx: int) -> ft.Control:
@@ -1276,9 +1295,14 @@ class WritingPage:
             toast(self.page, "分批模式需要细纲：请先「生成细纲」", error=True)
             return
         valid_ids = {b["id"] for b in blocks}
+        # 两种分批共用 prose_batches：别的写法留下的批次批号与新计划错位，整章作废
+        foreign = store.drop_foreign_prose_batches(cid, "batch")
         rows = store.list_prose_batches(cid)
-        if any(any(i not in valid_ids for i in store.prose_batch_block_ids(r))
-               for r in rows):
+        if foreign:
+            toast(self.page, f"检测到按大纲分批留下的 {foreign} 批旧批次，已清空，"
+                             "本次从第 1 批重新开始")
+        elif any(any(i not in valid_ids for i in store.prose_batch_block_ids(r))
+                 for r in rows):
             store.clear_prose_batches(cid)
             rows = []
             toast(self.page, "细纲已变化，旧批次已清空，本次从第 1 批重新开始")
@@ -1501,15 +1525,17 @@ class WritingPage:
     def _on_outline_split_change(self, e):
         split = (e.control.value or "beat")
         self.session.store.set_outline_batch_split(split)
+        note = self._clear_desk_batches("改分批划分")
         names = {"whole": "整章一次写完", "beat": "按大纲节拍分批", "free": "AI 自由划分"}
-        toast(self.page, f"分批划分已切为「{names.get(split, split)}」")
+        toast(self.page, f"分批划分已切为「{names.get(split, split)}」{note}")
         self.refresh()
 
     def _on_outline_size_change(self, e):
         raw = str(getattr(e.control, "value", "") or "").strip()
         size = int(raw) if raw.isdigit() and 1 <= int(raw) <= 8 else 2
         self.session.store.set_setting("outline_batch_size", str(size))
-        toast(self.page, f"每批 {size} 个大纲节拍（对下一批生效）")
+        note = self._clear_desk_batches("改每批粒度")
+        toast(self.page, f"每批 {size} 个大纲节拍（对下一批生效）{note}")
         self.refresh()
 
     def _generate_outline_batch(self, ch: dict):
@@ -1527,6 +1553,11 @@ class WritingPage:
         if not plans:
             toast(self.page, "本章大纲为空，无法分批", error=True)
             return
+        # 细纲分批留下的批次（block_ids 非空）按大纲批号接续会串批 → 整章作废
+        foreign = store.drop_foreign_prose_batches(cid, "outline")
+        if foreign:
+            toast(self.page, f"检测到细纲分批留下的 {foreign} 批旧批次，已清空，"
+                             "本次从第 1 批重新开始")
         rows = store.list_prose_batches(cid)
         next_idx = len(rows) + 1
         if next_idx > len(plans):

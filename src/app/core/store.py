@@ -1590,6 +1590,29 @@ class ProjectStore(QObject):
         self._exec("DELETE FROM prose_batches WHERE chapter_id=?", (chapter_id,))
         self.texts_changed.emit(chapter_id)
 
+    def prose_batch_belongs_to(self, row: dict, mode: str) -> bool:
+        """批次行是否属于指定写法（prose_batches 表没有写法字段，按 block_ids 判别）。
+
+        细纲分批（batch）每批都引用至少一个细纲块；按大纲分批（outline）恒定写
+        空数组（本模式没有细纲块，2026-10-17）。两种分批共用同一张批次表，
+        切写法后不区分就会把旧批当自己的批接着写/合并。
+        """
+        ids = self.prose_batch_block_ids(row)
+        return bool(ids) if mode == "batch" else not ids
+
+    def drop_foreign_prose_batches(self, chapter_id: int, mode: str) -> int:
+        """作废不属于当前写法的批次，返回清掉的批数（无残留返回 0）。
+
+        只删外来行会留下断档批号（next_idx = len(rows)+1 会覆盖或跳批），
+        所以发现一条外来批次就整章作废——语义同「细纲已变化，旧批次全部作废」。
+        已接受的整章正文不受影响。
+        """
+        rows = self.list_prose_batches(chapter_id)
+        if not rows or all(self.prose_batch_belongs_to(r, mode) for r in rows):
+            return 0
+        self.clear_prose_batches(chapter_id)
+        return len(rows)
+
     def truncate_prose_batches(self, chapter_id: int, from_index: int):
         """从第 from_index 批起作废（「从本批重新生成」：该批及其后全部重来）。"""
         self._exec("DELETE FROM prose_batches WHERE chapter_id=? AND order_index>=?",

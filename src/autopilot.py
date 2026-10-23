@@ -433,9 +433,12 @@ class AutoPilot:
             return
         # 细纲重新生成后旧批次可能引用已不存在的块 → 全部作废从头分批
         valid_ids = {b["id"] for b in blocks}
+        # 两种分批共用 prose_batches：别的写法留下的批次批号与新计划错位，整章作废
+        foreign = store.drop_foreign_prose_batches(cid, "batch")
         rows = store.list_prose_batches(cid)
-        if any(any(i not in valid_ids for i in store.prose_batch_block_ids(r))
-               for r in rows):
+        if not foreign and any(
+                any(i not in valid_ids for i in store.prose_batch_block_ids(r))
+                for r in rows):
             store.clear_prose_batches(cid)
             rows = []
         batches = plan_batches(blocks, store.get_setting_int("prose_batch_size", 3))
@@ -503,6 +506,8 @@ class AutoPilot:
         if not plans:
             self._fail(step, "本章大纲为空，无法分批")
             return
+        # 细纲分批留下的批次（block_ids 非空）按大纲批号接续会串批 → 整章作废
+        store.drop_foreign_prose_batches(cid, "outline")
         rows = store.list_prose_batches(cid)
         next_idx = len(rows) + 1
         if next_idx > len(plans):
