@@ -24,6 +24,22 @@ from .throttle import acquire as _throttle_acquire
 _MAX_TOKENS_DOWNGRADE_FLOOR = 8192
 
 
+def _request_with_proxy_fallback(http_call, url, **kw):
+    """环境变量代理指向死端口时自动改直连重发一次（2026-10-21）。
+
+    机器残留 HTTPS_PROXY/HTTP_PROXY=http://127.0.0.1:7897（Clash 类代理退出后的
+    残留环境变量）而该端口无程序监听时，requests 默认 trust_env 会读环境变量，
+    所有 AI 请求先撞本地死端口 →「WinError 10061 被对方计算机积极拒绝」，
+    表面上像服务方拒绝，实为本地代理死端口。只对 ProxyError（代理本身连不上）
+    触发直连重试：代理活着的用户请求正常走代理，完全不受影响。"""
+    try:
+        return http_call(url, **kw)
+    except requests.exceptions.ProxyError:
+        kw = dict(kw)
+        kw["proxies"] = {"http": None, "https": None}
+        return http_call(url, **kw)
+
+
 class ApiError(Exception):
     """API 调用错误，携带人类可读信息。"""
 
@@ -545,8 +561,9 @@ class LLMClient:
                             "completion_tokens": completion_tokens, "ok": True,
                             "status": "stopped", "error": "", "truncated": truncated,
                             "duration_ms": int((time.time() - t0) * 1000)}
-                with requests.post(url, headers=self._headers(), json=payload,
-                                   stream=stream, timeout=(15, min(self.timeout, 600))) as resp:
+                with _request_with_proxy_fallback(
+                        requests.post, url, headers=self._headers(), json=payload,
+                        stream=stream, timeout=(15, min(self.timeout, 600))) as resp:
                     # SSE 事实标准为 UTF-8（text/event-stream 无 charset 时 requests 会猜错）
                     resp.encoding = "utf-8"
                     if resp.status_code != 200:
@@ -808,8 +825,9 @@ class LLMClient:
         if not self.base_url:
             return {"ok": False, "models": [], "message": "请先填写接口地址（base_url）"}
         try:
-            with requests.get(self.base_url + "/models", headers=self._headers(),
-                              timeout=(15, 30)) as resp:
+            with _request_with_proxy_fallback(
+                    requests.get, self.base_url + "/models", headers=self._headers(),
+                    timeout=(15, 30)) as resp:
                 resp.encoding = "utf-8"
                 if resp.status_code != 200:
                     return {"ok": False, "models": [],

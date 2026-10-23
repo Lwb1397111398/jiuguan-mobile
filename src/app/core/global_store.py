@@ -19,7 +19,8 @@ from . import db
 from .outline_fields import effective_field_defs
 from .paths import app_data_dir
 from .sysprompts import (DEFAULT_ROLES, BUILTIN_CARDS,
-                         PROSE_REWRITE_LEGACY_NAME, PROSE_REWRITE_LEGACY_PROMPT)
+                         PROSE_REWRITE_LEGACY_NAME, PROSE_REWRITE_LEGACY_PROMPT,
+                         VOLUME_CHAPTERS_ITER_LEGACY_PROMPT)
 
 MIGRATE_MARK = "config_migrated"
 
@@ -814,6 +815,25 @@ class GlobalStore:
 
         self._patch_stale_prior_sentence()
         self._upgrade_prose_rewrite_identity()
+        self._upgrade_volume_chapters_iter_prompt()
+
+    def _upgrade_volume_chapters_iter_prompt(self) -> None:
+        """volume_chapters_iter 存量升级（幂等，2026-10-23 单版化）。
+
+        2026-10-17 补种的旧默认是『# 方案N』多候选选一版；老板要求改为在原切分
+        基础上直接出一版修订结果。库里仍是旧默认全文的行升级成新默认；
+        用户自定义过的不动——与「用户数据优先」同纪律。
+        """
+        cur = DEFAULT_ROLES.get("volume_chapters_iter")
+        if not cur:
+            return
+        _name, _temp, new_prompt = cur
+        row = self._one("SELECT system_prompt FROM task_routes WHERE role='volume_chapters_iter'")
+        if not row:
+            return
+        if (row.get("system_prompt") or "") == VOLUME_CHAPTERS_ITER_LEGACY_PROMPT:
+            self._exec("UPDATE task_routes SET system_prompt=? WHERE role='volume_chapters_iter'",
+                       (new_prompt,))
 
     def _upgrade_prose_rewrite_identity(self) -> None:
         """prose_rewrite 存量升级（幂等，2026-10-08 改写二合一）。
