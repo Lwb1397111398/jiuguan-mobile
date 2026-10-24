@@ -148,6 +148,35 @@ CONTINUE_FROM_TMPL = (
     "现在从【已生成部分】停止的地方继续输出（直接输出续写内容，不要任何开场白）："
 )
 
+# 「继续生成」带思考续写模板（2026-10-24 老板二反馈）：上一轮有思考但没输出正文
+# （思考耗尽 max_tokens / 思考完被掐断 / 安全评估后拒写）时，把上轮思考一并发过去，
+# 让模型接着上轮思路走。OpenAI 兼容接口无法真正续思维链（reasoning 不可回传续写），
+# 这里把思考作为普通文本给模型看，让它延续结论直接输出正文——实测效果就是老板要的
+# 「接着思考」。
+CONTINUE_THINKING_TMPL = (
+    "【上一轮的思考过程】上一次生成中断了，以下是当时已经完成的思考（正文没有输出或未输出完）：\n\n"
+    "{thinking}\n\n"
+    "【接续要求】请接着上面这份思考继续：已经想清楚的部分不要推翻、不要从头重新思考，"
+    "直接沿用它得出的结论与规划；没想完的部分先快速补完思考，"
+    "然后输出任务要求的正文内容。"
+)
+
+
+def build_continue_task(task: str, base: str, thinking: str = "") -> str:
+    """组装「继续生成」的任务指令：任务原文 +（可选）上轮思考 +（可选）已生成前文。
+
+    两个附件段都拼进任务指令（critical 模块，超预算也不被裁剪）：前文被裁模型
+    看不到续写起点会整篇重写；思考被裁模型接不上上轮思路。思考段在前、前文段
+    在后——离输出位置越近权重越高，字面衔接靠前文，思路衔接靠思考。
+    """
+    parts = [task or ""]
+    if (thinking or "").strip():
+        parts.append(CONTINUE_THINKING_TMPL.format(thinking=thinking.strip()))
+    if (base or "").strip():
+        parts.append(CONTINUE_FROM_TMPL.format(base=base))
+    return "\n\n".join(parts)
+
+
 # 各任务默认输出上限（auto 模式兜底）：很多渠道的默认 max_tokens 只有 2048/4096，
 # 长正文生成必被中途截断——请求必须显式携带足够大的输出上限。
 # 老板要求"上限拉到最高，别限制总纲/分卷/大纲/细纲/正文的篇幅"：创作与规划类
@@ -2927,7 +2956,11 @@ class Pipeline:
         log_id = self.store.add_log(
             role, profile.get("model", ""), prompt_text, resp["text"],
             in_tokens, out_tokens, round(cost, 4),
-            status=resp["status"], duration_ms=resp.get("duration_ms", 0))
+            status=resp["status"], duration_ms=resp.get("duration_ms", 0),
+            # 掐线保留部分文本时 api 返回 status=stopped 且 error 非空（用户主动
+            # 停止则恒为空串）——不记的话日志里两者无法区分（2026-10-24 取证靠
+            # 「尾部截断+恰好 301 秒」才推断出是网关掐线，而非老板点的停止）。
+            error=resp.get("error") or "")
         # 上游拦截形态判定：清洗后的正文与原始响应两处都看——清洗可能把这类整行剥掉。
         up_block = (detect_upstream_block(formal_text)
                     or detect_upstream_block(resp.get("text") or ""))
