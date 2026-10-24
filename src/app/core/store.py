@@ -1479,6 +1479,43 @@ class ProjectStore(QObject):
         self.set_setting("outline_batch_split",
                          split if split in ("whole", "beat", "free") else "beat")
 
+    # ---------- 分批口径（2026-10-24：按计划总批数 / 按每批数量） ----------
+
+    def get_batch_split_by(self) -> str:
+        """分批口径：'count'=按计划总批数（默认）/ 'size'=按每批数量（旧口径）。"""
+        split_by = self.get_setting("batch_split_by", "count") or "count"
+        return split_by if split_by in ("count", "size") else "count"
+
+    def set_batch_split_by(self, split_by: str):
+        self.set_setting("batch_split_by",
+                         split_by if split_by in ("count", "size") else "count")
+
+    def get_prose_batch_plan_value(self) -> tuple[int, bool]:
+        """细纲分批的界面数值与口径：(计划总批数|每批块数, 是否按总批数)。"""
+        by_count = self.get_batch_split_by() == "count"
+        key, default = (("prose_batch_count", 3) if by_count
+                        else ("prose_batch_size", 3))
+        return self.get_setting_int(key, default), by_count
+
+    def set_prose_batch_plan_value(self, value: int):
+        by_count = self.get_batch_split_by() == "count"
+        value = max(1, min(20 if by_count else 8, int(value or 1)))
+        self.set_setting("prose_batch_count" if by_count else "prose_batch_size",
+                         str(value))
+
+    def get_outline_batch_plan_value(self) -> tuple[int, bool]:
+        """按大纲分批的界面数值与口径：(计划总批数|每批节拍数, 是否按总批数)。"""
+        by_count = self.get_batch_split_by() == "count"
+        key, default = (("outline_batch_count", 3) if by_count
+                        else ("outline_batch_size", 2))
+        return self.get_setting_int(key, default), by_count
+
+    def set_outline_batch_plan_value(self, value: int):
+        by_count = self.get_batch_split_by() == "count"
+        value = max(1, min(20 if by_count else 8, int(value or 1)))
+        self.set_setting("outline_batch_count" if by_count else "outline_batch_size",
+                         str(value))
+
     def get_chapter_prose_block(self, chapter_id: int) -> dict | None:
         """本章整章正文块（kind='chapter'）；未写过返回 None。
 

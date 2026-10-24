@@ -441,7 +441,8 @@ class AutoPilot:
                 for r in rows):
             store.clear_prose_batches(cid)
             rows = []
-        batches = plan_batches(blocks, store.get_setting_int("prose_batch_size", 3))
+        value, by_count = store.get_prose_batch_plan_value()
+        batches = plan_batches(blocks, value, by_count)
         next_idx = len(rows) + 1
         if next_idx > len(batches):
             # 批全齐但正文未接受（上次中断在合并前）→ 直接合并收尾
@@ -501,8 +502,8 @@ class AutoPilot:
             self._fail(step, "本章还没有大纲，无法按大纲写正文")
             return
         free = store.get_outline_batch_split() == "free"
-        plans = plan_outline_batches(outline,
-                                     store.get_setting_int("outline_batch_size", 2))
+        value, by_count = store.get_outline_batch_plan_value()
+        plans = plan_outline_batches(outline, value, by_count)
         if not plans:
             self._fail(step, "本章大纲为空，无法分批")
             return

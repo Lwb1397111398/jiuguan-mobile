@@ -1050,10 +1050,12 @@ class WritingPage:
     # ---------- 写作台：分批（接力写作） ----------
 
     def _batch_desk_controls(self, ch: dict) -> list:
-        """分批模式：主按钮 + 每批块数 + 批次卡片 + 共用编辑器区 + 细纲块卡片。
+        """分批模式：主按钮 + 分批口径/数值 + 批次卡片 + 共用编辑器区 + 细纲块卡片。
 
         对齐桌面 writing_desk 分批模式：批次是工作区（prose_batches 表），
         逐批「生成 → 确认落批」，全部批完成后合并接受为整章正文（旧版存快照）。
+        2026-10-24 起默认按「计划总批数」控制：规定一共写几批，程序按本章
+        细纲块总数自动换算每批几块（12 块分 3 批 → 每批 4 块）。
         """
         from app.core.pipeline import plan_batches
         store = self.session.store
@@ -1062,8 +1064,9 @@ class WritingPage:
             return [hint("分批模式需要细纲：请先到「大纲」页生成本章细纲，"
                          "或用下方「更多 → 粘贴细纲」导入。")]
         rows = store.list_prose_batches(ch["id"])
-        total = len(plan_batches(blocks,
-                                 store.get_setting_int("prose_batch_size", 3)))
+        value, by_count = store.get_prose_batch_plan_value()
+        batches = plan_batches(blocks, value, by_count)
+        total = len(batches)
         n = len(rows)
         if n == 0:
             btn_text = "开始分批写作"
@@ -1080,10 +1083,21 @@ class WritingPage:
                           disabled=not rows),
         ], spacing=6, wrap=True)]
         controls.append(ft.Dropdown(
-            label="每批细纲块数", dense=True,
-            value=str(store.get_setting_int("prose_batch_size", 3)),
-            options=[ft.dropdown.Option(str(i)) for i in range(1, 9)],
+            label="分批口径", dense=True,
+            value=store.get_batch_split_by(),
+            options=[ft.dropdown.Option("count", "按总批数（推荐）"),
+                     ft.dropdown.Option("size", "按每批数量")],
+            on_select=self._on_batch_split_by_change))
+        controls.append(ft.Dropdown(
+            label="计划总批数" if by_count else "每批细纲块数", dense=True,
+            value=str(value),
+            options=[ft.dropdown.Option(str(i))
+                     for i in range(1, 21 if by_count else 9)],
             on_select=self._on_batch_size_change))
+        if by_count and batches:
+            controls.append(hint(
+                f"本章 {len(blocks)} 个细纲块 → 实际 {total} 批、"
+                f"每批 {len(batches[0])} 个（末批可少）"))
         for i, r in enumerate(rows, start=1):
             controls.append(self._batch_card(ch, r, i))
         controls += self._desk_editor_block(ch, whole=False)
@@ -1094,12 +1108,26 @@ class WritingPage:
             controls.append(self._outline_block_card(ch, b, i))
         return controls
 
+    def _on_batch_split_by_change(self, e):
+        split_by = str(getattr(e.control, "value", "") or "count")
+        self.session.store.set_batch_split_by(split_by)
+        note = self._clear_desk_batches("换分批口径")
+        name = "按总批数" if split_by == "count" else "按每批数量"
+        toast(self.page, f"分批口径已切为「{name}」{note}")
+        self.refresh()
+
     def _on_batch_size_change(self, e):
+        store = self.session.store
+        by_count = store.get_batch_split_by() == "count"
         raw = str(getattr(e.control, "value", "") or "").strip()
-        size = int(raw) if raw.isdigit() and 1 <= int(raw) <= 8 else 3
-        self.session.store.set_setting("prose_batch_size", str(size))
-        note = self._clear_desk_batches("改每批粒度")
-        toast(self.page, f"每批 {size} 个细纲块（对下一批生效）{note}")
+        limit = 20 if by_count else 8
+        value = int(raw) if raw.isdigit() and 1 <= int(raw) <= limit else 3
+        store.set_prose_batch_plan_value(value)
+        note = self._clear_desk_batches("改分批粒度")
+        if by_count:
+            toast(self.page, f"计划共 {value} 批（每批几块按本章细纲块自动换算）{note}")
+        else:
+            toast(self.page, f"每批 {value} 个细纲块（对下一批生效）{note}")
         self.refresh()
 
     def _batch_card(self, ch: dict, row: dict, idx: int) -> ft.Control:
@@ -1306,7 +1334,8 @@ class WritingPage:
             store.clear_prose_batches(cid)
             rows = []
             toast(self.page, "细纲已变化，旧批次已清空，本次从第 1 批重新开始")
-        batches = plan_batches(blocks, store.get_setting_int("prose_batch_size", 3))
+        value, by_count = store.get_prose_batch_plan_value()
+        batches = plan_batches(blocks, value, by_count)
         next_idx = len(rows) + 1
         if next_idx > len(batches):
             merged = store.prose_batch_merged(cid)
@@ -1490,8 +1519,8 @@ class WritingPage:
         if not outline.strip():
             controls.append(hint("本章还没有大纲：先到「大纲」页生成，再按大纲写正文。"))
             return controls
-        plans = plan_outline_batches(outline,
-                                     store.get_setting_int("outline_batch_size", 2))
+        value, by_count = store.get_outline_batch_plan_value()
+        plans = plan_outline_batches(outline, value, by_count)
         rows = store.list_prose_batches(ch["id"])
         n, total = len(rows), len(plans)
         btn_text = ("开始按大纲分批" if n == 0 else
@@ -1505,10 +1534,22 @@ class WritingPage:
                           disabled=not rows),
         ], spacing=6, wrap=True))
         controls.append(ft.Dropdown(
-            label="每批节拍数", dense=True,
-            value=str(store.get_setting_int("outline_batch_size", 2)),
-            options=[ft.dropdown.Option(str(i)) for i in range(1, 9)],
+            label="分批口径", dense=True,
+            value=store.get_batch_split_by(),
+            options=[ft.dropdown.Option("count", "按总批数（推荐）"),
+                     ft.dropdown.Option("size", "按每批数量")],
+            on_select=self._on_outline_split_by_change))
+        controls.append(ft.Dropdown(
+            label="计划总批数" if by_count else "每批节拍数", dense=True,
+            value=str(value),
+            options=[ft.dropdown.Option(str(i))
+                     for i in range(1, 21 if by_count else 9)],
             on_select=self._on_outline_size_change))
+        if by_count and plans:
+            per = plans[0]["last"] - plans[0]["first"] + 1
+            controls.append(hint(
+                f"本章 {plans[0]['total_beats']} 个节拍 → 实际 {total} 批、"
+                f"每批 {per} 个（末批可少）"))
         for i, r in enumerate(rows, start=1):
             controls.append(self._batch_card(ch, r, i))
         controls += self._desk_editor_block(ch, whole=False)
@@ -1530,12 +1571,26 @@ class WritingPage:
         toast(self.page, f"分批划分已切为「{names.get(split, split)}」{note}")
         self.refresh()
 
+    def _on_outline_split_by_change(self, e):
+        split_by = str(getattr(e.control, "value", "") or "count")
+        self.session.store.set_batch_split_by(split_by)
+        note = self._clear_desk_batches("换分批口径")
+        name = "按总批数" if split_by == "count" else "按每批数量"
+        toast(self.page, f"分批口径已切为「{name}」{note}")
+        self.refresh()
+
     def _on_outline_size_change(self, e):
+        store = self.session.store
+        by_count = store.get_batch_split_by() == "count"
         raw = str(getattr(e.control, "value", "") or "").strip()
-        size = int(raw) if raw.isdigit() and 1 <= int(raw) <= 8 else 2
-        self.session.store.set_setting("outline_batch_size", str(size))
-        note = self._clear_desk_batches("改每批粒度")
-        toast(self.page, f"每批 {size} 个大纲节拍（对下一批生效）{note}")
+        limit = 20 if by_count else 8
+        value = int(raw) if raw.isdigit() and 1 <= int(raw) <= limit else 3
+        store.set_outline_batch_plan_value(value)
+        note = self._clear_desk_batches("改分批粒度")
+        if by_count:
+            toast(self.page, f"计划共 {value} 批（每批几拍按本章大纲自动换算）{note}")
+        else:
+            toast(self.page, f"每批 {value} 个大纲节拍（对下一批生效）{note}")
         self.refresh()
 
     def _generate_outline_batch(self, ch: dict):
@@ -1548,8 +1603,8 @@ class WritingPage:
         if not outline.strip():
             toast(self.page, "本章还没有大纲：先到「大纲」页生成", error=True)
             return
-        plans = plan_outline_batches(outline,
-                                     store.get_setting_int("outline_batch_size", 2))
+        value, by_count = store.get_outline_batch_plan_value()
+        plans = plan_outline_batches(outline, value, by_count)
         if not plans:
             toast(self.page, "本章大纲为空，无法分批", error=True)
             return

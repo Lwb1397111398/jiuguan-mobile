@@ -1602,12 +1602,40 @@ def split_draft(text: str) -> tuple:
     return formal.strip(), "\n\n".join(p for p in draft_parts if p), incomplete
 
 
-def plan_batches(blocks: list[dict], size: int) -> list[list[dict]]:
+def batch_split_by(value: str | None) -> str:
+    """分批口径归一：count=按计划总批数（默认）/ size=按每批数量（旧口径）。"""
+    return "size" if str(value or "").strip().lower() == "size" else "count"
+
+
+def resolve_batch_size(total: int, value: int, by_count: bool = False) -> int:
+    """把界面上的分批数值换算成「每批实际包含几项」。
+
+    - by_count=True：value 是计划总批数，每批 = ceil(总数/批数)。
+      例：12 项分 3 批 → 每批 4；11 项分 3 批 → 4/4/3；8 项分 3 批 → 3/3/2。
+    - by_count=False：value 就是每批项数，夹紧到 1~8（旧口径，保留兼容）。
+
+    总数 <= 0 时返回 1；调用方通常已先处理空清单。
+    """
+    total = max(0, int(total or 0))
+    value = max(1, int(value or 1))
+    if not by_count:
+        return max(1, min(8, value))
+    if total <= 0:
+        return 1
+    return max(1, -(-total // value))
+
+
+def plan_batches(blocks: list[dict], size: int, by_count: bool = False) -> list[list[dict]]:
     """把细纲块按顺序切成连续批次（分批模式）：每批 size 块，末批可少。
 
-    size 夹取到 1~8（设置界面上限），空清单返回空（无块可分）。
+    ``by_count=True`` 时 size 参数是「计划总批数」，每批块数由
+    ``resolve_batch_size(len(blocks), size, True)`` 算出（老板 2026-10-24：
+    直接规定一共写几批，12 块分 3 批 → 每批 4 块）。
+    空清单返回空（无块可分）。
     """
-    size = max(1, min(8, int(size or 1)))
+    if not blocks:
+        return []
+    size = resolve_batch_size(len(blocks), size, by_count)
     return [blocks[i:i + size] for i in range(0, len(blocks), size)]
 
 
@@ -1695,16 +1723,20 @@ def split_outline_beats(text: str) -> list[dict]:
     return [{"label": "全文", "text": raw, "kind": "whole"}]
 
 
-def plan_outline_batches(outline_text: str, size: int) -> list[dict]:
+def plan_outline_batches(outline_text: str, size: int,
+                         by_count: bool = False) -> list[dict]:
     """把章节大纲按节拍切成分批计划：每批 ``size`` 个节拍，末批可少。
 
+    ``by_count=True`` 时 size 参数是「计划总批数」，每批节拍数由
+    ``resolve_batch_size(len(beats), size, True)`` 算出（老板 2026-10-24：
+    12 个序号分 3 批 → 每批 4 个；11 个 → 4/4/3；8 个 → 3/3/2）。
     返回 ``[{"label", "text", "first", "last", "total_beats"}]``；
     空大纲返回空清单（调用方提示先生成大纲）。
     """
     beats = split_outline_beats(outline_text)
     if not beats:
         return []
-    size = max(1, min(8, int(size or 1)))
+    size = resolve_batch_size(len(beats), size, by_count)
     plans: list[dict] = []
     for i in range(0, len(beats), size):
         group = beats[i:i + size]
