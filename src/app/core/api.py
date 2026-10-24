@@ -511,13 +511,16 @@ class LLMClient:
                  max_tokens: int | None = None, stream: bool = True,
                  on_chunk: Callable | None = None, stop_event: threading.Event | None = None,
                  retries: int = 1, on_thinking: Callable | None = None,
-                 _include_reasoning: bool = True) -> dict:
+                 _include_reasoning: bool = True,
+                 _read_timeout: int | None = None) -> dict:
         """调用模型，返回正文、思考内容和用量信息。
 
         - stream=True 且给 on_chunk：逐块回调增量文本
         - on_thinking：独立接收思考增量，不会混入正文
         - stop_event 被设置：中断并返回已生成部分（status='stopped'）
         - 网络异常自动重试 retries 次
+        - _read_timeout：内部参数，覆盖档案超时（仅供流式空响应降级非流式时
+          放宽读超时用——非流式要等整个生成完成，120 秒默认值必死）
         """
         if not self.model:
             raise ApiError("模型档案未填写模型名（model）")
@@ -531,10 +534,18 @@ class LLMClient:
         prompt_tokens = completion_tokens = 0
         truncated = False
         last_error = None
+        # 本次失败是否「网络/中断类且 0 字节」：这种失败换非流式重发也救不回
+        # （掐线是渠道网关干的，非流式响应更长只会再被掐；读超时说明渠道慢，
+        # 非流式要等更久）。立刻重发纯属白烧配额——免费站限流按次数计且失败
+        # 也计入。置位的场景：流式读循环抛网络异常（IncompleteRead 等）、
+        # requests 层网络异常（超时/连接失败）、abort 中断。渠道不支持流式
+        # （正常 EOF 但 0 字节）不置位，仍走非流式降级。
+        zero_byte_network_failure = False
         t0 = time.time()
 
         for attempt in range(retries + 1):
             self._aborted = False
+            zero_byte_network_failure = False
             # 每次重试清空累积缓冲：网络中断重试时，上一次已收到的文本/思考仍留在
             # text_parts / thinking_parts 里，会原样拼在重试结果前面（内容翻倍）。
             # 已有正文的错误分支在循环内直接 return（不再重试），故这里清空不会丢成果。
@@ -563,7 +574,8 @@ class LLMClient:
                             "duration_ms": int((time.time() - t0) * 1000)}
                 with _request_with_proxy_fallback(
                         requests.post, url, headers=self._headers(), json=payload,
-                        stream=stream, timeout=(15, min(self.timeout, 600))) as resp:
+                        stream=stream,
+                        timeout=(15, min(_read_timeout or self.timeout, 600))) as resp:
                     # SSE 事实标准为 UTF-8（text/event-stream 无 charset 时 requests 会猜错）
                     resp.encoding = "utf-8"
                     if resp.status_code != 200:
@@ -763,6 +775,7 @@ class LLMClient:
                                     "status": "stopped", "error": last_error or "网络中断",
                                     "truncated": truncated,
                                     "duration_ms": int((time.time() - t0) * 1000)}
+                        zero_byte_network_failure = True
                         break  # 无任何内容：交给循环外统一处理（重试/raise）
                     # 请求成功但一个字都没解析出来：多半是该接口不支持/未开启流式，
                     # 或服务方返回了我们没适配的格式。跳出循环去降级非流式（不占网络重试次数）。
@@ -787,8 +800,12 @@ class LLMClient:
                             "status": "stopped", "error": "", "duration_ms": int((time.time() - t0) * 1000)}
                 if self._aborted:
                     last_error = "已中断"  # abort 关闭连接（无 stop_event，如 run_busy 关进度框）：不重试、不降级
+                    zero_byte_network_failure = True
                     break
+                # requests 层网络异常（等响应头超时/连接失败）发生时必然一个字都没
+                # 收到——同样不值得降级非流式重发（见 zero_byte_network_failure 注释）
                 last_error = f"网络错误：{e}"
+                zero_byte_network_failure = True
                 if attempt < retries:
                     time.sleep(1.0)
                     continue
@@ -804,15 +821,28 @@ class LLMClient:
                             "completion_tokens": completion_tokens, "ok": True,
                             "status": "stopped", "error": "", "duration_ms": int((time.time() - t0) * 1000)}
                 raise ApiError(f"响应解析失败：{e}")
-        # 流式拿到了连接却 0 字 → 自动降级为非流式再试一次（独立于网络重试，retries=0 也生效）
-        # 主动停止/abort 时不降级——否则会再发一次请求重新挂起，且非流式路径无法被 abort 中断
+        # 流式拿到了连接却 0 字 → 自动降级为非流式再试一次（独立于网络重试，retries=0 也生效）。
+        # 不降级的三种情况：①用户停止/abort（再发一次只会重新挂起，非流式路径无法被 abort 中断）；
+        # ②网络/中断类 0 字节失败（掐线是渠道网关干的、读超时说明渠道慢——非流式响应更长，
+        # 重发只会再死一次还白烧配额，免费站限流按次数计且失败也计入；上层 30 秒后重试更划算）。
+        # 降级时读超时放宽（档案超时 ×3，至少 300 秒）：非流式必须等整个生成完成，
+        # 沿用 120 秒默认值的话长思考模型必死（2026-10-23 实测：降级请求
+        # 100% 死于同款读超时，等于每次掐线多烧一次配额）。
         if (stream and not text_parts and not thinking_parts
+                and not zero_byte_network_failure
+                and not self._aborted
                 and not (stop_event is not None and stop_event.is_set())):
             return self.complete(messages, temperature=temperature, max_tokens=max_tokens,
                                  stream=False, on_chunk=on_chunk, stop_event=stop_event,
                                  retries=0, on_thinking=on_thinking,
-                                 _include_reasoning=_include_reasoning)
-        raise ApiError(last_error or "未知错误")
+                                 _include_reasoning=_include_reasoning,
+                                 _read_timeout=min(max(self.timeout * 3, 300), 600))
+        msg = last_error or "未知错误"
+        if "(read timeout=" in msg:
+            # 读超时九成是思考模型等首字节超档案超时（等头阶段无心跳无重试放大），
+            # 报错里直接给解法，省得老板当成「自己网络断了」
+            msg += "。长思考模型常思考几分钟才吐第一个字，可在模型档案里调大「超时」（建议 300~600 秒）。"
+        raise ApiError(msg)
 
     def list_models(self) -> dict:
         """拉取服务方的模型列表（OpenAI 兼容 GET /models），供档案编辑时选择模型。
