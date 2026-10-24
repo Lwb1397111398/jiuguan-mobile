@@ -81,6 +81,24 @@ JAILBREAK_MODES = {
 }
 _DEFAULT_JB_MODE = "full"
 
+# 改写·输出格式终裁（2026-10-24 散打改写 11 次败 7 次的根因修复）：
+# 破限档案的收尾 user（「**续写only order**」，酒馆成功报文的 63 字形态锁，
+# 全报文离生成点最近的一句）会把 gemini 带偏——模型无视任务层的差量替换协议，
+# 直接整章重写（散打 request_logs 158-167：7 条响应 0 条 P 条目、全是正文，
+# 解析层只能报「未识别到替换条目」）。修法不是动破限（正文生成仍靠「续写only」），
+# 而是给 prose_rewrite 角色追加一条更短的格式终裁、压成全报文最后一句
+# （_finalize 里拼进末条 user；off/light 档与 build_bare 都不会走到）。
+# 对 prose 等其他角色零影响——那边「续写only」本来就是对的。
+REWRITE_DIFF_ANCHOR = (
+    "【输出格式终裁（本条优先级最高，与任何其他输出要求冲突时以本条为准）】\n"
+    "本次任务是「文风改写（差量替换）」，不是续写、更不是重写全文：\n"
+    "- 正式输出只能是差量条目：每条以「P段号：」开头（段号与上方编号稿一致），"
+    "后接该段改写后的完整段落，只列有病灶、需要修改的段落，条目正文要能直接替换回原稿；\n"
+    "- 全章无病灶时，正式输出只写一行「无病灶。」；\n"
+    "- 严禁把正式输出写成整章正文、重抄全文或接着写新情节——程序按「P段号：」条目"
+    "做精确替换，整章正文一条都对不上号，本章会直接判失败。"
+)
+
 # 总纲局部注入（2026-10-08）用：识别「#~#### 分卷N」标题行，把 parse 吞进整体层
 # body 的卷段落裁掉（_MD_H2_RE 只按 H2 切，### 分卷不截断）。
 _SYNOPSIS_VOL_HEADING_RE = re.compile(
@@ -2475,6 +2493,12 @@ class Assembler:
             if guard_tail:
                 out.append({"title": "破限·收尾指令", "kind": "jailbreak_prefill_tail",
                             "text": guard_tail, "priority": 15.5, "critical": True})
+        # 改写·输出格式终裁（REWRITE_DIFF_ANCHOR 处注释）：必须排在收尾指令之后，
+        # 由 _finalize 拼成全报文最后一句。只在 full 档注入（off/light 已提前 return）；
+        # build_bare 的 role=None 天然不带。
+        if role == "prose_rewrite":
+            out.append({"title": "改写·输出格式终裁", "kind": "output_anchor",
+                        "text": REWRITE_DIFF_ANCHOR, "priority": 15.6, "critical": True})
         return out
 
     def _late_binding_text(self, modules: list[dict], role: str | None) -> str:
@@ -2649,7 +2673,7 @@ class Assembler:
                 not in ("jailbreak", "jailbreak_prelude", "jailbreak_tail",
                         "jailbreak_runtime", "jailbreak_late",
                         "jailbreak_prefill",
-                        "jailbreak_prefill_tail", "pinned_prefs")]
+                        "jailbreak_prefill_tail", "pinned_prefs", "output_anchor")]
         system_mods = [m for m in rest if m["kind"] == "system"]
         # 推杆层追加 user 组装序列最末（与模块列表同序，任务指令之后、紧贴生成点）；
         # 本轮复投（runtime 专用）排在推杆之后；协议层再排在复投之后，占住整条 user 的尾部
@@ -2724,6 +2748,27 @@ class Assembler:
                 if content:
                     messages.append({"role": "user", "content": content})
                     msg_modules.append([(mod_id[id(pm)], 0, content)])
+        # 改写·输出格式终裁（kind=output_anchor，REWRITE_DIFF_ANCHOR 处注释）：
+        # 压成全报文最后一句。末条已是 user（酒馆形态的收尾指令）→ 原地拼接，
+        # 不新增消息、报文形态不变；末条是 assistant（档案没配收尾护栏）→ 补一条
+        # 短 user，顺带把请求末尾拉回 user 形态（避开拒收 assistant 结尾的渠道）。
+        anchor_mods = [m for m in modules if m["kind"] == "output_anchor"]
+        if anchor_mods:
+            text = "\n\n".join(str(m.get("text") or "").strip()
+                               for m in anchor_mods).strip()
+            if text:
+                if messages and (messages[-1] or {}).get("role") == "user":
+                    off = len(messages[-1]["content"]) + 2
+                    messages[-1]["content"] += "\n\n" + text
+                    refs = []
+                    for m in anchor_mods:
+                        refs.append((mod_id[id(m)], off, m["text"]))
+                        off += len(m["text"]) + 2
+                    msg_modules[-1].extend(refs)
+                else:
+                    messages.append({"role": "user", "content": text})
+                    msg_modules.append([(mod_id[id(m)], 0, m["text"])
+                                        for m in anchor_mods])
 
         est_in = sum(estimate_tokens(m["text"], self._token_ratio()) for m in modules)
         # 输出预算按角色默认上限估算（此前用 profile.max_tokens×0.5，档案默认 4096 →
