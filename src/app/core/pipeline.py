@@ -11,7 +11,7 @@ import time
 from .api import LLMClient, ApiError, estimate_cost
 from .assembler import Assembler
 from .chapter_outline import (chapter_outline_text, outline_draft_text,
-                              split_outline_points)
+                              split_outline_points, strip_whole_line_bold)
 from .completeness import (END_PUNCTUATION, TAIL_DECOR, detail_complete,
                            numbered_max_index, outline_complete, prose_complete,
                            synopsis_complete, volume_complete)
@@ -1647,13 +1647,15 @@ def plan_batches(blocks: list[dict], size: int, by_count: bool = False) -> list[
 #   ① 节拍行：老板的分卷模板产出「…展开分卷节拍①」「——展开分卷节拍①」，
 #      也兼容 Markdown 标题写法「## 展开分卷节拍①」（2026-10-23：第七章
 #      大纲用了 ## 前缀，旧正则认不出，退化成按每个 ①(1) 子条目切——57 段
-#      按每批 3 段被切成 19 批）；
+#      按每批 3 段被切成 19 批），以及加粗写法「**节拍①｜标题**」（2026-10-24：
+#      五遁忍术第一章大纲 11 个节拍全被模型加粗，旧正则 0 匹配，退化成按
+#      85 条微节拍 bullet 切成 86 段，3 批变 29/29/28 且切口全落在节拍中间）；
 #   ② 序号点：①②③ / 1. / 一、（chapter_outline.split_outline_points）；
 #   ③ 都没有 → 整段作为 1 批（等于整章一次写完）。
 # 只认行首结构，正文里的「节拍」二字不会被误切。
 
 _OUTLINE_BEAT_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*)?[—…\-–·．\.]{0,3}\s*"
+    r"^\s*(?:#{1,6}\s*)?(?:[*＊]{1,2}\s*)?[—…\-–·．\.]{0,3}\s*"
     r"(?:展开分卷节拍|分卷节拍|本章节拍|节拍)\s*"
     r"([①-⑳]|\d{1,2}|[一二两三四五六七八九十]{1,3})"
 )
@@ -3623,7 +3625,9 @@ class Pipeline:
             return None, "空输出"
 
         def _finish(title: str, body: str):
-            body = (body or "").strip()
+            # 整行加粗剥装饰（2026-10-24）：模型把节拍标题排版成『**节拍①｜…**』
+            # 落库后挡住分批识别，存库前统一剥掉；行内局部加粗不动。
+            body = strip_whole_line_bold((body or "").strip())
             if min_chars and len(body) < min_chars:
                 return None, (f"大纲正文仅 {len(body)} 字（低于 {min_chars} 字门槛），"
                               f"疑似 AI 未按要求生成，请重新生成")

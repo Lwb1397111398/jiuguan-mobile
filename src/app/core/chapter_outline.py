@@ -26,6 +26,23 @@ _CN_DIGITS = {
 # 【】块标题后允许跟内容（如『【章末状态收束】位置：X』整行独立）
 _SECTION_START_RE = re.compile(r"^\s*(?:【[^】\r\n]+】|——)")
 
+# 整行被 ** / ＊ 包裹的加粗行（『**节拍①｜标题**』）：剥装饰留文字。
+# 模型爱给节拍标题自加粗，而加粗会挡住分批识别的行首节拍判定，大纲落库前统一剥掉。
+_BOLD_WHOLE_LINE_RE = re.compile(r"^\s*([*＊]){1,2}(.*?)\1{1,2}\s*$")
+
+
+def strip_whole_line_bold(text: str | None) -> str:
+    """剥掉「整行被 ** 包裹」的加粗装饰，其余文字逐字保留。
+
+    只处理整行加粗（含全角 ＊＊），行内局部加粗（强调排版）不动。
+    AI 大纲落库前应用（parse_outline_chapter）：防止模型自作主张把
+    『节拍①』排版成『**节拍①｜标题**』挡住分批识别（2026-10-24 五遁忍术）。
+    """
+    return "\n".join(
+        _BOLD_WHOLE_LINE_RE.sub(r"\2", line)
+        for line in str(text or "").splitlines()
+    )
+
 # title 是章节元数据，不属于章节大纲正文；target_words 一律不进大纲文本
 # （字数由用户自定义提示词规定，系统不注入篇幅要求）。
 _LEGACY_FIELDS = (

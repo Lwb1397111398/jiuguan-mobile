@@ -12,6 +12,8 @@ from .db import DEFAULT_CONTEXT_LENGTH
 from .draft_check import build_draft_text
 from .endmark import END_MARK_INSTRUCTION, end_mark_enabled
 from .embedding import cosine_similarity, embed_one, load_embed_config
+from .rerank import (rerank_documents, load_rerank_config,
+                     RERANK_CANDIDATES, RERANK_DOC_MAX_CHARS)
 from .store import ProjectStore, lore_context_hit
 from .style_checker import high_frequency_phrases, recent_chapter_texts
 from .chapter_outline import chapter_outline_text, outline_draft_text
@@ -369,6 +371,8 @@ class Assembler:
         细纲显式点名；rumor:/event: 单元用 enumerate 序号跨快照漂移、不可靠
         反查 → 不参与唤醒（仍进 text 文本模块）。
         未配置嵌入 / 无向量索引 / 检索失败 → ("", 空集)，绝不阻断生成。
+        配置了重排模型（rerank_enabled=1）时召回走二次精排：余弦宽取 top 24 候选
+        → 重排按相关度精挑；重排失败/关闭自动回退纯余弦路径（0.25 阈值 + top5）。
 
         性能：按 (章, 块) 缓存在 build 实例内（同章多块共享一次 embed 调用
         与一次全量余弦扫描，大书 4650 向量单元纯 Python 余弦数百 ms）；
@@ -404,30 +408,61 @@ class Assembler:
             scored = sorted(((cosine_similarity(qv, u["vector"]), u) for u in units),
                             key=lambda x: (x[0], x[1].get("snapshot_version") or 0),
                             reverse=True)
-            # 阈值按实测分布取 0.25（llama-nemotron 等嵌入模型相关片段约 0.3+，无关约 0.1）
-            # 同名去重（2026-09-08）：每个快照版本各存一份 char:XXX 单元，不去重会把
-            # 同一角色的多个历史版本全部召回、提示词里重复注入。按 unit_key 只留
-            # 相似度最高的那条——相似度最高的即与当前剧情最相关（通常也是最新版本）。
-            hits: list[tuple[float, dict]] = []
-            seen_keys: set = set()
-            for s, u in scored:
-                if s < 0.25:
-                    break
-                key = str(u.get("unit_key") or id(u))
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                hits.append((s, u))
-                if len(hits) >= 5:
-                    break
+            # rerank 二次精排（2026-10-26）：余弦只衡量「用词像不像」，分不清「同一话题」
+            # 和「同一写作意图」——宽召回（不看 0.25 阈值，取余弦 top N，同名去重保留
+            # 余弦最高）后由重排模型逐条打相关分，按分精挑。未启用 / 未配置 / 调用失败
+            # 一律回退旧路径（0.25 阈值 + 去重 + top5），与未加精排时行为完全一致。
+            rerank_used = False
+            hits: list[tuple[float, dict]] | None = None
+            rk = load_rerank_config(self.store)
+            if rk:
+                cands: list[tuple[float, dict]] = []
+                cand_keys: set = set()
+                for s, u in scored:
+                    key = str(u.get("unit_key") or id(u))
+                    if key in cand_keys:
+                        continue
+                    cand_keys.add(key)
+                    cands.append((s, u))
+                    if len(cands) >= RERANK_CANDIDATES:
+                        break
+                ranked = rerank_documents(
+                    rk["base_url"], rk["api_key"], rk["model"], query,
+                    [u["text"][:RERANK_DOC_MAX_CHARS] for _, u in cands])
+                if ranked:
+                    picked = [r for r in ranked
+                              if rk["min_score"] <= 0 or r["score"] >= rk["min_score"]]
+                    hits = [(r["score"], cands[r["index"]][1])
+                            for r in picked[:rk["top_n"]]
+                            if 0 <= r["index"] < len(cands)]
+                    rerank_used = True
+            if hits is None:
+                # 旧路径：阈值按实测分布取 0.25（llama-nemotron 等嵌入模型相关片段
+                # 约 0.3+，无关约 0.1）。同名去重（2026-09-08）：每个快照版本各存一份
+                # char:XXX 单元，不去重会把同一角色的多个历史版本全部召回、提示词里
+                # 重复注入。按 unit_key 只留相似度最高的那条——相似度最高的即与当前
+                # 剧情最相关（通常也是最新版本）。
+                hits = []
+                seen_keys: set = set()
+                for s, u in scored:
+                    if s < 0.25:
+                        break
+                    key = str(u.get("unit_key") or id(u))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    hits.append((s, u))
+                    if len(hits) >= 5:
+                        break
             if not hits:
                 self._retrieval_cache[cache_key] = empty
                 return empty
+            score_label = "相关度" if rerank_used else "相似度"
             lines = ["【相关记忆（语义检索·情节连贯参考，不得违背状态卡）】"]
             wake: dict = {"char": set(), "entity": set()}
             for s, u in hits:
                 key = str(u.get("unit_key") or "")
-                lines.append(f"- [{key}]（相似度 {s:.2f}）{u['text']}")
+                lines.append(f"- [{key}]（{score_label} {s:.2f}）{u['text']}")
                 # 软唤醒反解：只认名字作 key 的 char:/entity:（rumor/event
                 # 是序号 key，跨快照漂移，宁可不唤醒也不误唤醒）。
                 # [:64] 截断的超长名反解后对不上当前记忆键 → 成员判定自然

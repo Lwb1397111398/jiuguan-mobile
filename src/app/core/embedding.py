@@ -163,6 +163,16 @@ def test_embedding(base_url: str, api_key: str, model: str) -> dict:
     return result
 
 
+def is_rerank_model(m: dict) -> bool:
+    """按模型 id / supported_endpoint_types 判断是否重排（rerank）模型。
+
+    嵌入模型列表用它排除重排条目；rerank.list_rerank_models 反向用它只留重排条目。
+    """
+    mid = str(m.get("id", "")).lower()
+    types = " ".join(str(x).lower() for x in (m.get("supported_endpoint_types") or []))
+    return any(t in mid or t in types for t in ("rerank", "re-ranker", "ranker"))
+
+
 def list_embedding_models(base_url: str, api_key: str) -> dict:
     """拉取 OpenAI 兼容服务的嵌入模型列表，过滤明确标为重排模型的条目。
 
@@ -191,11 +201,6 @@ def list_embedding_models(base_url: str, api_key: str) -> dict:
         result["message"] = f"获取失败：{type(exc).__name__}: {exc}"
         return result
 
-    def _is_rerank(m: dict) -> bool:
-        mid = str(m.get("id", "")).lower()
-        types = " ".join(str(x).lower() for x in (m.get("supported_endpoint_types") or []))
-        return any(t in mid or t in types for t in ("rerank", "re-ranker", "ranker"))
-
     def _is_embed(m: dict) -> bool:
         mid = str(m.get("id", "")).lower()
         if any(t in mid for t in ("embed", "embedding")):
@@ -213,7 +218,7 @@ def list_embedding_models(base_url: str, api_key: str) -> dict:
     for m in raw:
         if not isinstance(m, dict) or not m.get("id"):
             continue
-        if _is_rerank(m):
+        if is_rerank_model(m):
             continue
         if _is_embed(m):
             models.append({"id": m["id"], "context_length": _context_length(m)})
@@ -222,7 +227,7 @@ def list_embedding_models(base_url: str, api_key: str) -> dict:
         for m in raw:
             if not isinstance(m, dict) or not m.get("id"):
                 continue
-            if _is_rerank(m):
+            if is_rerank_model(m):
                 continue
             mid = str(m["id"]).lower()
             if any(t in mid for t in ("gpt", "chat", "claude", "qwen-turbo", "deepseek")):

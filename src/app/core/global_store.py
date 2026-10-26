@@ -51,6 +51,13 @@ GLOBAL_SETTING_DEFAULTS = {
     "embed_base_url": "",                # 嵌入（向量）接口地址：文风审校语义查重 + 记忆语义检索
     "embed_api_key": "",                 # 嵌入接口 API Key（密文存储）
     "embed_model": "",                   # 嵌入模型名
+    # ---------- 记忆召回 rerank 二次精排（2026-10-26）----------
+    "rerank_enabled": "0",               # 重排精排开关：0 关 / 1 开（召回后由重排模型按相关度精挑，多一次 API 调用）
+    "rerank_base_url": "",               # 重排接口地址：留空跟随 embed_base_url
+    "rerank_api_key": "",                # 重排接口 API Key（密文存储）：留空跟随 embed_api_key
+    "rerank_model": "",                  # 重排模型名（如 bge-reranker-v2-m3 / gte-rerank-v2）
+    "rerank_top_n": "5",                 # 精排后保留的记忆条数（1~10）
+    "rerank_min_score": "0",             # 最低相关分：0=只排序不淘汰（各家分数分布不同，非 0 时低于该分的记忆不注入）
     "prose_mode": "chapter",             # 正文写法：chapter=一次性（整章一次写完，默认）/ batch=分批（按细纲块接力）/ outline=按大纲直写（不生成细纲，2026-10-17）
     "batch_split_by": "count",           # 分批口径：count=按计划总批数（默认，程序用 ceil(总数/批数) 算每批几项）/ size=按每批数量（旧口径）
     "prose_batch_size": "3",             # 分批模式每批覆盖的细纲块数（仅 batch_split_by=size 生效；1~8，末批可少）
