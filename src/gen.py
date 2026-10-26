@@ -32,18 +32,18 @@ def start_generation(page, session, *, role, context, task, title, on_done,
 
     if not preview:
         _execute(page, pipe, role, context, task, title, on_done, on_text,
-                 bare_profile, max_tokens, "", on_started)
+                 bare_profile, max_tokens, "", on_started, use_cache=False)
         return
 
     def _send(extra: str):
         _execute(page, pipe, role, context, task, title, on_done, on_text,
-                 bare_profile, max_tokens, extra, on_started)
+                 bare_profile, max_tokens, extra, on_started, use_cache=True)
 
     preview_sheet(page, build, profile, route, _send, title=title)
 
 
 def _execute(page, pipe, role, context, task, title, on_done, on_text,
-             bare_profile, max_tokens, extra, on_started):
+             bare_profile, max_tokens, extra, on_started, use_cache=False):
     ctx = {**context, "extra": extra} if extra else context
     tk = StreamTask(page)
     tk.on_text = on_text
@@ -54,9 +54,12 @@ def _execute(page, pipe, role, context, task, title, on_done, on_text,
                 bare_profile, task, stream=True, on_chunk=tk._chunk,
                 stop_event=tk.stop_event, max_tokens=max_tokens,
                 extra=extra or "")
+        # 生成结果缓存（2026-10-27）：手动生成（preview=True 路径）按指纹复用
+        # 相同请求的上次完整结果；preview=False 是⚡自动模式，绝不缓存
+        # （失败重试不能拿到同一个坏结果）。开关判定在内核 pipeline.run 内。
         return pipe.run(
             role, ctx, task, stream=True, on_chunk=tk._chunk,
-            stop_event=tk.stop_event, max_tokens=max_tokens)
+            stop_event=tk.stop_event, max_tokens=max_tokens, use_cache=use_cache)
 
     if on_started:
         try:

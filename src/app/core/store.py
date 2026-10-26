@@ -838,6 +838,58 @@ class ProjectStore(QObject):
         """上次成功锁定总纲的内容指纹（空 = 尚未锁定过/旧项目无记录）。"""
         return self.get_meta("last_locked_synopsis_fingerprint", "")
 
+    # ---------- 生成结果缓存（2026-10-27，手动生成按指纹复用） ----------
+
+    def get_generation_cache(self, fingerprint: str) -> dict | None:
+        """按请求指纹读缓存，无则 None。任何异常都返回 None（缓存绝不影响生成）。"""
+        try:
+            row = self.conn.execute(
+                "SELECT task_role, model, result_text, thinking, created_at "
+                "FROM generation_cache WHERE fingerprint = ?",
+                (str(fingerprint or ""),)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        return {"task_role": row[0], "model": row[1], "result_text": row[2],
+                "thinking": row[3], "created_at": row[4]}
+
+    def list_generation_cache_entries(self) -> list[dict]:
+        """全部缓存条目（测试与排查用，不含正文只含元信息）。"""
+        try:
+            rows = self.conn.execute(
+                "SELECT id, fingerprint, task_role, model, created_at "
+                "FROM generation_cache ORDER BY id").fetchall()
+        except sqlite3.Error:
+            return []
+        return [{"id": r[0], "fingerprint": r[1], "task_role": r[2],
+                 "model": r[3], "created_at": r[4]} for r in rows]
+
+    def save_generation_cache(self, fingerprint: str, task_role: str, model: str,
+                              result_text: str, thinking: str = "",
+                              keep: int = 100) -> None:
+        """写入/覆盖缓存（同指纹 upsert，重新生成的结果覆盖旧行），并只保留
+        最近 keep 条（按时间倒序清理最老的）。失败静默——缓存是纯增强，坏了也不能碰生成。"""
+        try:
+            now = db.now()
+            self.conn.execute(
+                "INSERT INTO generation_cache "
+                "(fingerprint, task_role, model, result_text, thinking, created_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET "
+                "task_role=excluded.task_role, model=excluded.model, "
+                "result_text=excluded.result_text, thinking=excluded.thinking, "
+                "created_at=excluded.created_at",
+                (str(fingerprint or ""), str(task_role or ""), str(model or ""),
+                 str(result_text or ""), str(thinking or ""), now))
+            self.conn.execute(
+                "DELETE FROM generation_cache WHERE id NOT IN ("
+                "SELECT id FROM generation_cache ORDER BY created_at DESC, id DESC LIMIT ?)",
+                (max(1, int(keep)),))
+            self.conn.commit()
+        except sqlite3.Error:
+            pass
+
+
     def synopsis_volumes_differ(self, volumes: list[dict]) -> bool:
         """当前库中分卷与总纲解析结果的差异判断（旧项目无指纹时的换纲依据）。
 

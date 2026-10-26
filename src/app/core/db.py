@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # 新模型档案的默认上下文长度。写小说需要尽量长的上下文（多章记忆、前文注入），
 # 所以默认给到 100 万 token；若服务方模型实际上限更低、报"上下文超限"错误，
@@ -161,6 +161,21 @@ CREATE TABLE IF NOT EXISTS rewrite_batches (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rewrite_batches_chapter ON rewrite_batches(chapter_id, order_index);
+
+-- 生成结果缓存（2026-10-27）：手动生成按请求指纹复用上次完整结果（内容没变
+-- 就不再花钱重跑）。指纹 = 角色+模型+温度+max_tokens+完整报文的 SHA-256；
+-- 只缓存「确实写完」的结果（取消/空文本/截断/未过完整性判定不入库）。
+CREATE TABLE IF NOT EXISTS generation_cache (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  fingerprint  TEXT NOT NULL UNIQUE,        -- 请求指纹（sha256 十六进制）
+  task_role    TEXT NOT NULL DEFAULT '',    -- 任务角色（排查用冗余）
+  model        TEXT NOT NULL DEFAULT '',    -- 模型名（排查用冗余）
+  result_text  TEXT NOT NULL DEFAULT '',    -- 清洗后的完整结果
+  thinking     TEXT NOT NULL DEFAULT '',    -- 思考过程（可空）
+  created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_cache_created ON generation_cache(created_at);
 
 -- 本章动态：每块正文确认后提取的块级状态变化，注入后续所有块
 CREATE TABLE IF NOT EXISTS chapter_notes (
@@ -408,6 +423,20 @@ MIGRATIONS = [
           created_at      TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_volume_versions ON volume_versions(volume_id, version);
+    """),
+    # v19（2026-10-27）：生成结果缓存表（同 v16-v18 幂等模式，SCHEMA_SQL 同步建表）——
+    # 手动生成按请求指纹复用上次完整结果；fingerprint 唯一键 upsert，上限清理在 store 层做。
+    (19, """
+        CREATE TABLE IF NOT EXISTS generation_cache (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          fingerprint  TEXT NOT NULL UNIQUE,
+          task_role    TEXT NOT NULL DEFAULT '',
+          model        TEXT NOT NULL DEFAULT '',
+          result_text  TEXT NOT NULL DEFAULT '',
+          thinking     TEXT NOT NULL DEFAULT '',
+          created_at   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_generation_cache_created ON generation_cache(created_at);
     """),
 ]
 

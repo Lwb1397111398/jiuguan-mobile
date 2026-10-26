@@ -5,8 +5,10 @@
 - 红线：AI 生成结果一律不直接写入正式内容，返回给 UI 由用户确认后落库
 - 所有方法返回 dict：{ok, data|text, error, log_id, est_*，build}
 """
+import json
 import re
 import time
+import hashlib
 
 from .api import LLMClient, ApiError, estimate_cost
 from .assembler import Assembler
@@ -554,6 +556,22 @@ def join_continuation(full_text: str, new_text: str) -> str:
         if full.endswith(new[:tail_len]):
             return full + new[tail_len:]
     return full + new
+
+
+def generation_fingerprint(role: str, build: dict, profile: dict,
+                           temperature, max_tokens) -> str:
+    """请求指纹（2026-10-27 生成结果缓存）：角色+模型+温度+max_tokens+完整报文
+    的 SHA-256。同指纹 = 输入完全没变 → 可复用上次完整结果。换行归一防跨端差异；
+    拒答重试/继续生成/预览额外要求都会改变报文 → 指纹自然不同，不会误命中。"""
+    messages = [{"role": str(m.get("role", "")),
+                 "content": str(m.get("content", "")).replace("\r\n", "\n")}
+                for m in ((build or {}).get("messages") or [])]
+    norm = json.dumps({"role": role, "model": (profile or {}).get("model", ""),
+                       "temperature": temperature, "max_tokens": max_tokens,
+                       "messages": messages},
+                      ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
 
 def _safe_int(value, default: int) -> int:
     """安全转 int：模型输出的 target_words 可能是 "2,000"/"三千"/"3000字" 等，兜底回退默认。"""
@@ -2677,7 +2695,8 @@ class Pipeline:
 
     def run(self, role: str, context: dict, task_instruction: str,
             stream: bool = False, on_chunk=None, stop_event=None,
-            max_tokens: int | None = None, on_thinking=None) -> dict:
+            max_tokens: int | None = None, on_thinking=None,
+            use_cache: bool = False) -> dict:
         """统一执行一次生成：组装→调用→记日志。任何错误都返回 error dict（不抛异常）。
 
         温度唯一来源是角色路由（模型档案温度已退役）：路由温度 -1 = 默认档，
@@ -2687,9 +2706,19 @@ class Pipeline:
         （余额耗尽/限流/Key 失效/服务端故障/网络不通）且重试仍失败 → 重新组装请求
         （破甲/参数按新档案走）换下一个渠道重发；全部失败则原样返回最后一次错误。
         没配备用链时循环只跑一轮，行为与旧版完全一致。
+
+        生成结果缓存（2026-10-27，use_cache=True 才启用，默认关）：手动生成路径传入。
+        组装后算请求指纹，命中缓存 → 直接回放上次完整结果（0 调用 0 费用，结果带
+        cache_hit=True 供 UI 提示）；未命中正常调用，完整成功且过完整性判定的结果
+        写入缓存。自动模式/记忆归档/审校不传此参，行为不变。
         """
         t0 = time.time()
         build = None
+        cache_fp: str | None = None
+        # 全局开关兜底（设置「重复生成时复用上次结果」）：手动路径传 use_cache=True，
+        # 用户关了开关就整体停用（读与写都不走），各调用点无需再判。
+        if use_cache and str(self.store.get_setting("regen_cache_enabled", "1") or "").strip() != "1":
+            use_cache = False
         # 拒答重试 → 自动升级协议栈（2026-09-23）：总纲首轮被拒后，重试轮无条件挂上
         # 协议栈，不再只看 `protocol_stack_enabled` 开关。依据 docs/酒馆破限对照排查SOP.md
         # §4.9：同一素材同一分钟，无栈基线族 **1/30** 出正文、带栈 **4/6**；而强化推杆
@@ -2715,8 +2744,21 @@ class Pipeline:
                     # 这是保险；思考增量走 on_thinking，不进正文缓冲）。
                     on_chunk(STREAM_RESET)
                 build = None
+                cache_fp = None
                 try:
                     build = self.assembler.build(role, context, task_instruction, prof)
+                    cache_fp = generation_fingerprint(role, build, prof,
+                                                      temperature, max_tokens)
+                    if use_cache:
+                        cached = self.store.get_generation_cache(cache_fp)
+                        if cached:
+                            # 命中：回放上次完整结果（on_chunk 一次性发全文，
+                            # 流式窗口瞬间上屏），跳过渠道循环直接返回。
+                            result = self._cache_hit_result(build, cached)
+                            if on_chunk is not None and result["text"]:
+                                on_chunk(result["text"])
+                            used = prof
+                            break
                     result = self._retry_upstream_blocked(
                         self._complete_and_log(build, prof, role, temperature, t0,
                                                stream=stream, on_chunk=on_chunk,
@@ -2736,9 +2778,42 @@ class Pipeline:
                 switches.append({"from": prof.get("name", ""),
                                  "to": chain[idx + 1].get("name", ""),
                                  "kind": kind, "reason": why})
-            return self._with_channel_info(result, switches, used)
+            final = self._with_channel_info(result, switches, used)
+            # 生成缓存写入（2026-10-27）：只存「确实写完」的合格结果——完整成功
+            # （status=ok 且过完成标志/结构完整性判定）、非空、非截断、非命中回放
+            # （命中不再写，防重复 upsert 刷新时间戳）。取消/半截/拒答一律不入缓存。
+            if (use_cache and cache_fp and final.get("ok")
+                    and final.get("status") == "ok" and not final.get("cache_hit")
+                    and (final.get("text") or "").strip()
+                    and final.get("end_mark") and not final.get("truncated")):
+                try:
+                    self.store.save_generation_cache(
+                        cache_fp, role, (used or {}).get("model", ""),
+                        final.get("text", ""), final.get("thinking", "") or "")
+                except Exception:
+                    pass
+            return final
         except Exception as e:
             return self._error_result(role, t0, build, e)
+
+    @staticmethod
+    def _cache_hit_result(build: dict, cached: dict) -> dict:
+        """缓存命中返回：字段与 _complete_and_log 成功结构对齐，0 token 0 费用
+        未调 AI。草稿自检的 draft 不入缓存（一次性辅助内容），命中时恒空。"""
+        return {
+            "ok": True, "text": cached.get("result_text", ""),
+            "scene_meta": "", "draft": None, "draft_incomplete": False,
+            "draft_expected": False,
+            "thinking": cached.get("thinking", "") or "",
+            "think_stripped": 0, "clean_failed": False,
+            "status": "ok", "error": "",
+            "upstream_blocked": False, "model_safety_refusal": False,
+            "silent_refusal": "", "truncated": False, "end_mark": True,
+            "complete_fallback": "", "continued": 0, "log_id": None,
+            "est_input_tokens": 0, "est_output_tokens": 0, "est_cost": 0.0,
+            "build": build, "cache_hit": True,
+            "cache_created_at": cached.get("created_at", "") or "",
+        }
 
     @staticmethod
     def _with_channel_info(result: dict, switches: list, used_profile: dict) -> dict:
