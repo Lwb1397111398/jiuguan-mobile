@@ -1277,6 +1277,65 @@ class Assembler:
                         f"{texts[-1][-1500:]}")
         return ""
 
+    def prose_prev_context(self, chapter_id: int, rows: list[dict] | None = None) -> str:
+        """分批续写/跨章首批的衔接原文（2026-10-27 老板要求）。
+
+        数据来源按顺序：
+        1. `rows` 传入的本章批次（续第 N 批）→ 最后一批有内容的原文；
+        2. 本章还没有批次（写第 1 批）→ 回溯上一章：优先它最后一批的原文，
+           没有分批记录（一次性写完）则取整章正文结尾。
+
+        全局键 `prose_prev_batch_full`（默认 1）控制是否带上一批原文；关掉时退回
+        旧行为（只带末尾两段）。`prose_prev_batch_chars`（默认 6000）是原文上限，
+        超长只保留最后一段——既保住衔接落点，也避免单次请求体量失控。
+        """
+        full = self.store.get_setting_int("prose_prev_batch_full", 1) == 1
+        max_chars = self.store.get_setting_int("prose_prev_batch_chars", 6000)
+        max_chars = max(500, min(20000, max_chars))
+        if rows is None:
+            rows = self.store.list_prose_batches(chapter_id)
+        filled = [r for r in (rows or []) if (r.get("content") or "").strip()]
+        content = ""
+        label = ""
+        if filled:
+            content = filled[-1]["content"]
+            label = "上一批正文原文"
+        else:
+            chapters = self.store.list_chapters()
+            cur = next((c for c in chapters if c["id"] == chapter_id), None)
+            prior = [c for c in chapters
+                     if cur is not None and c["order_index"] < cur["order_index"]]
+            for c in reversed(prior):
+                prev_rows = [r for r in self.store.list_prose_batches(c["id"])
+                             if (r.get("content") or "").strip()]
+                if prev_rows:
+                    content = prev_rows[-1]["content"]
+                    label = (f"上一章最后一批正文原文"
+                             f"（第{c['order_index']}章 {c['title']}）")
+                    break
+                texts = self._accepted_texts(c["id"])
+                if texts:
+                    content = texts[-1]
+                    label = f"上一章正文结尾（第{c['order_index']}章 {c['title']}）"
+                    break
+        content = (content or "").strip()
+        if not content:
+            return ""
+        if not full:
+            # 旧行为：同章续批只带末尾两段；跨章没有批次时沿用 1500 字结尾
+            if not label.startswith("上一批"):
+                content = content[-1500:]
+            from .pipeline import batch_tail_two_paras
+            return ("【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"
+                    "不要重复这段内容】\n" + batch_tail_two_paras(content))
+        truncated = len(content) > max_chars
+        if truncated:
+            content = content[-max_chars:]
+        note = ("（原文过长，这里只保留最后一部分；衔接与文风以此为准）\n"
+                if truncated else "")
+        return (f"【{label}（文风与叙事衔接基准：请紧接其后续写，不要重复；"
+                f"沿用它的叙述视角、句长节奏、用词习惯与对话格式）】\n{note}{content}")
+
     def _notes_text(self, notes: list[dict]) -> str:
         if not notes:
             return ""

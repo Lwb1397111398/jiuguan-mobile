@@ -67,6 +67,8 @@ GLOBAL_SETTING_DEFAULTS = {
     "outline_batch_split": "beat",       # 按大纲直写模式的分批方式：whole=整章一次写完 / beat=按大纲节拍分批 / free=AI 自由划分
     "outline_batch_size": "2",           # 按大纲直写·分批时每批覆盖的大纲节拍数（仅 batch_split_by=size 生效；1~8，末批可少）
     "outline_batch_count": "3",          # 按大纲直写·分批计划总批数（仅 batch_split_by=count 生效；free 模式直接按它划分）
+    "prose_prev_batch_full": "1",        # 分批续写带上上一批正文原文（2026-10-27）：0=退回旧行为（只带末尾两段）
+    "prose_prev_batch_chars": "6000",    # 上一批原文最多带多少字（500~20000；超长只保留结尾）
     "auto_archive": "1",                 # 正文接受后自动归档记忆（重新接受=重归档）
     "keep_awake": "1",                   # 防休眠：0=关 / 1=应用运行期间 / 2=仅自动模式运行时
     "keep_awake_display": "0",           # 防休眠时是否同时阻止屏幕关闭（1=屏幕常亮，笔记本更耗电）

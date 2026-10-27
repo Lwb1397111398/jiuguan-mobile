@@ -474,14 +474,13 @@ class AutoPilot:
                       final_note=BATCH_FINAL_NOTE if is_final else "")
         if next_idx == 1:
             task = render_task("prose_batch_first", store, **common)
-            # 重写整章时不能拿本章旧正文当「前文结尾」（与桌面同口径）
-            context["previous_end_override"] = Assembler(store).prev_chapter_end(cid)
+            # 重写整章时不能拿本章旧正文当「前文结尾」（与桌面同口径）；
+            # 跨章首批带上一章最后一批原文（没有批次则带上一章正文结尾）
+            context["previous_end_override"] = Assembler(store).prose_prev_context(cid, [])
         else:
             task = render_task("prose_batch_next", store, batch_no=next_idx, **common)
             context["batch_state"] = store.prose_batch_state_package(cid)
-            context["previous_end_override"] = (
-                "【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"
-                "不要重复这段内容】\n" + batch_tail_two_paras(rows[-1].get("content") or ""))
+            context["previous_end_override"] = Assembler(store).prose_prev_context(cid, rows)
         self._run_gen("prose", context, task, step)
 
     def _do_prose_outline_batch(self, step, ch: dict, cid: int):
@@ -553,12 +552,10 @@ class AutoPilot:
         task = render_task("prose_outline_first" if next_idx == 1 else "prose_outline_next",
                            store, **common)
         if next_idx == 1:
-            context["previous_end_override"] = Assembler(store).prev_chapter_end(cid)
+            context["previous_end_override"] = Assembler(store).prose_prev_context(cid, [])
         else:
             context["batch_state"] = store.prose_batch_state_package(cid)
-            context["previous_end_override"] = (
-                "【前块结尾（衔接）：这是上一批正文的最后两段，请紧接其后续写本批，"
-                "不要重复这段内容】\n" + batch_tail_two_paras(rows[-1].get("content") or ""))
+            context["previous_end_override"] = Assembler(store).prose_prev_context(cid, rows)
         self._run_gen("prose", context, task, step)
 
     def _do_archive(self, step):
