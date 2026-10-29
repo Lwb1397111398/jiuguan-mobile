@@ -775,6 +775,9 @@ class MemoryService:
         self.store.touch_lore_mentions(chapter_id)
         self.index_vectors_async(version, full_state, events)
         self._check_lore_coverage(full_state)
+        # 任意路径归档成功（含手动）都消除本项目「自动归档失败」提醒：
+        # 只在 archive_auto 里清的话，手动补归档成功后提醒会残留不消
+        clear_issue("auto_archive", project=_project_tag(self.store))
         return version
 
     def _check_lore_coverage(self, full_state: dict):
