@@ -6,7 +6,8 @@
 
 - 统计行：本月请求次数 / 本月费用 / 总费用；
 - 筛选：角色（走 SQL）+ 状态（内存过滤）；
-- 点条目看完整提示词与返回（超长内容截断并明示，完整记录在电脑版可看）。
+- 点条目看完整提示词与返回（超长内容截断并明示，完整记录在电脑版可看），
+  详情里可单条删除、也可从这条日志发起续写。
 
 字段名坑（2026-09-18 修）：表里的列是 `prompt_tokens` / `completion_tokens` / `time`，
 旧实现读的是 `input_tokens` / `output_tokens` / `created_at` —— 全是空值，
@@ -63,6 +64,108 @@ def logs_view(page, session, on_refresh=None):
             bgcolor=ft.Colors.with_opacity(0.06, ft.Colors.ON_SURFACE),
             border_radius=8, padding=8, expand=True)
 
+    def _continue_flow(log):
+        """把这条日志当成一次「被中断的生成」接着往下写（2026-11-05）。
+
+        与桌面 LogDetailDialog 的「续写」对齐：原任务指令 + 上轮思考 + 已生成正文
+        一起发回去。日志里的思考是完整的（界面思考面板常常为空），带上它模型能
+        接上上轮思路；正文先过一遍清洗链，免得把【生成完毕】喂回去让它提前收尾。
+        """
+        from app.core.pipeline import (build_continue_task, clean_log_body,
+                                       parse_log_task, is_safety_thinking)
+        from gen import start_generation
+
+        role = log.get("role") or "prose"
+        task = (log.get("task_text") or "").strip() or parse_log_task(log.get("prompt") or "")
+        body = clean_log_body(role, log.get("response") or "")
+        think_raw = (log.get("thinking") or "").strip()
+        # 英文安全评估不能当「上轮思路」拼回去（见 core.pipeline.is_safety_thinking）
+        think = "" if is_safety_thinking(think_raw) else think_raw
+        if role == "ai_task":
+            toast(page, "这是 AI 辅助任务的裸调用日志，没有角色提示词，无法续写", error=True)
+            return
+        if len(task) < 20:
+            toast(page, "这条日志里没有任务指令，无法续写", error=True)
+            return
+        if not body and not think:
+            toast(page, "这条日志既没有正文也没有思考，无法续写", error=True)
+            return
+        cont = build_continue_task(task, body, think)
+        try:
+            page.pop_dialog()
+        except Exception:
+            pass
+        toast(page, "已开始续写…"
+              if not (think_raw and not think)
+              else "已开始续写（本条思考是英文安全评估，已跳过）")
+
+        def done(result):
+            if not result or not result.get("ok"):
+                err = (result or {}).get("error") or "生成失败"
+                try:
+                    toast(page, f"续写失败：{err}", error=True)
+                    page.update()
+                except Exception:
+                    pass
+                return
+            text = (result.get("text") or "").strip()
+            full = (body + text) if body else text
+            try:
+                w = int(getattr(page, "width", 0) or 0) or 420
+                h = int(getattr(page, "height", 720) or 720)
+                page.show_dialog(ft.AlertDialog(
+                    modal=True, title=ft.Text(f"续写结果 · 日志 #{log.get('id')}"),
+                    content=ft.Container(
+                        ft.Column([
+                            ft.Text(f"前文 {len(body)} 字 ＋ 本次续写 {len(text)} 字"
+                                    + ("（被平台审核掐断时已写部分保留）" if not text else ""),
+                                    size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                            _text_block(full),
+                        ], spacing=6, expand=True),
+                        width=min(560, int(w * 0.94)), height=int(h * 0.62)),
+                    actions=[ft.TextButton("关闭", on_click=lambda e: page.pop_dialog())],
+                    actions_alignment=ft.MainAxisAlignment.END))
+                page.update()
+            except Exception as e:
+                print(f"[logs_ui] 显示续写结果失败: {e}")
+
+        # preview=False：日志续写的报文很长（思考动辄上万字），手机预览 sheet 撑不住，
+        # 也没必要再确认——用户点「续写」就是明确授权。
+        start_generation(page, session, role=role, context={}, task=cont,
+                         title=f"续写 · 日志 #{log.get('id')}", on_done=done,
+                         preview=False,
+                         # 只有确实带上了上轮思考才降档（英文安全评估被过滤成空串）
+                         continue_round=bool(think.strip()))
+
+    def _delete_one(log_id):
+        """单条删除（2026-11-05 与桌面 LogDetailDialog 对齐）。
+
+        日志面板原本只有「清空日志」，想删一条脏记录只能整库清空。
+        confirm 的确定按钮会自己 pop 一层，这里再 pop 一层关掉详情弹窗，
+        然后重刷底部面板。
+        """
+        def _yes():
+            try:
+                store.delete_log(log_id)
+            except Exception as ex:
+                toast(page, f"删除失败：{ex}", error=True)
+                return
+            try:
+                page.pop_dialog()      # 关掉详情 AlertDialog（确认框已自行关闭）
+            except Exception:
+                pass
+            _load()
+            try:
+                page.update()
+            except Exception:
+                pass
+            toast(page, f"已删除日志 #{log_id}")
+
+        confirm(page, "删除日志",
+                f"确定删除请求日志 #{log_id}？只删这一条，不可恢复；"
+                "小说内容与其它日志不受影响，删后这条将不能再续写。",
+                _yes, yes_text="删除")
+
     def _detail(log_id):
         try:
             log = store.get_log(log_id)
@@ -72,28 +175,56 @@ def logs_view(page, session, on_refresh=None):
             toast(page, "找不到该条日志", error=True)
             return
         st = log.get("status") or ""
+        think = log.get("thinking") or ""
+        body = log.get("response") or ""
+        rt = int(log.get("reasoning_tokens") or 0)
         head = (f"{log.get('time', '')} ｜ 角色 "
                 f"{name_of.get(log.get('role'), log.get('role') or '-')}"
-                f" ｜ 模型 {log.get('model') or '-'} ｜ {STATUS_TEXT.get(st, st)} ｜ "
-                f"输入 {fmt_tokens(log.get('prompt_tokens', 0))} / "
+                f" ｜ 模型 {log.get('model') or '-'} ｜ {STATUS_TEXT.get(st, st)}"
+                + (f" ｜ 终止 {log.get('finish_reason')}" if log.get("finish_reason") else "")
+                + f" ｜ 输入 {fmt_tokens(log.get('prompt_tokens', 0))} / "
                 f"输出 {fmt_tokens(log.get('completion_tokens', 0))} tok ｜ "
                 f"费用 {float(log.get('cost') or 0):.4f} 元 ｜ "
-                f"{log.get('duration_ms', 0)}ms"
+                f"{log.get('duration_ms', 0)}ms ｜ 思考 {len(think)} 字"
+                + (f"（{rt} tok）" if rt else "")
+                + f" / 正文 {len(body)} 字"
                 + (f" ｜ 错误：{log.get('error')}" if log.get("error") else ""))
         w = int(getattr(page, "width", 0) or 0) or 420
+        # 续写可用性：能还原出任务指令才有意义（裸调用的 AI 辅助日志没有）
+        from app.core.pipeline import parse_log_task as _parse_task
+        _task_for_ui = (log.get("task_text") or "").strip() or _parse_task(log.get("prompt") or "")
+        can_continue = len(_task_for_ui) >= 20 and (log.get("role") or "") != "ai_task"
         page.show_dialog(ft.AlertDialog(
             modal=True, title=ft.Text(f"请求日志 #{log.get('id')}"),
             content=ft.Container(
                 ft.Column([
                     ft.Text(head, size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                    ft.Text("续写 = 原任务指令 + 上轮思考 + 已生成正文一起重发；"
+                            "思考在电脑/手机生成窗里有时是空的，日志里存的是全文。"
+                            + ("⚠ 这条是旧日志，当时的思考被 5 万字硬截断过，"
+                               "后半份思路已找不回来。" if "思考超长已截断" in think else ""),
+                            size=11, color=ft.Colors.ON_SURFACE_VARIANT),
                     ft.Text("提示词", size=13, weight=ft.FontWeight.W_600),
                     _text_block(log.get("prompt")),
-                    ft.Text("返回", size=13, weight=ft.FontWeight.W_600),
-                    _text_block(log.get("response")),
+                    # 思考 ≠ 正文（2026-11-05，与桌面 LogDetailDialog 对齐）：
+                    # 思考 = reasoning_content（界面左侧小框）；正文 = content。
+                    # 按任务协议，正文里可能本身就有一段叫「思考输出」的内容 —— 那仍是正文。
+                    *([ft.Text("思考（模型内部推理，不是正文）", size=13,
+                               weight=ft.FontWeight.W_600),
+                       _text_block(think)] if think.strip() else []),
+                    ft.Text("返回正文（可能含协议要求的「思考输出」段）", size=13,
+                            weight=ft.FontWeight.W_600),
+                    _text_block(body),
                 ], spacing=6, expand=True),
                 width=min(560, int(w * 0.94)),
                 height=int((getattr(page, "height", 720) or 720) * 0.6)),
-            actions=[ft.TextButton("关闭", on_click=lambda e: page.pop_dialog())],
+            actions=[
+                ft.TextButton("续写（带上思考）", disabled=not can_continue,
+                              on_click=lambda e, lg=log: _continue_flow(lg)),
+                ft.TextButton("删除此日志",
+                              on_click=lambda e, _id=log_id: _delete_one(_id)),
+                ft.TextButton("关闭", on_click=lambda e: page.pop_dialog()),
+            ],
             actions_alignment=ft.MainAxisAlignment.END))
 
     # ---------- 行 ----------

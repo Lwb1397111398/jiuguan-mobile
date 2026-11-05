@@ -217,6 +217,16 @@ class AutoPilot:
             if result.get("status") == "stopped":
                 self.pause()
                 return
+            if result.get("safety_blocked"):
+                # 平台内容审核掐断（2026-11-05，与桌面版对齐）：finish_reason=
+                # sensitive / content_filter。审核看的是内容本身，不看推杆，
+                # 同报文重试必然再被掐 → 不重试，直接停下交给人换渠道/降素材。
+                self._retry = 0
+                fr = result.get("finish_reason") or "content_filter"
+                self._fail(step, f"被平台内容审核在生成中途掐断（finish_reason={fr}）——"
+                                 "不是破限失效也不是网络问题；同报文重试无效，"
+                                 "请换渠道/档案，或降低该段素材的极端度")
+                return
             if self._last_fail_blocked:
                 # 拦截占位说明不是正文，绝不能丢给解析器（解析成空只会报
                 # 「解析失败」，老板看不出真正原因）

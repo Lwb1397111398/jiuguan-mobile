@@ -124,14 +124,25 @@ class SettingsPage:
         return ft.Column([dd, hint(desc)], spacing=2)
 
     def _text(self, target, key, label, value, desc="", multiline=False,
-              lines=3, password=False, on_clear=False):
+              lines=3, password=False, on_clear=False, normalize_default=None):
         tf = ft.TextField(
             label=label, value=str(value or ""), dense=not multiline,
             multiline=multiline, min_lines=lines if multiline else None,
             max_lines=lines if multiline else None,
             password=password, can_reveal_password=password,
             text_size=12 if multiline else None)
-        self._reg(target, key, lambda: tf.value or "", tf)
+
+        def _val():
+            raw = tf.value or ""
+            # 归一化（2026-11-05，去 AI 味提示词栏用）：与内置默认相同 / 纯空白
+            # → 写空串（留空 = 用内置默认），避免把默认全文固化进 app.db。
+            # normalize_default=None 时行为与旧版完全一致（其它设置项不受影响）。
+            if normalize_default is not None and (
+                    not raw.strip() or raw.strip() == normalize_default.strip()):
+                return ""
+            return raw
+
+        self._reg(target, key, _val, tf)
         parts = [tf]
         if desc:
             parts.append(hint(desc))
@@ -286,6 +297,9 @@ class SettingsPage:
         self._writers = []      # 每次重建重置登记表（避免重复保存）
         self._widgets = {}
         g = self._g
+        # 常量一律从 app.core 延迟导入，不得在 src/ 自带副本。
+        # 依赖 sync_core.py 已把内核同步过来（构建前 --check 必须为 0）。
+        from app.core.anti_ai_taste import DEAI_DEFAULT_TEXT
 
         # ---- 前文注入 ----
         inject = self._card("前文注入", [
@@ -346,6 +360,15 @@ class SettingsPage:
                      "要求 AI 以【生成完毕】收尾，无标志即判定未写完（自动剥离）"),
         ])
 
+        # ---- 继续生成 / 日志续写：思考降档开关（与桌面同一全局键）----
+        cont = self._card("继续生成 / 日志续写", [
+            self._sw("g", "continue_low_thinking",
+                     "续写时自动把思考强度降到「低」",
+                     g("continue_low_thinking", "1") == "1",  # _sw 内 bool("0") 会是 True
+                     "照上一轮的思考接着写、不再深入思考；只在确实带上思考的续写轮生效。"
+                     "各渠道对「低」的实现不同，若发现更容易拒答，关掉即可。"),
+        ])
+
         # ---- 草稿自检 ----
         stages_cur = [s.strip() for s in
                       str(g("draft_check_stages", "") or "").split(",") if s.strip()]
@@ -381,6 +404,21 @@ class SettingsPage:
                            "替换内置清单，每行一条", multiline=True, lines=3,
                            on_clear=True),
             ]))
+
+        # ---- 去 AI 味·可读性护栏（生成期事前预防，与桌面「去 AI 味」tab 同源）----
+        # 注意：与下面的「文风审校」套话清单、以及整章改写的十四类病灶是两回事，
+        # 那两个是稿子写完后的事后检测/改写，本卡片管「写的时候就别压太密」。
+        deai = self._card("去 AI 味（生成期预防）", [
+            self._sw("g", "deai_enabled", "启用去 AI 味护栏",
+                     g("deai_enabled", "1") == "1",   # _sw 内 bool("0") 会是 True，必须传 bool
+                     "注入全部创作环节（总纲/分卷/大纲/细纲/正文/改写）；"
+                     "检查/审校/记忆提取不注入"),
+            self._text("g", "deai_text", "提示词文案",
+                       g("deai_text", "") or DEAI_DEFAULT_TEXT,
+                       "可编辑，对所有项目生效并随全量备份同步；留空 = 使用内置中文版默认",
+                       multiline=True, lines=6, on_clear=True,
+                       normalize_default=DEAI_DEFAULT_TEXT),
+        ])
 
         # ---- 文风审校 ----
         style = self._card("文风审校", [
@@ -455,8 +493,8 @@ class SettingsPage:
         ])
 
         body = ft.Column(
-            [head, inject, mem, est, anti, draft] + stage_cards +
-            [style, embed, backup, power, tpl_row,
+            [head, inject, mem, est, anti, cont, draft] + stage_cards +
+            [deai, style, embed, backup, power, tpl_row,
              ft.Row([ft.FilledButton("保存设置", on_click=self._save)],
                     alignment=ft.MainAxisAlignment.CENTER)],
             scroll=ft.ScrollMode.AUTO, expand=True, spacing=8)

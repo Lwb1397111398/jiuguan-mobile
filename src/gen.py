@@ -9,13 +9,16 @@ from bridge import StreamTask
 
 def start_generation(page, session, *, role, context, task, title, on_done,
                      on_text=None, stream=True, bare_profile=None,
-                     max_tokens=None, on_started=None, preview=True):
+                     max_tokens=None, on_started=None, preview=True,
+                     continue_round=False):
     """统一生成入口。
 
     on_done(result)：工作线程回调，result = pipeline 返回 dict（ok/text/error/status/...）。
     on_text(buffer)：流式节流回调（工作线程），buffer 为累计生成文本。
     on_started(task)：任务启动时回调（拿到 StreamTask 以便停止）。
     preview=False：跳过发送前预览直接执行（⚡ 自动模式=用户预先授权）。
+    continue_round：续写轮且确实带上了上轮思考 → 内核临时把思考档位降到 low
+    （2026-11-05，与桌面 run_generation 同名参数对齐）。正常生成恒为 False。
     """
     store = session.store
     pipe = session.pipeline()
@@ -32,18 +35,21 @@ def start_generation(page, session, *, role, context, task, title, on_done,
 
     if not preview:
         _execute(page, pipe, role, context, task, title, on_done, on_text,
-                 bare_profile, max_tokens, "", on_started, use_cache=False)
+                 bare_profile, max_tokens, "", on_started, use_cache=False,
+                 continue_round=continue_round)
         return
 
     def _send(extra: str):
         _execute(page, pipe, role, context, task, title, on_done, on_text,
-                 bare_profile, max_tokens, extra, on_started, use_cache=True)
+                 bare_profile, max_tokens, extra, on_started, use_cache=True,
+                 continue_round=continue_round)
 
     preview_sheet(page, build, profile, route, _send, title=title)
 
 
 def _execute(page, pipe, role, context, task, title, on_done, on_text,
-             bare_profile, max_tokens, extra, on_started, use_cache=False):
+             bare_profile, max_tokens, extra, on_started, use_cache=False,
+             continue_round=False):
     ctx = {**context, "extra": extra} if extra else context
     tk = StreamTask(page)
     tk.on_text = on_text
@@ -53,13 +59,14 @@ def _execute(page, pipe, role, context, task, title, on_done, on_text,
             return pipe.run_bare(
                 bare_profile, task, stream=True, on_chunk=tk._chunk,
                 stop_event=tk.stop_event, max_tokens=max_tokens,
-                extra=extra or "")
+                extra=extra or "", continue_round=continue_round)
         # 生成结果缓存（2026-10-27）：手动生成（preview=True 路径）按指纹复用
         # 相同请求的上次完整结果；preview=False 是⚡自动模式，绝不缓存
         # （失败重试不能拿到同一个坏结果）。开关判定在内核 pipeline.run 内。
         return pipe.run(
             role, ctx, task, stream=True, on_chunk=tk._chunk,
-            stop_event=tk.stop_event, max_tokens=max_tokens, use_cache=use_cache)
+            stop_event=tk.stop_event, max_tokens=max_tokens, use_cache=use_cache,
+            continue_round=continue_round)
 
     if on_started:
         try:

@@ -30,8 +30,10 @@ SERVICE_TEMPLATES = {
                  "input_price": 2.0, "output_price": 3.0, "currency": "元"},
 }
 
+# 档位只写名字（2026-11-05 老板）：括号里的说明是按单一渠道实测写死的，
+# 各 API 渠道对 最大/高/中/低 的定义与思考量差别很大，不能拿一家标注通用下拉。
 REASONING_OPTIONS = [
-    ("最大（用渠道默认，不显式指定档位）", "max"),
+    ("最大", "max"),
     ("高", "high"),
     ("中", "medium"),
     ("低", "low"),
