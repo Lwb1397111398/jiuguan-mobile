@@ -48,6 +48,15 @@ GLOBAL_SETTING_DEFAULTS = {
     "anti_truncate_enabled": "0",        # 截断自动续写（防截断）开关：0 关 / 1 开
     "anti_truncate_rounds": "2",         # 截断自动续写最多续写轮数（1~5）
     "end_mark_enabled": "1",             # 输出完成标志协议（软截断检测）：注入【生成完毕】收尾要求，无标志=疑似未写完（0=不注入不判定）
+    "think_guard_enabled": "1",          # 思考纪律（2026-11-05）：禁止反复推演/重复结论/思考里预写正文；思考字数兜底（结构 3 万字/正文 2 万字）。0=不注入
+    "continue_low_thinking": "1",        # 续写轮（继续生成/日志续写）把思考档位临时降到低（2026-11-05 老板拍板）；0=保持档案档位。只写 "1"/"0"
+    # ---------- 去 AI 味·可读性护栏（2026-11-05，论文 arXiv:2610.29162v1 改造）----------
+    # 生成期事前预防：注入全部创作环节，只约束「为压缩信息而把句子写难懂」。
+    # deai_text 默认**空串**：内置默认全文在 app/core/anti_ai_taste.py 的 DEAI_DEFAULT_TEXT，
+    # 读数为空时回退。别把 900 多字全文塞进这里——用户「什么都没改点保存」会把它固化进库，
+    # 以后升级内置文案老用户永远跟不上（留空 = 用内置默认，与 draft_checklist_* 同惯例）。
+    "deai_enabled": "1",                 # 0=不注入；只写 "1"/"0"，绝不写空串（if v: 判空会回退默认）
+    "deai_text": "",                     # 用户自定义护栏文案；空 = 用内置 DEAI_DEFAULT_TEXT
     "embed_base_url": "",                # 嵌入（向量）接口地址：文风审校语义查重 + 记忆语义检索
     "embed_api_key": "",                 # 嵌入接口 API Key（密文存储）
     "embed_model": "",                   # 嵌入模型名
@@ -830,6 +839,20 @@ class GlobalStore:
         self._patch_stale_prior_sentence()
         self._upgrade_prose_rewrite_identity()
         self._upgrade_volume_chapters_iter_prompt()
+        self._upgrade_iter_templates()
+
+    def _upgrade_iter_templates(self) -> None:
+        """迭代类任务模板存量升级（幂等，2026-11-06 迭代增量化）。
+
+        task_template_synopsis_iter / task_template_volume_chapters_iter 的全局
+        meta 覆盖若仍是旧默认全文（用户没自定义过），清空回落新默认（两段式
+        「AI 判断保留」协议）；自定义过的不动。角色层同款先例见
+        _upgrade_volume_chapters_iter_prompt（基准元组追加即可，该函数无需改）。
+        """
+        from .task_templates import ITER_TEMPLATES_LEGACY
+        for key, legacy in ITER_TEMPLATES_LEGACY.items():
+            if self.get_meta(f"task_template_{key}", "") == legacy:
+                self.set_meta(f"task_template_{key}", "")
 
     def _upgrade_volume_chapters_iter_prompt(self) -> None:
         """volume_chapters_iter 存量升级（幂等，2026-10-23 两次改版）。

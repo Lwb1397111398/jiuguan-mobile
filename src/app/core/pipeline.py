@@ -158,10 +158,76 @@ CONTINUE_FROM_TMPL = (
 CONTINUE_THINKING_TMPL = (
     "【上一轮的思考过程】上一次生成中断了，以下是当时已经完成的思考（正文没有输出或未输出完）：\n\n"
     "{thinking}\n\n"
-    "【接续要求】请接着上面这份思考继续：已经想清楚的部分不要推翻、不要从头重新思考，"
+    "【接续要求】请接着上面这份思考继续：本轮不必从头自行深入推演，照着已有结论写即可；"
+    "已经想清楚的部分不要推翻、不要从头重新思考，"
     "直接沿用它得出的结论与规划；没想完的部分先快速补完思考，"
     "然后输出任务要求的正文内容。"
+    "本段不改变任务协议对正文格式与内容的要求。"
 )
+
+# 「思考已完成版」（2026-11-05 老板提）：上一轮思考已经结束、正文已经开始出字，
+# 中途被打断。这是界面「继续生成」的主力场景（按钮在正常生成完成后也常亮）。
+# 此时不能再叫模型「补完思考」——那等于让它把已完成的规划重做一遍，白烧思考
+# token，还可能顺手改动既定情节。改说「不用重做、直接沿用结论接着写」。
+#
+# 措辞三条红线：
+# ① 只限「不必重做上一轮规划」一事，**不改任务协议对正文格式/内容的要求**——
+#    正文里按协议写出的「思考输出」段仍是正文，别写成「不要输出思考过程」；
+# ② 不能踩思考纪律的反向锁（禁「只出结论不出过程」）：本段压的是「重复规划」，
+#    不是压思考本身；
+# ③ 老板 2026-11-05 晚拍板：续写轮**同时**把思考档位降到低（实现见
+#    Pipeline._complete_and_log 的 continue_round）。这里是配套提示词、不是替代
+#    参数——参数压预算，指令改行为，两件事都要做。SOP §4.6 的「显式档位稳定
+#    拒答」结论仍然成立，续写轮是老板明确要求的有意例外，已收窄到只影响
+#    「确实带上上轮思考」的续写轮，并留了全局开关可一键关掉。
+#    见 docs/继续生成与日志续写模块总览.md。
+CONTINUE_THINKING_DONE_TMPL = (
+    "【上一轮的思考过程】上一次生成已经完成思考、并已开始写出正文，中途被打断。"
+    "以下是当时完成的思考，本轮直接沿用：\n\n"
+    "{thinking}\n\n"
+    "【接续要求】这份思考已经完成：本轮不必再自行深入思考、不必重新推演或规划，"
+    "照着上面这份思考的结论直接接着写即可。不要推翻已想清楚的结论、"
+    "不要从头重新规划、不要复述或总结它。"
+    "本段只说明「不必重做上一轮的规划」，不改变任务协议对正文格式与内容的要求。"
+)
+
+# 续写轮思考降档（2026-11-05 老板拍板）：只作用于 continue_round=True 且
+# 调用方确实把上轮思考拼进了任务指令的那一轮。正常生成、拒答重试、自动模式
+# 一律不碰档案档位。``low`` 是档位值，不是「关掉思考」。
+CONTINUE_LOW_THINKING_KEY = "continue_low_thinking"
+CONTINUE_LOW_THINKING_MODE = "low"
+
+
+def continue_low_thinking_enabled(store) -> bool:
+    """续写轮自动降档开关（全局，默认开；只认 "1"/"0"）。
+
+    store 兼容两种后端，与 think_guard_enabled 同构：ProjectStore 的
+    get_setting_int 会按 GLOBAL_SETTING_KEYS 自动转发全局库，GlobalStore
+    直接读全局键。读不到/类型异常一律视为「开」（老板要的默认行为）。
+    """
+    try:
+        return int(store.get_setting_int(CONTINUE_LOW_THINKING_KEY, 1)) > 0
+    except AttributeError:
+        pass
+    except (TypeError, ValueError):
+        return True
+    try:
+        return int(store.get_global_setting(CONTINUE_LOW_THINKING_KEY, "1")) > 0
+    except Exception:
+        return True
+
+
+def apply_continue_thinking_mode(profile: dict, continue_round: bool,
+                                 store) -> dict:
+    """续写轮把模型档案的思考档位临时降到 low；其余情况原样返回。
+
+    抽成纯函数是为了能独立回归（不必 mock 整条生成链）。返回**新 dict**（浅
+    拷贝），绝不就地改 profile —— 它是角色路由 / 备用渠道链共享的档案对象，
+    就地改会污染之后的生成和 generation_fingerprint。
+    """
+    if not continue_round or not continue_low_thinking_enabled(store):
+        return profile
+    return {**profile, "reasoning_mode": CONTINUE_LOW_THINKING_MODE}
 
 
 def build_continue_task(task: str, base: str, thinking: str = "") -> str:
@@ -170,28 +236,118 @@ def build_continue_task(task: str, base: str, thinking: str = "") -> str:
     两个附件段都拼进任务指令（critical 模块，超预算也不被裁剪）：前文被裁模型
     看不到续写起点会整篇重写；思考被裁模型接不上上轮思路。思考段在前、前文段
     在后——离输出位置越近权重越高，字面衔接靠前文，思路衔接靠思考。
+
+    思考段按「有没有已生成正文」分两版（2026-11-05）：
+    - 有正文 = 思考已结束、正式输出已开始 → CONTINUE_THINKING_DONE_TMPL，
+      只要求沿用结论，不叫模型重新思考；
+    - 无正文 = 思考中被掐 / 思考完还没动笔 → CONTINUE_THINKING_TMPL，
+      保留「先快速补完思考」的续想要求。
+    判据只用 base 是否非空：调用方（界面 / 日志）传进来的 base 就是已生成正文。
     """
     parts = [task or ""]
     if (thinking or "").strip():
-        parts.append(CONTINUE_THINKING_TMPL.format(thinking=thinking.strip()))
+        tmpl = CONTINUE_THINKING_DONE_TMPL if (base or "").strip() \
+            else CONTINUE_THINKING_TMPL
+        parts.append(tmpl.format(thinking=thinking.strip()))
     if (base or "").strip():
         parts.append(CONTINUE_FROM_TMPL.format(base=base))
     return "\n\n".join(parts)
 
 
+# 日志里模块标题行的格式（`_complete_and_log` 用 "[标题]\n正文" 拼接，模块之间空行）：
+# 标题必须独占一行，且**前面是空行或字符串开头**——任务指令正文里也可能出现
+# `[1]`、`[P0]` 这类编号行，但它们前面只有单换行，不能当模块边界。
+_LOG_MODULE_RE = re.compile(r"(?m)^\[([^\]\n]{1,40})\]\s*$")
+_LOG_TASK_TITLE = "任务指令"
+_LOG_TASK_PREFIX_RE = re.compile(r"^\[任务指令\]\s*\n\s*【任务指令】\s*\n?")
+
+
+def _log_module_marks(prompt: str) -> list[tuple[int, str]]:
+    """日志提示词里所有**模块标题行**的位置（前有空行/位于开头，见 _LOG_MODULE_RE）。"""
+    marks = []
+    for m in _LOG_MODULE_RE.finditer(prompt):
+        pos = m.start()
+        if pos == 0 or prompt[max(0, pos - 2):pos] == "\n\n":
+            marks.append((pos, m.group(1)))
+    return marks
+
+
+def parse_log_task(prompt: str) -> str:
+    """从请求日志的提示词全文里还原「任务指令」原文（日志续写用）。
+
+    日志只存了模块拼接后的全文（`"[标题]\\n正文"` 之间空行连接），**没有单独的
+    task 字段**，所以要续写旧日志只能按模块边界切。好在任务指令模块的标题固定是
+    「任务指令」、内容以「【任务指令】」开头。
+
+    实测（2026-11-05，老板真实日志 将军 id=18）：整条提示词 10995 字，切出
+    「任务指令」模块 1319 字 → 还原 1305 字，与原文一致，可直接喂回续写。
+
+    找不到（老的裸调用日志/特殊角色无此模块）返回 ""，调用方据此禁用续写入口。
+    """
+    if not (prompt or "").strip():
+        return ""
+    marks = _log_module_marks(prompt)
+    start = next((pos for pos, title in marks if title == _LOG_TASK_TITLE), None)
+    if start is None:
+        return ""
+    later = [pos for pos, _ in marks if pos > start]
+    seg = prompt[start:(later[0] if later else len(prompt))].strip()
+    task = _LOG_TASK_PREFIX_RE.sub("", seg).strip()
+    # 切出过短（< 20 字）多半是边界判错：宁可判失败让入口禁用，
+    # 也不发一条被截断的任务指令白烧一轮。
+    return task if len(task) >= 20 else ""
+
+
+def clean_log_body(role: str, text: str) -> str:
+    """把日志里的**原始返回**洗成可续写的正文（日志续写用）。
+
+    日志存的是清洗前的模型原始输出：可能含内联思考段、`<draft>` 自检草稿、
+    【生成完毕】标志、破甲回显。直接当续写前文喂回去，模型会看到「已经生成完毕」
+    而提前收尾——所以必须走一遍与正常生成相同的清洗链（顺序也一致：
+    先剥思考、再剥草稿、再剥阶段残留、最后剥完成标志）。
+
+    清洗抛异常时退回原文：宁可带点垃圾，也不能让续写没有前文。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    try:
+        formal, _think, _info = strip_model_output(
+            raw, detect_no_body=role in ("prose", "prose_rewrite"))
+        formal, _draft, _incomplete = split_draft(formal)
+        if role in ("prose", "prose_rewrite"):
+            formal = strip_prose_residue(formal, [])
+        elif role in TEXT_OUTPUT_ROLES:
+            formal = strip_jailbreak_residue(formal)
+        formal, _end = strip_end_mark(formal)
+        return (formal or "").strip() or raw
+    except Exception:
+        return raw
+
+
 # 各任务默认输出上限（auto 模式兜底）：很多渠道的默认 max_tokens 只有 2048/4096，
 # 长正文生成必被中途截断——请求必须显式携带足够大的输出上限。
-# 老板要求"上限拉到最高，别限制总纲/分卷/大纲/细纲/正文的篇幅"：创作与规划类
-# 统一 60000（≈4 万字中文，超过所有主流模型的最大输出，即事实上的"不设限"）。
-# max_tokens 是"输出上限"不是"强制长度"：设大不影响正常篇幅与费用，只是允许写得更长；
-# 若超过模型自身最大输出（如 DeepSeek 官方上限 8192、GPT-4.1 32k），api.py 会收到
-# 400/422 后自动减半降级重发（递归直到渠道可接受），不会报错失败。
+# 老板要求"上限拉到最高，别限制总纲/分卷/大纲/细纲/正文的篇幅"。
+#
+# **2026-11-05 上调 60000 → 96000（创作类）**：这条线不再是"超过所有主流模型"了。
+# 现在主流思考模型的**思考 token 计入 completion_tokens、也占 max_tokens 预算**
+# （智谱 GLM-5.3 思考不可关闭、默认 reasoning_effort=max；官方文档：深度思考的
+# 思考过程计入输出 Token 计费）。实测（2026-11-05，官方 glm-5.3）：
+#   · 600 字的短文开头 → 思考 6902 token，占输出 **94%**（86 秒）
+#   · 长篇创作动辄思考 1–4 万（老板实测经验），极端更长
+# 按 60000 算：思考 4 万时正文只剩 2 万 token（≈1.3 万字），整章 10500 字勉强；
+# 思考 5.5 万时正文只剩 5000 token（≈3300 字）→ 整章必被 length 截断。
+# 96000 给正文留出 3.6–5.6 万 token（≈2.4–3.7 万字），覆盖所有单章/单块需求。
+# GLM-5.3 最大输出 128K、DeepSeek 等小上限渠道由 api.py 自动减半降级，不影响正确性。
+#
+# max_tokens 是"输出上限"不是"强制长度"：设大不影响正常篇幅与费用，只是允许写得更长。
 _DEFAULT_MAX_TOKENS = {
-    "prose": 60000, "prose_rewrite": 60000,
-    "check": 60000, "style": 60000,
-    "synopsis": 60000, "volume": 60000, "outline": 60000, "detail": 60000,
-    "volume_iter": 60000, "volume_chapters_iter": 60000,
-    "memory": 60000,
+    # 长文本创作/规划类：思考占比最高，必须给足预算
+    "prose": 96000, "prose_rewrite": 96000,
+    "synopsis": 96000, "volume": 96000, "outline": 96000, "detail": 96000,
+    "volume_iter": 96000, "volume_chapters_iter": 96000,
+    # 审校/记忆/辅助类：输出本身短，60000 足够（思考再长也留得下）
+    "check": 60000, "style": 60000, "memory": 60000,
     # 辅助任务（AI 识别/整理/提取破甲）此前只有 20000，长预设一压就被截断；
     # 与创作类统一拉满，渠道不接受时 api.py 会自动减半降级。
     "ai_task": 60000,
@@ -358,6 +514,29 @@ def detect_silent_refusal(text: str) -> str:
         return ""
     m = _SILENT_REFUSAL_RE.search(text)
     return m.group(0) if m else ""
+
+
+def is_safety_thinking(text: str) -> bool:
+    """判断日志里的「思考」是不是模型的安全评估，而非创作思路（2026-11-05）。
+
+    **实测**（老板真实日志 将军 id=18）：`request_logs.thinking` 8519 字全是英文
+    ——「The user wants a volume-level chapter plan… Per policy, no minors, no
+    real-world harm…」——这是模型对内容的**安全评估**（reasoning_content），
+    不是它在构思情节。同一次请求 `reasoning_tokens=0`（智谱不报该字段），正文里
+    也没有这段，所以它只可能是思维链。
+
+    日志续写要判断这一条：**把安全评估当「上轮思路」拼回任务指令，等于当着模型的
+    面把「这段内容违规」的结论再念一遍**，只会提高拒答/被掐概率。这类思考宁可不带。
+
+    判据用「中文占比 < 2%」而非句式正则：中文小说的创作思路不可能通篇英文，而纯
+    英文评估恰好符合；万一某个模型用英文构思（少见），跳过它只损失一点上下文，
+    不会引入有害内容。长度 < 200 字不判（短英文多半是标签/口头禅）。
+    """
+    t = (text or "").strip()
+    if len(t) < 200:
+        return False
+    zh = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+    return zh * 50 < len(t)     # 中文占比 < 2% → 判为安全评估
 
 
 # ---------- 上游拦截自动规避（2026-09-10） ----------
@@ -2696,7 +2875,7 @@ class Pipeline:
     def run(self, role: str, context: dict, task_instruction: str,
             stream: bool = False, on_chunk=None, stop_event=None,
             max_tokens: int | None = None, on_thinking=None,
-            use_cache: bool = False) -> dict:
+            use_cache: bool = False, continue_round: bool = False) -> dict:
         """统一执行一次生成：组装→调用→记日志。任何错误都返回 error dict（不抛异常）。
 
         温度唯一来源是角色路由（模型档案温度已退役）：路由温度 -1 = 默认档，
@@ -2711,6 +2890,11 @@ class Pipeline:
         组装后算请求指纹，命中缓存 → 直接回放上次完整结果（0 调用 0 费用，结果带
         cache_hit=True 供 UI 提示）；未命中正常调用，完整成功且过完整性判定的结果
         写入缓存。自动模式/记忆归档/审校不传此参，行为不变。
+
+        continue_round（2026-11-05）：本轮是「继续生成 / 日志续写」且确实带上了
+        上轮思考。仅此一轮把模型档案的 reasoning_mode 临时覆盖成 low（照着已有
+        思路写、不再深入思考），开关 continue_low_thinking 可整体关掉。
+        默认 False → 所有既有调用方零回归。
         """
         t0 = time.time()
         build = None
@@ -2763,10 +2947,14 @@ class Pipeline:
                         self._complete_and_log(build, prof, role, temperature, t0,
                                                stream=stream, on_chunk=on_chunk,
                                                stop_event=stop_event, max_tokens=max_tokens,
-                                               on_thinking=on_thinking, context=context),
+                                               on_thinking=on_thinking, context=context,
+                                               task_instruction=task_instruction,
+                                               continue_round=continue_round),
                         build, prof, role, temperature, t0,
                         stream=stream, on_chunk=on_chunk, stop_event=stop_event,
-                        max_tokens=max_tokens, on_thinking=on_thinking, context=context)
+                        max_tokens=max_tokens, on_thinking=on_thinking, context=context,
+                        task_instruction=task_instruction,
+                        continue_round=continue_round)
                 except Exception as e:      # 备用渠道组装/调用异常：当渠道故障处理，继续下一个
                     result = self._error_result(role, t0, build, e)
                 used = prof
@@ -2877,7 +3065,9 @@ class Pipeline:
     def _retry_upstream_blocked(self, result: dict, build: dict, profile: dict,
                                 role: str, temperature, t0: float, *, stream: bool,
                                 on_chunk=None, stop_event=None, max_tokens=None,
-                                on_thinking=None, context: dict | None = None) -> dict:
+                                on_thinking=None, context: dict | None = None,
+                                task_instruction: str = "",
+                                continue_round: bool = False) -> dict:
         """被上游拦截时，逐个尝试「加标题行」变体重发（2026-09-10，2026-09-11 扩展）。
 
         覆盖两层失败，都只在**失败后**补救，正常请求形态一个字节不改：
@@ -2918,7 +3108,9 @@ class Pipeline:
             result = self._complete_and_log(
                 guarded, profile, role, temperature, t0, stream=stream,
                 on_chunk=on_chunk, stop_event=stop_event, max_tokens=max_tokens,
-                on_thinking=on_thinking, context=context)
+                on_thinking=on_thinking, context=context,
+                task_instruction=task_instruction,
+                continue_round=continue_round)
             result["upstream_guard"] = prefix
         return result
 
@@ -2926,7 +3118,7 @@ class Pipeline:
                  stream: bool = False, on_chunk=None, stop_event=None,
                  max_tokens: int | None = None, temperature: float | None = None,
                  on_thinking=None, jailbreak_text: str | None = None,
-                 extra: str = "") -> dict:
+                 extra: str = "", continue_round: bool = False) -> dict:
         """裸调用（AI 辅助任务专用）：直接按所选档案发送，不走角色路由。
 
         请求只带 破甲 + 任务指令，不携带任何角色的系统提示词/
@@ -2948,7 +3140,9 @@ class Pipeline:
             return self._complete_and_log(build, profile, "ai_task", temp, t0,
                                           stream=stream, on_chunk=on_chunk,
                                           stop_event=stop_event, max_tokens=max_tokens,
-                                          on_thinking=on_thinking)
+                                          on_thinking=on_thinking,
+                                          task_instruction=task_instruction,
+                                          continue_round=continue_round)
         except Exception as e:
             return self._error_result("ai_task", t0, build, e)
 
@@ -2956,12 +3150,26 @@ class Pipeline:
                           temperature: float | None,
                           t0: float, stream: bool, on_chunk=None, stop_event=None,
                           max_tokens: int | None = None, on_thinking=None,
-                          context: dict | None = None) -> dict:
+                          context: dict | None = None,
+                          task_instruction: str = "",
+                          continue_round: bool = False) -> dict:
         """调用 + 记日志（run / run_bare 共用）。temperature=None 时不发送该参数。
 
         context：本次生成的任务上下文（run 传入；run_bare 的辅助任务为 None）。
         只在「完成标志缺失」时用于结构完整性备选判定（completeness.py）。
+
+        task_instruction：任务指令原文，单独落库到 `request_logs.task_text`
+        （2026-11-05 日志续写）。日志里的 `prompt` 是**模块拼接后的全文**，
+        没有原始 task；存下来就不必再从 prompt 里按模块边界反推。
+
+        continue_round：续写轮（且带上了上轮思考）→ 本轮临时把思考档位降到 low。
         """
+        # 续写轮思考降档（2026-11-05 老板拍板）：只在这一轮把档案的
+        # reasoning_mode 覆盖成 low，用完即弃——不写回档案、不改全局配置、
+        # 不影响后续任何一轮。LLMClient 内部所有递归重发（摘掉思考参数 /
+        # max_tokens 减半）都读 self.profile，一次覆盖即可全程保持，api.py
+        # 一个字节不用动。实现与判据见 apply_continue_thinking_mode。
+        profile = apply_continue_thinking_mode(profile, continue_round, self.store)
         client = LLMClient(profile)
         self._client = client
         retries = self.store.get_setting_int("api_retries", 1)
@@ -3069,7 +3277,19 @@ class Pipeline:
             # 掐线保留部分文本时 api 返回 status=stopped 且 error 非空（用户主动
             # 停止则恒为空串）——不记的话日志里两者无法区分（2026-10-24 取证靠
             # 「尾部截断+恰好 301 秒」才推断出是网关掐线，而非老板点的停止）。
-            error=resp.get("error") or "")
+            error=resp.get("error") or "",
+            # 原始终止原因（stop/length/sensitive/''）：区分「模型自己收尾」
+            # 「输出上限截断」「平台内容审核掐断」「连接被掐」的唯一可靠依据。
+            finish_reason=resp.get("finish_reason") or "",
+            # 模型思考（reasoning_content）：与「正文里按协议写出的思考输出段」
+            # 是两回事。旧日志不存它，排查时曾把两者看反（2026-11-05）。
+            thinking=resp.get("thinking") or "",
+            # 思考吃掉的输出 token：判断「是不是思考把 max_tokens 预算吃光、
+            # 正文才写了几千字就停」的唯一量化依据。
+            reasoning_tokens=int(resp.get("reasoning_tokens") or 0),
+            # 任务指令原文：日志续写要用它重新组装（旧日志只能从 prompt 里按
+            # 模块边界反推，见 pipeline.parse_log_task）。
+            task_text=task_instruction or "")
         # 上游拦截形态判定：清洗后的正文与原始响应两处都看——清洗可能把这类整行剥掉。
         up_block = (detect_upstream_block(formal_text)
                     or detect_upstream_block(resp.get("text") or ""))
@@ -3108,6 +3328,14 @@ class Pipeline:
                                or detect_silent_refusal(resp.get("text") or ""))
             if role in UPSTREAM_GUARD_ROLES else "",
             "truncated": bool(resp.get("truncated", False)),
+            # 本次的原始终止原因与「平台内容审核掐断」标记（2026-11-05）。
+            # safety_blocked 的处置与其它失败**相反**：同报文重试必然再被掐
+            # （审核看的是内容，不看推杆），上层不得自动重试/换渠道续命。
+            "finish_reason": resp.get("finish_reason") or "",
+            "safety_blocked": bool(resp.get("safety_blocked", False)),
+            # 思考 token（usage 口径）：GLM-5.3 思考不可关闭且计入 max_tokens，
+            # 这个数字大 = 留给正文的预算被吃掉了（2026-11-05）。
+            "reasoning_tokens": int(resp.get("reasoning_tokens") or 0),
             # 输出完成标志是否命中（软截断检测；开关关闭时恒 True 不参与判定）
             "end_mark": bool(end_mark_found),
             # 标志缺失但结构完整性备选通过时的依据说明（未用到为空串）：

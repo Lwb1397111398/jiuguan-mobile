@@ -23,6 +23,39 @@ from .throttle import acquire as _throttle_acquire
 # 渠道默认常是 2048/4096，地板过低会让降级后的实际上限反而更小，正文更容易截断。
 _MAX_TOKENS_DOWNGRADE_FLOOR = 8192
 
+# 安全审核类终止原因（2026-11-05）：平台/渠道的内容审核在**生成过程中**掐断输出时
+# 不会返回 HTTP 错误，而是在流式最后一帧给一个 finish_reason。智谱 GLM 官方文档
+# 明确：流式生成中被判违法/不良信息时返回 `finish_reason: "sensitive"`，同帧带
+# `content_filter` 明细（输入侧 role=user、输出侧 role=assistant）；OpenAI 兼容层
+# 用 `content_filter`，Gemini 走候选的 SAFETY。
+#
+# 识别它有三个用处：① 如实告知「是平台审核掐的，不是破限失效、不是网络掐线」；
+# ② 内容审核类**重试同报文必然再被掐**（还烧配额），上层要据此停止重试；
+# ③ 事后可取证（日志记 finish_reason）。
+#
+# ⚠ 破限（jailbreak）改的是模型自身的对齐，**管不了平台侧审核层**——同一份报文
+# 酒馆能过而本程序被掐、或官方渠道比中转站更容易被掐，都属这一层的差异。
+SAFETY_FINISH_REASONS = frozenset({
+    "sensitive", "content_filter", "content_filtered", "safety",
+    "prohibited_content", "blocked",
+})
+
+
+def normalize_finish_reason(raw: str) -> str:
+    """归一化终止原因（小写、去空白）；没收到返回 ''。"""
+    return (raw or "").strip().lower()
+
+
+def classify_finish(raw: str) -> tuple:
+    """终止原因 → (归一化值, 是否长度截断, 是否内容审核掐断)。
+
+    抽成纯函数是为了可测：这三分支决定下游是「自动续写」「提示调大上限」
+    还是「停止重试、换渠道」，判错方向就会把平台审核误报成破限失效
+    （2026-11-05 老板实测就是这么被误导的）。
+    """
+    fr = normalize_finish_reason(raw)
+    return fr, fr == "length", fr in SAFETY_FINISH_REASONS
+
 
 def _request_with_proxy_fallback(http_call, url, **kw):
     """环境变量代理指向死端口时自动改直连重发一次（2026-10-21）。
@@ -240,12 +273,38 @@ class LLMClient:
         provider = f"{self.base_url} {self.model}".lower()
         uses_thinking = any(name in provider for name in (
             "deepseek", "dashscope", "aliyun", "bigmodel", "siliconflow"))
+        # 智谱 GLM-5.x 走单独分支（2026-11-05 修）：官方支持
+        # reasoning_effort=low/high/max（默认 max），但下面 uses_thinking 分支
+        # 会把 high/medium/low 一律吞成 `thinking.enabled` —— 四个档位发出完全
+        # 相同的参数，档案页的「思考强度」对智谱形同虚设，永远走最深档。
+        #
+        # ⚠ 实测（2026-11-05 二次实测，官方 glm-5.3，同一短任务 n=1/档）：
+        #   max  → 思考 2294 tok / 5057 字，正文 652 字，42.3s
+        #   high → 思考 **43 tok / 200 字**，正文 645 字，12.5s
+        # 即智谱的 high 不是「想得少一点」，而是把思考压到几乎象征性（25 倍差距）。
+        # 官方文档写 high=「增强推理」，实测与之不符，**以实测为准**。
+        # 需要长程规划（情节铺排、伏笔埋设、跨章一致）的场景用 max；
+        # 短任务（检查/改写/简单问答）才考虑 high。`max` 仍保持「什么都不传」走渠道
+        # 默认，这条红线不变（曾把 max 映射成 high → GLM-5.3 稳定拒答）。
+        zhipu = ("bigmodel" in provider) or ("glm-5" in provider)
         if mode == "off":
-            return {"thinking": {"type": "disabled"}} if uses_thinking else {}
+            if uses_thinking:
+                if "glm-5.3" in self.model.lower():
+                    # GLM-5.3 系列**强制思考**：官方文档明确「不再支持 disabled，
+                    # 传入 disabled 会导致 API 请求失败」（阿里云百炼同文）。
+                    # 选「关闭」时降到最低档 low，至少不 400——真关不掉。
+                    return {"thinking": {"type": "enabled"},
+                            "reasoning_effort": "low"}
+                return {"thinking": {"type": "disabled"}}
+            return {}
         if mode == "max":
             # 不显式指定档位：渠道默认即「它允许的最高思考级别」
             return {"thinking": {"type": "enabled"}} if uses_thinking else {}
         level = {"high": "high", "medium": "medium", "low": "low"}[mode]
+        if zhipu:
+            # 智谱只认 low/high/max（没有 medium）→ medium 就近取 high
+            return {"thinking": {"type": "enabled"},
+                    "reasoning_effort": "high" if level == "medium" else level}
         if uses_thinking:
             return {"thinking": {"type": "enabled"}}
         return {"reasoning_effort": level}
@@ -434,8 +493,27 @@ class LLMClient:
         if isinstance(usage, dict) and usage:
             pt = int(usage.get("prompt_tokens") or 0)
             ct = int(usage.get("completion_tokens") or 0)
-            if pt or ct:
-                events.append(("usage", f"{pt}/{ct}"))
+            # 思考 token（2026-11-05）：GLM-5.3 的思考不可关闭、默认 reasoning_effort=max，
+            # 思考 tokens **计入 completion_tokens 也占 max_tokens 预算**（官方文档：
+            # 深度思考的思考过程计入输出 Token 计费）。不单独记下来的话，
+            # 「正文才 3000 字怎么就停了」永远看不出真实原因是思考吃光了预算。
+            details = usage.get("completion_tokens_details")
+            rt = 0
+            if isinstance(details, dict):
+                try:
+                    rt = int(details.get("reasoning_tokens") or 0)
+                except (TypeError, ValueError):
+                    rt = 0
+            if pt or ct or rt:
+                events.append(("usage", f"{pt}/{ct}/{rt}"))
+
+        # 平台内容安全审核明细（2026-11-05）：智谱 V4 在拦截帧里带
+        # `content_filter: [{"role":"assistant","level":1}]`；部分 OpenAI 兼容渠道
+        # 只给这个字段、不给 finish_reason。必须独立识别——否则输出被审核掐断时
+        # 我们只看到「流正常结束」，把它当成功收下（本次故障的根因）。
+        cf = obj.get("content_filter")
+        if isinstance(cf, list) and cf:
+            events.append(("safety", "content_filter"))
 
         # Anthropic 原生：thinking_delta 使用 thinking 字段，text_delta 使用 text。
         if obj.get("type") == "content_block_delta":
@@ -534,6 +612,14 @@ class LLMClient:
         prompt_tokens = completion_tokens = 0
         truncated = False
         last_error = None
+        # 本次请求的终止原因（2026-11-05）：只认 length 时，「内容审核掐断」
+        # （GLM 的 sensitive）和「模型自己收尾」（stop）在下游完全无法区分，
+        # 只能按末尾标点猜 → 把平台审核说成「破限没生效」，误导处置方向。
+        finish_reason = ""
+        safety_blocked = False
+        # 思考占用的输出 token（来自 usage.completion_tokens_details.reasoning_tokens）。
+        # 与 completion_tokens 是包含关系：思考越多，留给正文的预算越少。
+        reasoning_tokens = 0
         # 本次失败是否「网络/中断类且 0 字节」：这种失败换非流式重发也救不回
         # （掐线是渠道网关干的，非流式响应更长只会再被掐；读超时说明渠道慢，
         # 非流式要等更久）。立刻重发纯属白烧配额——免费站限流按次数计且失败
@@ -542,6 +628,24 @@ class LLMClient:
         # （正常 EOF 但 0 字节）不置位，仍走非流式降级。
         zero_byte_network_failure = False
         t0 = time.time()
+
+        def _ret(**kw) -> dict:
+            """统一出口：所有返回分支都带上终止原因与审核标记。
+
+            此前每个 return 各写一份字段，新增字段必然漏掉某几支（abrupt 就只在
+            正常 EOF 分支出现过）。集中一处后，下游拿到的形态恒定。
+            """
+            out = {"text": "".join(text_parts),
+                   "thinking": "".join(thinking_parts),
+                   "prompt_tokens": prompt_tokens,
+                   "completion_tokens": completion_tokens,
+                   "truncated": truncated,
+                   "finish_reason": finish_reason,
+                   "safety_blocked": safety_blocked,
+                   "reasoning_tokens": reasoning_tokens,
+                   "duration_ms": int((time.time() - t0) * 1000)}
+            out.update(kw)
+            return out
 
         for attempt in range(retries + 1):
             self._aborted = False
@@ -554,6 +658,9 @@ class LLMClient:
                 thinking_parts.clear()
                 completion_tokens = 0
                 truncated = False
+                finish_reason = ""
+                safety_blocked = False
+                reasoning_tokens = 0
             try:
                 # 渠道节流闸（2026-09-19）：档案配了「每分钟请求上限」时按窗口排队，
                 # 避免失败补救（上游拦截变体重发）与网络重试连发把渠道配额一次打光
@@ -566,12 +673,7 @@ class LLMClient:
                         or (stop_event is not None and stop_event.is_set())))
                 if self._aborted or (stop_event is not None and stop_event.is_set()):
                     # 等配额期间用户点了停止：一个字节都没发出去，按「已停止」返回
-                    return {"text": "".join(text_parts),
-                            "prompt_tokens": prompt_tokens,
-                            "thinking": "".join(thinking_parts),
-                            "completion_tokens": completion_tokens, "ok": True,
-                            "status": "stopped", "error": "", "truncated": truncated,
-                            "duration_ms": int((time.time() - t0) * 1000)}
+                    return _ret(ok=True, status="stopped", error="")
                 with _request_with_proxy_fallback(
                         requests.post, url, headers=self._headers(), json=payload,
                         stream=stream,
@@ -626,16 +728,25 @@ class LLMClient:
                         usage = obj.get("usage") or {}
                         choices = obj.get("choices") or []
                         first = choices[0] if choices and isinstance(choices[0], dict) else {}
-                        truncated = bool(first.get("finish_reason") == "length")
-                        return {
-                            "text": "".join(text_parts),
-                            "thinking": "".join(thinking_parts),
-                            "prompt_tokens": int(usage.get("prompt_tokens", 0)),
-                            "completion_tokens": int(usage.get("completion_tokens", 0)),
-                            "ok": True, "status": "ok", "error": "",
-                            "truncated": truncated,
-                            "duration_ms": int((time.time() - t0) * 1000),
-                        }
+                        # 非流式同样要分判终止原因：此前只认 length，
+                        # finish_reason=sensitive（GLM 官方内容审核）被当成正常完成。
+                        finish_reason, is_len, safety_blocked = classify_finish(
+                            first.get("finish_reason") or "")
+                        truncated = is_len
+                        if obj.get("content_filter"):
+                            safety_blocked = True
+                            finish_reason = finish_reason or "content_filter"
+                        details = usage.get("completion_tokens_details")
+                        if isinstance(details, dict):
+                            try:
+                                reasoning_tokens = int(details.get("reasoning_tokens") or 0)
+                            except (TypeError, ValueError):
+                                reasoning_tokens = 0
+                        return _ret(
+                            ok=True, status="ok", error="",
+                            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                            completion_tokens=int(usage.get("completion_tokens", 0)),
+                        )
                     # 流式 SSE：select 心跳轮询 + read1 分块读取。
                     # Windows 上无法从另一线程可靠中断阻塞中的 recv（close 不唤醒、
                     # 超时还会毒化 socket 对象不可再读），改用 select 短超时轮询 fd 可读性：
@@ -656,6 +767,7 @@ class LLMClient:
                         """
                         nonlocal saw_data, got_finish, truncated, prompt_tokens
                         nonlocal completion_tokens, done
+                        nonlocal finish_reason, safety_blocked, reasoning_tokens
                         for kind, delta in evs:
                             if kind == "done":
                                 saw_data = True
@@ -664,16 +776,35 @@ class LLMClient:
                                 return True
                             if kind == "finish":
                                 got_finish = True
-                                if delta == "length":
+                                fr, is_len, is_safety = classify_finish(delta)
+                                if fr:
+                                    finish_reason = fr
+                                if is_len:
                                     truncated = True  # 被输出上限截断
+                                elif is_safety:
+                                    # 平台内容审核掐断（GLM 官方 = sensitive）：
+                                    # 已生成部分保留，但**不是**模型自己收尾，
+                                    # 也不该按「破限没生效」处置（见常量注释）。
+                                    safety_blocked = True
+                                continue
+                            if kind == "safety":
+                                # 只有 content_filter 字段、没有 finish_reason 的渠道
+                                saw_data = True
+                                got_finish = True
+                                safety_blocked = True
+                                if not finish_reason:
+                                    finish_reason = "content_filter"
                                 continue
                             if kind == "usage":
-                                # include_usage 终止帧：真实用量覆盖逐字估算值
-                                pt, _, ct = delta.partition("/")
+                                # include_usage 终止帧：真实用量覆盖逐字估算值。
+                                # 格式 pt/ct/rt（rt=思考 token；旧格式只有两段，兼容）。
+                                parts = delta.split("/")
                                 try:
-                                    prompt_tokens = int(pt)
-                                    completion_tokens = int(ct)
-                                except ValueError:
+                                    prompt_tokens = int(parts[0])
+                                    completion_tokens = int(parts[1])
+                                    if len(parts) > 2:
+                                        reasoning_tokens = int(parts[2])
+                                except (ValueError, IndexError):
                                     pass
                                 continue
                             if kind == "thinking":
@@ -754,50 +885,33 @@ class LLMClient:
                     finally:
                         self._active_resp = None
                     if outcome == "stopped":
-                        return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                                "thinking": "".join(thinking_parts),
-                                "completion_tokens": completion_tokens, "ok": True,
-                                "status": "stopped", "error": "", "truncated": truncated,
-                                "duration_ms": int((time.time() - t0) * 1000)}
+                        return _ret(ok=True, status="stopped", error="")
                     if self._aborted or (stop_event is not None and stop_event.is_set()):
                         # abort 关闭连接导致 EOF 退出：同样按「已停止」处理
-                        return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                                "thinking": "".join(thinking_parts),
-                                "completion_tokens": completion_tokens, "ok": True,
-                                "status": "stopped", "error": "", "truncated": truncated,
-                                "duration_ms": int((time.time() - t0) * 1000)}
+                        return _ret(ok=True, status="stopped", error="")
                     if outcome == "error":
                         if text_parts:
                             # 网络中断但已有部分文本：保留已生成内容，不丢弃
-                            return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                                    "thinking": "".join(thinking_parts),
-                                    "completion_tokens": completion_tokens, "ok": True,
-                                    "status": "stopped", "error": last_error or "网络中断",
-                                    "truncated": truncated,
-                                    "duration_ms": int((time.time() - t0) * 1000)}
+                            return _ret(ok=True, status="stopped",
+                                        error=last_error or "网络中断")
                         zero_byte_network_failure = True
                         break  # 无任何内容：交给循环外统一处理（重试/raise）
                     # 请求成功但一个字都没解析出来：多半是该接口不支持/未开启流式，
                     # 或服务方返回了我们没适配的格式。跳出循环去降级非流式（不占网络重试次数）。
                     if not text_parts and not saw_data:
                         break
-                    return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                            "thinking": "".join(thinking_parts),
-                            "completion_tokens": completion_tokens, "ok": True,
-                            "status": "ok", "error": "", "truncated": truncated,
-                            # 没收到 [DONE]/finish_reason 就 EOF → 连接被服务端/网关中途掐断
-                            # （常见：渠道 100 秒超时限制、网络波动），正文多半没写完
-                            "abrupt": bool(text_parts and not got_finish),
-                            "duration_ms": int((time.time() - t0) * 1000)}
+                    return _ret(
+                        ok=True, status="ok", error="",
+                        # 没收到 [DONE]/finish_reason 就 EOF → 连接被服务端/网关中途掐断
+                        # （常见：渠道 100 秒超时限制、网络波动），正文多半没写完
+                        abrupt=bool(text_parts and not got_finish),
+                    )
             except StopGeneration:
                 raise
             except (requests.RequestException, requests.ConnectionError, TimeoutError) as e:
                 if stop_event is not None and stop_event.is_set():
                     # 用户主动停止（停止按钮/关窗）：保留已生成部分，不重试、不降级
-                    return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                            "thinking": "".join(thinking_parts),
-                            "completion_tokens": completion_tokens, "ok": True,
-                            "status": "stopped", "error": "", "duration_ms": int((time.time() - t0) * 1000)}
+                    return _ret(ok=True, status="stopped", error="")
                 if self._aborted:
                     last_error = "已中断"  # abort 关闭连接（无 stop_event，如 run_busy 关进度框）：不重试、不降级
                     zero_byte_network_failure = True
@@ -816,10 +930,7 @@ class LLMClient:
                 # abort 关闭读取缓冲后 iter_lines/resp.json 可能抛 ValueError/OSError 等
                 # 任意异常：这属于主动中断而非解析失败，返回已生成部分
                 if self._aborted or (stop_event is not None and stop_event.is_set()):
-                    return {"text": "".join(text_parts), "prompt_tokens": prompt_tokens,
-                            "thinking": "".join(thinking_parts),
-                            "completion_tokens": completion_tokens, "ok": True,
-                            "status": "stopped", "error": "", "duration_ms": int((time.time() - t0) * 1000)}
+                    return _ret(ok=True, status="stopped", error="")
                 raise ApiError(f"响应解析失败：{e}")
         # 流式拿到了连接却 0 字 → 自动降级为非流式再试一次（独立于网络重试，retries=0 也生效）。
         # 不降级的三种情况：①用户停止/abort（再发一次只会重新挂起，非流式路径无法被 abort 中断）；
@@ -830,6 +941,7 @@ class LLMClient:
         # 100% 死于同款读超时，等于每次掐线多烧一次配额）。
         if (stream and not text_parts and not thinking_parts
                 and not zero_byte_network_failure
+                and not safety_blocked
                 and not self._aborted
                 and not (stop_event is not None and stop_event.is_set())):
             return self.complete(messages, temperature=temperature, max_tokens=max_tokens,

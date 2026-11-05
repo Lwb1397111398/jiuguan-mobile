@@ -2659,14 +2659,44 @@ class ProjectStore(QObject):
 
     def add_log(self, role: str, model: str, prompt: str, response: str,
                 prompt_tokens: int, completion_tokens: int, cost: float,
-                status: str = "ok", error: str = "", duration_ms: int = 0) -> int:
+                status: str = "ok", error: str = "", duration_ms: int = 0,
+                finish_reason: str = "", thinking: str = "",
+                reasoning_tokens: int = 0, task_text: str = "") -> int:
+        """写一条请求日志。
+
+        finish_reason（2026-11-05）：本次请求的原始终止原因（stop/length/
+        sensitive/''）。此前只把 length 归进 truncated、其余丢弃，事后无法
+        区分「模型自己收尾」「平台内容审核掐断」「连接被掐」——排查只能靠猜。
+
+        thinking（2026-11-05）：模型的思考内容（reasoning_content）。旧日志只存
+        正文，导致排查时把「正文里按协议写出的思考输出段」误当成「模型的内部
+        思考」（老板当场纠正过一次）。**全文落库、绝不截断**（2026-11-05 老板：
+        续写就得把思考全文发过去，模型才不必重新想；只给半份思路等于逼它自己
+        另编一份）。代价是长思考会推高 project.db 体积与续写轮输入 token，
+        由 log_retention 控制保留条数兜底。
+
+        reasoning_tokens（2026-11-05）：思考占用的输出 token（来自 usage）。
+        与 completion_tokens 是包含关系：思考越多，留给正文的预算越少。
+
+        task_text（2026-11-05）：任务指令原文，供「日志续写」重新组装。
+        prompt 是模块拼接后的全文，没有原始 task——从旧日志只能按模块边界反推
+        （pipeline.parse_log_task），新日志有原文就不必反推。
+        """
+        # 全文落库，绝不截断：日志续写会把这份思考原样拼回任务指令，
+        # 少一个字模型就可能另起炉灶重新规划（老板 2026-11-05）。
+        think = thinking or ""
         cur = self._exec(
             "INSERT INTO request_logs(time,role,model,prompt,response,prompt_tokens,completion_tokens,"
-            " cost,status,error,duration_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            " cost,status,error,duration_ms,finish_reason,thinking,reasoning_tokens,task_text)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (db.now(), role, model, prompt, response, prompt_tokens, completion_tokens,
-             cost, status, error, duration_ms))
+             cost, status, error, duration_ms, finish_reason or "", think,
+             int(reasoning_tokens or 0), task_text or ""))
         self._prune_logs()
         return cur.lastrowid
+
+    # 思考**没有**保存上限：曾按 5 万字截断，续写只能带半份思路（2026-11-05 移除）。
+    # 日志保留条数由 log_retention 控制（见 _prune_logs），别在这里偷偷截断内容。
 
     # 每插入 LOG_PRUNE_EVERY 条才清理一次：DELETE + 子查询有成本，不必每次请求都做
     LOG_PRUNE_EVERY = 50
@@ -2703,6 +2733,16 @@ class ProjectStore(QObject):
 
     def get_log(self, log_id: int) -> dict | None:
         return self._one("SELECT * FROM request_logs WHERE id=?", (log_id,))
+
+    def delete_log(self, log_id: int) -> bool:
+        """删除单条请求日志（日志详情里的「删除此日志」，2026-11-05 老板提）。
+
+        只按主键删一行，不动其它日志、不动费用统计口径；返回是否真的删掉了一行。
+        日志是排查与「日志续写」的唯一存档（含全文思考），所以删除必须由 UI 先
+        显式确认，这里不提供批量删除、也不做级联。
+        """
+        cur = self._exec("DELETE FROM request_logs WHERE id=?", (log_id,))
+        return bool(cur.rowcount)
 
     def clear_logs(self):
         self._exec("DELETE FROM request_logs")

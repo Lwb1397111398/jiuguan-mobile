@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 22
 
 # 新模型档案的默认上下文长度。写小说需要尽量长的上下文（多章记忆、前文注入），
 # 所以默认给到 100 万 token；若服务方模型实际上限更低、报"上下文超限"错误，
@@ -293,7 +293,11 @@ CREATE TABLE IF NOT EXISTS request_logs (
   cost              REAL NOT NULL DEFAULT 0,
   status            TEXT NOT NULL DEFAULT 'ok',
   error             TEXT NOT NULL DEFAULT '',
-  duration_ms       INTEGER NOT NULL DEFAULT 0
+  duration_ms       INTEGER NOT NULL DEFAULT 0,
+  finish_reason     TEXT NOT NULL DEFAULT '',
+  thinking          TEXT,
+  reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+  task_text         TEXT
 );
 
 -- 锁定项：注入时带"不可更改"标注
@@ -627,6 +631,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_volume_version(conn)
     _ensure_synopsis_updated_at(conn)
     _ensure_volume_synopsis_synced(conn)
+    _ensure_request_log_columns(conn)
     if current < SCHEMA_VERSION:
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
     conn.commit()
@@ -798,3 +803,37 @@ def _ensure_volume_synopsis_synced(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(volumes)")}
     if "synopsis_synced" not in columns:
         conn.execute("ALTER TABLE volumes ADD COLUMN synopsis_synced TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_request_log_columns(conn: sqlite3.Connection) -> None:
+    """为旧库的 request_logs 补两列（2026-11-05，排查取证用）。
+
+    - `finish_reason`：本请求的原始终止原因。此前只认 `length`（长度截断），
+      模型/平台给的其它终止原因全被丢掉。智谱 GLM 官方在**生成过程中**被内容
+      审核掐断时，流式最后一帧给 `finish_reason: "sensitive"`（不是 HTTP 错误）
+      ——旧代码把它当正常结束，下游只能靠末尾标点猜，于是把「平台审核掐断」
+      误报成「破限没生效」。记下来才能分清 length / sensitive / stop / 空串。
+    - `thinking`：模型的思考内容（reasoning_content / thinking）。
+      **旧日志只存正文不存思考**，曾导致排查时把「正文里的思考输出段」当成
+      「模型的内部思考」，把两件事看反（2026-11-05 老板当场纠正）。
+      思考是判断「模型在干什么」的唯一直接证据，必须留痕。
+    - `reasoning_tokens`：思考占用的输出 token（usage 的
+      completion_tokens_details.reasoning_tokens）。GLM-5.3 的思考不可关闭、
+      默认 reasoning_effort=max，思考 tokens 计入 completion 也占 max_tokens
+      预算——不单独记，「正文才 3000 字怎么就停了」就永远看不出真正原因。
+    - `task_text`：任务指令原文（2026-11-05 日志续写）。日志的 `prompt` 是
+      模块拼接后的全文（`[标题]\n正文` 空行连接），没有单独的任务指令字段；
+      从旧日志续写只能按模块边界反推（pipeline.parse_log_task）。存原文更准，
+      也免去反推失败时入口不可用。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)")}
+    if "finish_reason" not in columns:
+        conn.execute(
+            "ALTER TABLE request_logs ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''")
+    if "thinking" not in columns:
+        conn.execute("ALTER TABLE request_logs ADD COLUMN thinking TEXT")
+    if "reasoning_tokens" not in columns:
+        conn.execute(
+            "ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0")
+    if "task_text" not in columns:
+        conn.execute("ALTER TABLE request_logs ADD COLUMN task_text TEXT")

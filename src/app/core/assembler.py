@@ -11,6 +11,9 @@ from .api import estimate_tokens, estimate_cost
 from .db import DEFAULT_CONTEXT_LENGTH
 from .draft_check import build_draft_text
 from .endmark import END_MARK_INSTRUCTION, end_mark_enabled
+from .think_guard import think_guard_enabled, think_guard_text
+from .anti_ai_taste import (deai_enabled, deai_text, DEAI_MODULE_TITLE,
+                            DEAI_KIND, DEAI_ORDER)
 from .embedding import cosine_similarity, embed_one, load_embed_config
 from .rerank import (rerank_documents, load_rerank_config,
                      RERANK_CANDIDATES, RERANK_DOC_MAX_CHARS)
@@ -2419,14 +2422,43 @@ class Assembler:
         # 老板会以为"按钮不管用"。
         # 第二个条件 context["protocol_stack"]：拒答重试轮的自动升级（总纲首轮被拒 →
         # 重试轮无条件挂栈），由 `pipeline.Pipeline.run` 置位，理由与实测数据见那里。
-        if role == "synopsis" and (context.get("protocol_stack")
-                                   or self.store.get_setting_int("protocol_stack_enabled", 0)):
+        # 提成变量是因为「思考纪律」要用它做互斥（见下方 4.4）。
+        stack_on = role == "synopsis" and (
+            context.get("protocol_stack")
+            or self.store.get_setting_int("protocol_stack_enabled", 0))
+        if stack_on:
             add("协议栈增强（破甲可选）", "protocol_stack", PROTOCOL_STACK_TEXT,
                 11, critical=True, order=_PROTOCOL_STACK_ORDER)
 
         # 4 任务指令（最后一条 user）；额外补充 = 用户明确要求，最高优先级保证不被裁剪
         add("任务指令", "instruction", "【任务指令】\n" + task_instruction, 11, critical=True)
         add("额外补充", "user", context.get("extra", ""), 12)
+        # 4.4 思考纪律（think_guard.py，2026-11-05）：管住「反复推演 / 思考里预写正文」。
+        # 位置：任务指令(11)/草稿(11.5)/额外补充(12)/协议栈(12.4) 之后，完成标志(12.6) 之前。
+        # - 任务指令先声明「先思考输出、再正式输出」，本段后说并声明冲突以本段为准；
+        # - 草稿协议(11.5)先读到，本段再显式豁免 <draft>，不互相拆台；
+        # - 完成标志仍占全报文最后一句。
+        # 与协议栈互斥：协议栈的「思考预算 3500 token / 逐项点名」是它把任务拉进
+        # 「按格式执行」轨道的一部分（拒答重试的救命药），本段再压会破坏那 4/6 的收益。
+        # critical=True：开关开着必须送达，静默被裁等于白开（与 end_mark / 协议栈同款经验）。
+        if think_guard_enabled(self.store) and not stack_on:
+            _tg = think_guard_text(role)
+            if _tg:
+                add("思考纪律", "think_guard", _tg, 12, critical=True, order=12.5)
+        # 4.45 去 AI 味·可读性护栏（anti_ai_taste.py，2026-11-05）：论文「后训练偏好
+        # 信息密度最大化 → 牺牲人类阅读理解」的生成期事前预防。
+        # 位置：思考纪律(12.5) 之后、完成标志(12.6) 之前——两段护栏相邻成组，
+        # 本段管成品输出、更贴近生成点；完成标志仍占全报文最后一句。
+        # critical=True：开关开着必送达，静默被预算裁掉等于白开。
+        # ⚠️ 与协议栈【不互斥】（刻意区别于上面的思考纪律）：协议栈只在 synopsis
+        # 拒答重试轮命中，排除会成为唯一缺口；且协议栈管格式执行/思考预算，
+        # 本段管成品文字阅读负担，正交。别顺手加 `and not stack_on`。
+        # 非创作 role（check/style/memory/ai_task）由 deai_text 返回 "" 自动跳过。
+        if deai_enabled(self.store):
+            _deai = deai_text(self.store, role)
+            if _deai:
+                add(DEAI_MODULE_TITLE, DEAI_KIND, _deai, 12,
+                    critical=True, order=DEAI_ORDER)
         # 4.5 输出完成标志协议（endmark.py，软截断检测）：critical 保证不被预算
         # 裁剪；order 排任务指令(11)/草稿(11.5)/额外补充(12)之后、破甲推杆之前
         # ——贴近生成点提高遵从度（与草稿协议同款经验）。
