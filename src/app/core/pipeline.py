@@ -2069,6 +2069,28 @@ def looks_like_meta_placeholder(text: str) -> bool:
     return any(_META_SINGLE_LINE_RE.match(ln) for ln in lines)
 
 
+def _is_rewrite_delete_body(body: str) -> bool:
+    """一条差量条目正文是否「删除指令」而非替换正文（2026-11-07）。
+
+    协议：整段要删时条目正文只写「删除/删去」（可带「本段/该段/此段」后缀与
+    括号原因），如「P8：删除」「P8：删除（分批残留）」；折行的说明行只许是
+    括号包裹的短说明（与占位判据同形态）。判据从严整体匹配——正文续行
+    （不带括号的正常句子）绝不误判成删除；括号占位标记（【此段落已按指令删除】）
+    不在此列，仍按元信息占位丢弃。唯一消费点 _push_rewrite_entry。
+    """
+    lines = [ln.strip() for ln in (body or "").split("\n") if ln.strip()]
+    if not lines:
+        return False
+    head, rest = lines[0], lines[1:]
+    if not Pipeline._REWRITE_DELETE_BODY_RE.match(head):
+        return False
+    # 续行只许是括号包裹的短说明行（≤30 字，不需要命中占位词表——
+    # 「删除」后面的括号行按说明处理，绝不把说明行当正文续写收进成稿）
+    return all(
+        ln[0] in "（(【[〖〔" and ln[-1] in "）)】]〗〕" and len(ln) <= 30
+        for ln in rest)
+
+
 def _check_tail_line(line: str) -> bool:
     """紧跟检查块的「过渡句」行：『核对完成，直接正文输出。』『开始输出正文。『场景头』』——
     模型把「动笔宣言」（有时粘连一个 RP 场景头/伪标签）单独写一行顶在正文前（实测
@@ -4317,6 +4339,15 @@ class Pipeline:
     # 「全章无病灶」的约定输出（模板要求带句号，末尾标点启发式才不会误判中断）
     _REWRITE_DIFF_NONE_RE = re.compile(r"^\s*无病灶[。.\s]*$")
 
+    # 删除条目正文（2026-11-07 老板拍板：改写允许删段）：整段要删时条目正文
+    # 只写「删除/删去」（可带「本段/该段/此段」后缀与一个括号原因），
+    # 如「删除」「删除（分批残留）」「删去该段」。判据从严：整体匹配才算删除；
+    # 括号包裹的占位标记（【此段落已按指令删除】）不在此列，仍走 meta_dropped
+    # 丢弃——协议要求用「P段号：删除」表达删除，不许用标记代替。
+    _REWRITE_DELETE_BODY_RE = re.compile(
+        r"^(?:删除|删去)(?:[本该此]段)?(?:\s*[" + _META_BRACKETS_OPEN + r"][^"
+        + _META_BRACKETS_ANY + r"\n]{0,24}[" + _META_BRACKETS_CLOSE + r"])?$")
+
     @staticmethod
     def _push_rewrite_entry(repl: dict, info: dict, no: int, lines: list) -> None:
         """收一条差量条目：空体丢弃；元信息占位（模型自补的「已删除」类说明）
@@ -4329,9 +4360,23 @@ class Pipeline:
         回抄（实测《校霸》ch4 `P185：『2012-10月26日-星期六–02:15-…』`、ch5
         `P211：『…晴』`）。照单替换会把该段正文换成垃圾 → 删残留行；删完为空
         则丢弃条目、原段保留（判据严格，正常段落不会命中）。
+
+        2026-11-07 删除条目：正文只写「删除/删去」（可带括号原因）的条目是合法
+        删除指令 → 记进 info["deletions"]（同段号替换/删除互相以后值覆盖），
+        由 apply_diff 执行；判据从严（_REWRITE_DELETE_BODY_RE 整体匹配），
+        必须先于占位判据——裸「删除」二字不带括号，不会命中占位判据，
+        不拦截会被当成替换正文写进成书。
         """
         body = "\n".join(lines).strip()
         if not body:
+            return
+        # 删除条目先判（先于场景头过滤与占位判据）：裸「删除」不命中两者，
+        # 但「删除（分批残留）」这类带括号原因的形态可能被占位判据误吞。
+        if _is_rewrite_delete_body(body):
+            repl.pop(no, None)
+            dels = info.setdefault("deletions", [])
+            if no not in dels:
+                dels.append(no)
             return
         kept = [ln for ln in body.split("\n")
                 if not (ln.strip() and _is_scene_header_line(ln))]
@@ -4343,6 +4388,9 @@ class Pipeline:
             info.setdefault("meta_dropped", []).append(no)
             return
         repl[no] = body
+        dels = info.get("deletions")
+        if dels and no in dels:
+            dels.remove(no)  # 同段号先删后替换 → 后值覆盖，撤销删除
 
     @classmethod
     def parse_style_rewrite_diff(cls, text: str,
@@ -4351,13 +4399,16 @@ class Pipeline:
 
         条目 = 条目头行 + 其后的续行（改写段落可能折行）；条目间空行可有可无。
         info_out 写入 {"none_declared": 是否声明无病灶, "noise_lines": 被忽略的行数,
-        "meta_dropped": 被丢弃的元信息占位条目段号列表} 供调用方提示。
-        重复段号取后值（模型修正前文时以后一条为准）。
+        "meta_dropped": 被丢弃的元信息占位条目段号列表,
+        "deletions": 删除条目段号列表（2026-11-07：正文只写「删除/删去」的条目，
+        由调用方交 apply_diff 执行真删除）} 供调用方提示与执行。
+        重复段号取后值（模型修正前文时以后一条为准；替换与删除同段号互相覆盖）。
         """
         info = info_out if info_out is not None else {}
         info["none_declared"] = False
         info["noise_lines"] = 0
         info["meta_dropped"] = []
+        info["deletions"] = []
         repl: dict[int, str] = {}
         cur_no = 0
         cur_lines: list[str] = []

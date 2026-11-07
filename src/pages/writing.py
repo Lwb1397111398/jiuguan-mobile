@@ -2481,11 +2481,14 @@ class WritingPage:
             from app.core.pipeline import Pipeline
             info: dict = {}
             repl = Pipeline.parse_style_rewrite_diff(result.get("text") or "", info)
-            if not repl and not info.get("none_declared"):
+            dels = info.get("deletions") or []
+            if not repl and not dels and not info.get("none_declared"):
                 toast(self.page, "未识别到替换条目（P段号：改写后的段落），输出可能不符合格式",
                       error=True)
                 return
-            merged, applied, skipped = apply_diff(text, repl)
+            res = apply_diff(text, repl, dels)
+            merged = res["text"]
+            applied, skipped = res["applied"], res["skipped"]
             if skipped:
                 toast(self.page, "段号 %s 超出本章范围，已忽略"
                       % "、".join(str(s) for s in skipped))
@@ -2493,10 +2496,16 @@ class WritingPage:
             if dropped:
                 # 模型想「删掉这一段」只回了标记（如【此段落已按指令删除】）：
                 # 解析层已丢弃该条目 → 原段保留，标记绝不落进正文（2026-10-10）。
-                toast(self.page, "模型对第 %s 段只回了「已删除」标记，已保留原段"
+                toast(self.page, "模型对第 %s 段只回了「已删除」类标记（未按删除条目格式），已保留原段"
                       % "、".join(str(s) for s in dropped))
-            if not applied:
-                if dropped:
+            if res["del_rejected"]:
+                toast(self.page, "模型要求删除 %d 段，超过安全上限（全章段数三分之一），已全部保留原段"
+                      % res["del_rejected"])
+            if res["deleted"]:
+                toast(self.page, "AI 将删除第 %s 段（对比确认后生效）"
+                      % "、".join(str(s) for s in res["deleted"]))
+            if not applied and not res["deleted"]:
+                if dropped or res["del_rejected"]:
                     return
                 toast(self.page, "AI 判定全章无病灶，无需改写"
                       if info.get("none_declared") else "没有可落地的替换条目")

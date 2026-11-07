@@ -8,16 +8,29 @@
 整章一次调用完成扫描与执行，输出差量条目——模型只回传「P段号：改写后的整段」，
 没有病灶的段落一字不提，由 apply_diff 程序确定性拼回初稿、不经模型。
 按次计费渠道只花一次调用的钱，保留段零误伤。
+
+删除条目（2026-11-07 老板拍板）：模型可以输出「P段号：删除」（可带括号原因）
+要求整段删除，apply_diff 执行真删除；括号占位标记（【此段落已按指令删除】）
+不算删除指令、照旧丢弃（meta_dropped），协议要求用删除条目表达删除意图。
 """
 from .pipeline import Pipeline, number_paragraphs, split_paragraphs
 from .task_templates import render as render_task
 
 
-def apply_diff(draft: str, replacements: dict[int, str]) -> tuple[str, list[int], list[int]]:
-    """把差量条目替换进初稿 → (成稿, 已替换段号列表, 越界忽略段号列表)。
+def apply_diff(draft: str, replacements: dict[int, str],
+               deletions: list[int] | tuple = ()) -> dict:
+    """把差量条目执行进初稿（替换 + 删除）→ 结果字典。
 
-    替换是程序确定性操作：没有条目的段落一字不动地原样保留（不经模型），
-    「照抄不伤」由实现保证而非提示词约束。重复段号已在解析层取后值。
+    返回 {"text": 成稿, "applied": 已替换段号, "skipped": 越界替换段号,
+    "deleted": 已删除段号, "del_skipped": 越界删除段号, "del_rejected": 防跑偏
+    拦下的删除条数（0=未拦）}。替换与删除都是程序确定性操作：没有条目的段落
+    一字不动地原样保留（不经模型），「照抄不伤」由实现保证而非提示词约束。
+    重复段号已在解析层取后值；替换与删除同段号互相覆盖（解析层保证互斥）。
+
+    防跑偏护栏（2026-11-07）：删除条目超过全章段数三分之一且超过 3 段时，
+    视为模型跑偏 → **全部删除条目不成立、原段全保留**，条数记进 del_rejected
+    （正常删除是零星几段，合法删除不可能命中护栏）。全章段全被删 → 成稿为空，
+    由调用方按「结果为空保留原稿」兜底。
     """
     paras = split_paragraphs(draft)
     applied: list[int] = []
@@ -28,7 +41,25 @@ def apply_diff(draft: str, replacements: dict[int, str]) -> tuple[str, list[int]
             applied.append(no)
         else:
             skipped.append(no)
-    return "\n\n".join(paras), applied, skipped
+    deleted: list[int] = []
+    del_skipped: list[int] = []
+    del_rejected = 0
+    dels: list[int] = []
+    for no in deletions:
+        if 1 <= no <= len(paras):
+            dels.append(no)
+        else:
+            del_skipped.append(no)
+    if len(dels) > max(3, len(paras) // 3):
+        del_rejected = len(dels)
+        dels = []
+    for no in dels:
+        paras[no - 1] = None
+        deleted.append(no)
+    text = "\n\n".join(p for p in paras if p is not None)
+    return {"text": text, "applied": applied, "skipped": skipped,
+            "deleted": deleted, "del_skipped": del_skipped,
+            "del_rejected": del_rejected}
 
 
 def _chapter_task_args(chapter: dict) -> dict:
@@ -55,12 +86,16 @@ def run_whole_call(store, chapter: dict, draft: str, runner,
 
     差量替换：模型只回传「P段号：改写后的整段」条目，这里解析后由
     apply_diff 替换进初稿——没有条目的段落原样保留（不经模型）。
-    返回 {ok, text(整章成稿), changed(替换段号), skipped(越界段号),
+    删除条目（2026-11-07）：「P段号：删除」由 apply_diff 执行真删除；
+    防跑偏护栏把超限删除整体否决（del_rejected>0 = 删除全部不成立）。
+    返回 {ok, text(整章成稿), changed(替换段号), skipped(越界替换段号),
+    deleted(已删除段号), del_skipped(越界删除段号), del_rejected(被否决删除条数),
     none_declared(模型声明全章无病灶), meta_dropped(模型只回「已删除」类标记、
     被丢弃的段号——原段保留，绝不写进正文), error, stopped}。
     """
     _empty = {"text": "", "changed": [], "skipped": [], "none_declared": False,
-              "meta_dropped": []}
+              "meta_dropped": [], "deleted": [], "del_skipped": [],
+              "del_rejected": 0}
     if stop_event is not None and stop_event.is_set():
         return {"ok": False, "stopped": True, "error": "已停止", **_empty}
     ctx, task = build_whole(store, chapter, draft)
@@ -76,13 +111,16 @@ def run_whole_call(store, chapter: dict, draft: str, runner,
         return {"ok": False, "stopped": False, "error": "改写输出为空", **_empty}
     info: dict = {}
     repl = Pipeline.parse_style_rewrite_diff(text, info)
-    if not repl and not info.get("none_declared") and info.get("noise_lines"):
-        # 一条条目都没认出来，还净是噪声行 → 大概率没按格式输出（如重抄了全文）
+    dels = list(info.get("deletions") or [])
+    if not repl and not dels and not info.get("none_declared") and info.get("noise_lines"):
+        # 一条条目（含删除条目）都没认出来，还净是噪声行 → 大概率没按格式输出（如重抄了全文）
         return {"ok": False, "stopped": False,
                 "error": "未识别到任何替换条目（P段号：改写后的段落），输出可能不符合格式",
                 **_empty}
-    merged, applied, skipped = apply_diff(draft, repl)
-    return {"ok": True, "stopped": False, "error": "", "text": merged,
-            "changed": applied, "skipped": skipped,
+    res = apply_diff(draft, repl, dels)
+    return {"ok": True, "stopped": False, "error": "", "text": res["text"],
+            "changed": res["applied"], "skipped": res["skipped"],
+            "deleted": res["deleted"], "del_skipped": res["del_skipped"],
+            "del_rejected": res["del_rejected"],
             "none_declared": bool(info.get("none_declared")),
             "meta_dropped": list(info.get("meta_dropped") or [])}
