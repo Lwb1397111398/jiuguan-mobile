@@ -2153,6 +2153,11 @@ class Assembler:
             if prev_batches:
                 add("已生成部分（前几批总纲，勿重写）", "synopsis_batches", prev_batches,
                     5.5, critical=True)
+            # 总纲分批·批次规划（2026-11-07 老板提议）：规划文本整体注入每一批作为执行依据——
+            # 每批写哪几卷规划里写死，模型不用自猜；critical 防超预算被裁（被裁就等于没有规划）。
+            plan = (context.get("synopsis_batch_plan") or "").strip()
+            if plan:
+                add("批次规划（执行依据）", "synopsis_plan", plan, 5.5, critical=True)
         elif role == "outline":
             # 消息顺序原则：本次要写的排最前，直接参考其次，定位参考（本卷/总纲）殿后。
             # 模型对序列后段的指令遵从度更高，但把整卷剧情放前面会诱导"一次写完整卷"——
