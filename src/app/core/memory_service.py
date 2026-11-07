@@ -232,7 +232,14 @@ class MemoryService:
             task = base_task
             if attempt > 0:
                 task += f"\n\n【重要】上次输出解析失败：{last_err}\n请只输出合法的 JSON，不要输出任何解释文字。"
-            r = self.pipeline.run("memory", context, task, stream=False, on_chunk=on_chunk)
+            # 必须流式（2026-11-07 老板反馈「归档比其他阶段都慢」根因）：记忆提取是
+            # 全项目 prompt 最大的任务之一（整章正文 + 全量记忆 + 台账/死亡规则），
+            # 思考型模型生成总时长轻松超过档案读超时（默认 120 秒）——非流式要等
+            # 整个响应体到达才计时结束，超时后按 api_retries 重试翻倍等待，表现即
+            # 「归档特别钝、经常失败」；流式只要数据持续到达就不会撞读超时（手动
+            # 归档弹窗一直走 StreamWorker 流式，从不撞墙）。流式不改变结果文本，
+            # 自动归档/批量重归档不传 on_chunk 时增量直接丢弃，零副作用。
+            r = self.pipeline.run("memory", context, task, stream=True, on_chunk=on_chunk)
             if not r["ok"]:
                 return r
             diff, err = self.parse_extract_result(r["text"], prev_state, allow_empty=allow_empty)
