@@ -1100,7 +1100,8 @@ class GlobalStore:
     # ---------- 模型档案 ----------
 
     def list_profiles(self) -> list[dict]:
-        return self._rows("SELECT * FROM model_profiles ORDER BY id")
+        # 模型页拖拽排序（2026-11-07）：sort_order 相同（如旧库全 0）时按 id，与旧版等价
+        return self._rows("SELECT * FROM model_profiles ORDER BY sort_order, id")
 
     def get_profile(self, profile_id: int) -> dict | None:
         return self._one("SELECT * FROM model_profiles WHERE id=?", (profile_id,))
@@ -1111,6 +1112,9 @@ class GlobalStore:
             rpm = max(0, int(data.get("rpm") or 0))
         except (TypeError, ValueError):
             rpm = 0
+        # 新档案排最后：接在当前最大排序号之后（旧库全 0 时首个新建档案 = 1）
+        sort_seq = int((self._one("SELECT COALESCE(MAX(sort_order), 0) AS m FROM model_profiles")
+                        or {"m": 0})["m"]) + 1
         if profile_id:
             self._exec(
                 "UPDATE model_profiles SET name=?,base_url=?,api_key=?,model=?,context_length=?,"
@@ -1126,15 +1130,15 @@ class GlobalStore:
             return profile_id
         cur = self._exec(
             "INSERT INTO model_profiles(name,base_url,api_key,model,context_length,input_price,output_price,"
-            " currency,max_tokens,timeout,temperature,reasoning_mode,max_output_mode,jailbreak,rpm,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " currency,max_tokens,timeout,temperature,reasoning_mode,max_output_mode,jailbreak,rpm,sort_order,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (data.get("name", ""), data.get("base_url", ""), data.get("api_key", ""),
              data.get("model", ""), int(data.get("context_length", db.DEFAULT_CONTEXT_LENGTH)),
              float(data.get("input_price", 0)), float(data.get("output_price", 0)),
              data.get("currency", "元"), int(data.get("max_tokens", 4096)),
              int(data.get("timeout", 120)), float(data.get("temperature", 0.8)),
              data.get("reasoning_mode", "max"), data.get("max_output_mode", "auto"),
-             data.get("jailbreak", ""), rpm, db.now()))
+             data.get("jailbreak", ""), rpm, sort_seq, db.now()))
         return cur.lastrowid
 
     def delete_profile(self, profile_id: int):
@@ -1142,6 +1146,31 @@ class GlobalStore:
         self._exec("UPDATE task_routes SET profile_id=NULL WHERE profile_id=?", (profile_id,))
         self._exec("DELETE FROM model_profiles WHERE id=?", (profile_id,))
         self._purge_fallback_refs(profile_id)
+
+    def reorder_profiles(self, ordered_ids: list[int]) -> None:
+        """模型页拖拽排序（2026-11-07）：按传入顺序写 sort_order=1..n。
+
+        传入列表未覆盖的档案（拖拽期间被其他入口新增的）追加在末尾、
+        保持库内原相对顺序，任何输入下都不丢档案。
+        """
+        ordered_ids = [int(pid) for pid in (ordered_ids or []) if pid is not None]
+        if not ordered_ids:
+            return
+        all_ids = [r["id"] for r in self._rows("SELECT id FROM model_profiles ORDER BY sort_order, id")]
+        in_list = set(ordered_ids)
+        tail = [pid for pid in all_ids if pid not in in_list]
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                seq = 0
+                for pid in list(ordered_ids) + tail:
+                    seq += 1
+                    self.conn.execute(
+                        "UPDATE model_profiles SET sort_order=? WHERE id=?", (seq, pid))
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
 
     # ---------- 渠道故障自动切换：备用渠道链（2026-09-18） ----------
     # 一个角色 = 主渠道（绑定的档案）+ 备用渠道顺序表。主渠道报「渠道层错误」

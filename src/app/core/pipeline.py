@@ -704,6 +704,18 @@ CONTINUE_INSTRUCTION = (
     "直接输出正文，不要重复任何已写内容，不要总结，不要加任何说明或标记。"
 )
 
+# ---------- 总纲分批生成（2026-11-07 老板需求：超大故事一次生成每卷太简略） ----------
+
+# 分批批数上限：AI 每批自判写几卷，进度标记丢失视为未完结会继续要下一批，
+# 上限防「模型一直不写完结标记」时无限空转烧钱
+SYNOPSIS_BATCH_MAX = 8
+
+# 批末进度标记：【分批进度】已写到：分卷N｜未完结（或｜全书完结）。
+# 状态词枚举宽松（未完结/完结/全书完结/已完结），卷号中文/数字都认。
+_SYN_BATCH_MARKER_RE = re.compile(
+    r"【分批进度】\s*已写到\s*[:：]?\s*分卷\s*([一二三四五六七八九十百千\d]+)"
+    r"\s*[｜|]\s*((?:未)?(?:全书|已)?完结)")
+
 # 裁半句搜索窗口：末段超过该长度仍无收尾标点 → 保守保留全文续写
 _TRIM_WINDOW = 200
 
@@ -764,11 +776,15 @@ def _safe_int(value, default: int) -> int:
 
 # 中文数字/序号 → 整数（分卷「分卷十二」、大纲序号「①/一、/1.」等）
 _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+              "六": 6, "七": 7, "八": 8, "九": 9}
 
 
 def _cn_to_int(s: str) -> int:
-    """中文数字转 int：支持 一~九、十~九十九（如 十二/二十三）。阿拉伯数字原样返回。"""
+    """中文数字转 int：支持 一~九十九（如 十二/二十三）。阿拉伯数字原样返回。
+
+    「十」单独处理（乘位）：十二=10+2、二十=2*10——「十」若放进 _CN_DIGITS
+    会先命中查表分支导致十位丢失（2026-11-07 修复：十二 曾返回 2）。
+    """
     s = (s or "").strip()
     if not s:
         return 0
@@ -776,11 +792,11 @@ def _cn_to_int(s: str) -> int:
         return int(s)
     total, num = 0, 0
     for ch in s:
-        if ch in _CN_DIGITS:
-            num = _CN_DIGITS[ch]
-        elif ch == "十":
-            total += num if num else 10
+        if ch == "十":
+            total += (num if num else 1) * 10
             num = 0
+        elif ch in _CN_DIGITS:
+            num = _CN_DIGITS[ch]
     return total + num
 
 
@@ -3593,6 +3609,28 @@ class Pipeline:
         if bare is not None:
             return bare
         return {"overview": content, "volumes": []}
+
+    @staticmethod
+    def parse_synopsis_batch_marker(text: str) -> tuple[str, int, bool]:
+        """解析总纲分批批末的进度标记 → (剥标记后的干净文本, 写到的卷号, 是否全书完结)。
+
+        标记由 synopsis_batch_first/next 任务模板约定，批末单独一行：
+        【分批进度】已写到：分卷N｜未完结（或｜全书完结）。
+        只在文本末尾 300 字窗口内找（防把总纲正文里偶然出现的同形文字当标记）；
+        卷号中文/数字都认（_cn_to_int 归一）。找不到标记 → (原文, 0, False)，
+        调用方按「未完结」继续，调用方防呆（上限/空批）兜底空转。
+        """
+        text = text or ""
+        tail = text[-300:]
+        m = _SYN_BATCH_MARKER_RE.search(tail)
+        if not m:
+            return text, 0, False
+        start = len(text) - len(tail) + m.start()
+        line_end = text.find("\n", len(text) - len(tail) + m.end())
+        clean = (text[:start] + (text[line_end:] if line_end != -1 else "")).strip()
+        vol_no = _cn_to_int(m.group(1))
+        finished = not m.group(2).startswith("未")
+        return clean, vol_no, finished
 
     @staticmethod
     def replace_synopsis_volume(content: str, index: int, title: str,

@@ -2613,6 +2613,10 @@ class ProjectStore(QObject):
         """删除档案；绑定的路由解除绑定。"""
         return self.gstore.delete_profile(profile_id)
 
+    def reorder_profiles(self, ordered_ids: list[int]) -> None:
+        """模型页拖拽排序：按传入顺序持久化（委托全局库）。"""
+        self.gstore.reorder_profiles(ordered_ids)
+
     # ---------- 任务角色（全局） ----------
 
     def list_routes(self) -> list[dict]:

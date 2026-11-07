@@ -480,6 +480,7 @@ CREATE TABLE IF NOT EXISTS model_profiles (
   max_output_mode TEXT NOT NULL DEFAULT 'auto',
   jailbreak      TEXT NOT NULL DEFAULT '',  -- 该档案使用的破甲名（''=跟随全局当前破甲；'__none__'=不注入）
   rpm            INTEGER NOT NULL DEFAULT 0,  -- 每分钟请求上限（0=不限）；渠道限流小的中转站必须配
+  sort_order     INTEGER NOT NULL DEFAULT 0,  -- 模型页拖拽排序（0=未排序，与旧版按 id 排等价）
   created_at     TEXT NOT NULL
 );
 
@@ -579,6 +580,10 @@ def _ensure_global_model_profile_columns(conn: sqlite3.Connection) -> None:
         # 2026-09-19：渠道每分钟请求上限（0=不限）。实测部分中转站把「每分钟 N 次」
         # 当硬限制且失败也计入，软件的失败补救连发会把配额打光 → 全 429。
         conn.execute("ALTER TABLE model_profiles ADD COLUMN rpm INTEGER NOT NULL DEFAULT 0")
+    if "sort_order" not in columns:
+        # 2026-11-07：模型页拖拽排序。旧库全 0，list_profiles 按 sort_order, id 排序时
+        # 与旧版「按 id」结果一致，免数据迁移；拖拽后写入 1..n。
+        conn.execute("ALTER TABLE model_profiles ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

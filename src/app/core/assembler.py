@@ -2146,6 +2146,13 @@ class Assembler:
         # 3 任务数据（按角色组合）
         if role == "synopsis":
             add("创作要求", "user", context.get("user_req", ""), 5)
+            # 总纲分批（2026-11-07）：续批把此前所有批次的完整原文作为独立数据模块注入——
+            # 全文可见是最强承接（卷号连续/情节承接/详略一致全靠它），critical 防超预算
+            # 被裁（被裁模型看不到前文就会整篇重写，教训同 build_continue_task）。
+            prev_batches = (context.get("synopsis_prev_batches") or "").strip()
+            if prev_batches:
+                add("已生成部分（前几批总纲，勿重写）", "synopsis_batches", prev_batches,
+                    5.5, critical=True)
         elif role == "outline":
             # 消息顺序原则：本次要写的排最前，直接参考其次，定位参考（本卷/总纲）殿后。
             # 模型对序列后段的指令遵从度更高，但把整卷剧情放前面会诱导"一次写完整卷"——
