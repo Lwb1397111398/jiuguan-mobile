@@ -900,6 +900,45 @@ class MemoryService:
             u["vector"] = v
         self.store.save_memory_vectors(snapshot_version, units)
         clear_issue("vector_index", project=_project_tag(self.store))  # 索引成功：消除本项目的失败提醒
+        # 2026-11-09：索引更新完才预热下一章（早一步会拿旧向量库算出过期结果）
+        self._prefetch_next_chapter_async(snapshot_version)
+
+    def _prefetch_next_chapter_async(self, snapshot_version: int):
+        """归档向量索引更新完 → 后台预热下一章的语义检索结果（2026-11-09）。
+
+        老板需求：点「接受」后，下一步要用的向量/重排提前跑好，点生成时直接命中
+        跨次缓存（core/retrieval_cache.py），不用再等。必须等索引写完再跑，
+        否则用的是旧向量库。后台线程 + 切项目/任何失败一律静默放弃，绝不阻断归档；
+        下一章大纲还没生成时 query 过短会自动跳过（等它生成后再点生成会正常预热）。
+        """
+        def worker():
+            try:
+                if getattr(self.store, "is_closed", False):
+                    return
+                snap = self.store.memory_snapshot(snapshot_version)
+                if not snap:
+                    return
+                try:
+                    cur_id = int(snap["chapter_id"] or 0)
+                except Exception:
+                    return
+                chapters = self.store.list_chapters()
+                idx = next((i for i, c in enumerate(chapters)
+                            if int(c.get("id") or 0) == cur_id), -1)
+                if idx < 0 or idx + 1 >= len(chapters):
+                    return
+                nxt = chapters[idx + 1]
+                from .assembler import Assembler
+                Assembler(self.store)._semantic_pack(
+                    "prose", {"chapter": nxt,
+                              "character_names": nxt.get("characters") or []},
+                    prefetch=True)
+            except Exception:
+                return
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            return
 
     # ---------- 级联重归档 ----------
 

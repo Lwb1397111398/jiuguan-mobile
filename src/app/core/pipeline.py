@@ -136,6 +136,14 @@ REFUSAL_RETRY_EXTRA = (
     "直接输出任务要求的正文内容，不解释、不道歉、不省略、不概述，完整写完。现在开始。"
 )
 
+# 续写新增段体检门槛（2026-11-10）：续写轮的质量闸不能只看「前文 + 续写」合并稿
+# ——前文本身已经够长、结尾也有标点，合并稿必然过闸，于是「续写 0 字」「只补一句
+# 概括」都会被当成成功。改成先单独检查这一轮新写出来的那段（continuation_segment_issue）。
+# 阈值取舍：误判代价 = 多一轮续写（连续 2 次 → 整章重写），比「垃圾落库」便宜。
+CONT_NEW_MIN_PROSE = 200      # 正文/改写续写：新增少于 200 字且底稿够长 → 疑似概括收尾
+CONT_NEW_MIN_STRUCT = 80      # 大纲/细纲/分卷/总纲等结构化阶段
+CONT_NEW_BASE_MIN = 1500      # 底稿达到该长度才套用「过短」规则（短稿续写不苛刻）
+
 # 「继续生成」指令模板（2026-10-24）：生成中断（网络断/渠道掐线/停止）后不从头重试，
 # 把文本框里已生成的内容作为前文让模型无缝续写。格式化时 {base} 换成已生成全文。
 # 拼进任务指令发送（critical 模块，超预算也不被裁剪——extra 通道优先级 12 非 critical，
@@ -426,6 +434,45 @@ def detect_blocked_output(text: str) -> str | None:
     return None
 
 
+# 软性自我审查（2026-11-10 老板反馈）：破甲失败的第三形态——既不是「我无法生成」
+# 这类硬拒答，也不是平台审核掐断，而是模型用**省略/淡出/概括收尾**把露骨内容糊过去：
+#   「此处省略…」「之后的事不必细说」「一笔带过」「由于尺度限制，不展开描写」。
+# 这类文本完全不含拒答关键词、长度也可能够，detect_refusal / detect_blocked_output
+# 都抓不到 → 被当成正常正文收下、显示完成（老板原话：「实质上是破甲失败然后显示完成」）。
+#
+# **只用于续写新增段**（continuation_segment_issue），不拿它扫整章正文：
+# 正常小说里「一夜无话」「此处删去」偶有修辞用法，全文扫描误伤面太大；
+# 而续写段出现这些词，几乎都是在替模型自己找台阶下。
+# 刻意不匹配「本章完/全文完/未完待续/次日/一夜无话」——那些是正常收尾或时间跳跃。
+_SOFT_EVASION_PATTERNS = [
+    r"(此处|这里|以下|下文|后续|后面)[^，。\n]{0,8}"
+    r"(省略|略去|从略|不表|不再赘述|不予展开|不作展开|跳过|删去)",
+    r"(细节|过程|具体内容|具体过程|具体细节)[^，。\n]{0,10}"
+    r"(不再|无需|不必|不便|省略|略去|从略|不表)",
+    r"(一笔带过|草草带过|轻轻带过|笼统带过)",
+    r"(由于|鉴于|考虑到)[^，。\n]{0,12}(限制|尺度|规范|政策|审核|篇幅)"
+    r"[^。\n]{0,12}(省略|跳过|略去|不展开|不描述|不予描写)",
+    r"(接下来|之后|此后|后面)的?(事情|事|内容|过程|细节)[^，。\n]{0,8}"
+    r"(不必|无需|不便|不再)(细说|详述|展开|赘述)",
+    r"(fade\s+to\s+black|scene\s+fades|rest\s+of\s+the\s+scene\s+is\s+omitted"
+    r"|details?\s+(are|is)\s+(skipped|omitted))",
+]
+
+
+def detect_soft_evasion(text: str) -> str:
+    """检测「软性自我审查」：用省略/淡出/概括代替正文。命中返回片段，未命中 ''。
+
+    仅限**续写新增段**使用（见 continuation_segment_issue）。判据保守：
+    必须出现「省略/略去/不表/一笔带过/不必细说」等明确措辞，不靠语气猜测。
+    """
+    text = text or ""
+    for p in _SOFT_EVASION_PATTERNS:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0)
+    return ""
+
+
 # 上游输入端拦截（2026-09-10）：渠道/上游在**请求送进模型之前**就把 prompt 拦掉时，
 # 会把拦截说明当成正常正文回传（HTTP 200，cost=0，finish_reason 正常），软件此前
 # 把它当成功输出收下 → 用户只看到一段英文、毫无提示，自动模式也不会重试。
@@ -537,6 +584,47 @@ def is_safety_thinking(text: str) -> bool:
         return False
     zh = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
     return zh * 50 < len(t)     # 中文占比 < 2% → 判为安全评估
+
+
+def continuation_segment_issue(role: str, new_text: str, base: str = "") -> str:
+    """续写新增段体检（2026-11-10）：返回 '' = 合格，否则返回一句人话原因。
+
+    为什么必须单独看新增段：续写轮此前的质量闸全在检查「前文 + 续写」合并稿。
+    前文本身动辄几千字、结尾也有标点，于是合并稿必然过长度/收尾闸——
+    ① 续写返回 0 字或几十字，也算成功；
+    ② 模型用「此处省略/之后的事不必细说」软性自我审查收尾，没有拒答关键词，
+       所有闸门放行 → 垃圾写进正文并显示完成。
+    老板 2026-11-10 反馈的正是第二种。本函数把「这一轮到底补了什么」单独过一遍。
+
+    调用方：自动模式 AutoPilot._run（续写轮）、生成窗 TaskRunDialog._on_done、
+    日志续写结果窗 ContinueResultDialog。纯函数，不碰数据库。
+
+    `base` 是本次续写所依据的前文（底稿）；为空表示「思考续写」——没有正文底稿，
+    不套用「新增过短」规则（那种轮次本来就该按整篇新生成来判）。
+    """
+    new = (new_text or "").strip()
+    base = base or ""
+    if not new:
+        return "续写没有返回任何新内容"
+    if detect_refusal(new):
+        return "续写段出现拒答腔"
+    blocked = detect_blocked_output(new)
+    if blocked:
+        return f"续写段命中破限失败信号「{blocked}」"
+    up = detect_upstream_block(new)
+    if up:
+        return f"续写段是渠道拦截占位「{up}」"
+    if detect_silent_refusal(new):
+        return "续写段是英文安全评估，没有产出正文"
+    ev = detect_soft_evasion(new)
+    if ev:
+        return f"续写段用省略/概括代替正文「{ev}」"
+    if len(base.strip()) >= CONT_NEW_BASE_MIN:
+        min_new = (CONT_NEW_MIN_PROSE if role in ("prose", "prose_rewrite")
+                   else CONT_NEW_MIN_STRUCT)
+        if len(new) < min_new:
+            return f"续写只新增 {len(new)} 字（少于 {min_new} 字，疑似概括收尾）"
+    return ""
 
 
 # ---------- 上游拦截自动规避（2026-09-10） ----------
@@ -749,6 +837,79 @@ def join_continuation(full_text: str, new_text: str) -> str:
     return full + new
 
 
+# 日志续写「一键应用」支持的角色（2026-11-10 老板需求：不想再复制粘贴）
+APPLY_CONTINUATION_ROLES = ("prose", "prose_rewrite", "outline")
+
+
+def apply_continuation(store, role: str, chapter_id: int, full_text: str,
+                       base_len: int, append: bool = False,
+                       mark_done: bool = True) -> dict:
+    """把日志续写结果写回指定章节，返回 {ok, note, error}。
+
+    背景：`request_logs` 没有章节 id，程序原本无法判断续写该落到哪一章，所以
+    结果窗只能「复制全文 / 另存为 .txt」。但库层能力一直是现成的——缺的只是
+    「让人选一章」这一步。本函数是 UI 与测试共用的纯落库入口。
+
+    - `prose/prose_rewrite` → `accept_chapter_prose`（旧版自动存快照，可回滚）
+    - `outline` → `update_chapter(outline_content)` + `set_outline_refined`
+    - 其它角色（detail/synopsis/volume/ai_task）→ 不支持，仍走复制/另存
+
+    `append=True` 时只写 `full_text[base_len:]`（目标章已有前文时用，避免把前文
+    再插一遍）；`append=False` 整篇覆盖。追加是幂等的：新增段已在正文里则跳过。
+    `mark_done=True` 顺带把本章标成已完成 / 大纲已细化——**必须标**，否则自动模式
+    会把「正文块已接受但章节状态还是旧值」误判成没写完，又生成一遍覆盖掉。
+    """
+    role = role or ""
+    try:
+        cid = int(chapter_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "没有选定目标章节"}
+    full = (full_text or "").strip()
+    if not full:
+        return {"ok": False, "error": "续写结果为空"}
+    base_len = max(0, int(base_len or 0))
+    if role in ("prose", "prose_rewrite"):
+        if append:
+            new = full[base_len:].strip() if base_len < len(full) else ""
+            if not new:
+                return {"ok": False, "error": "本次没有新增内容可追加"}
+            existing = store.chapter_prose_text(cid)
+            if new in existing:
+                return {"ok": True, "note": "新增段已在正文中，未重复写入"}
+            text = join_continuation(existing, new).strip()
+        else:
+            # 整篇覆盖：先剥掉模型可能重复输出的章标题/场景头，避免标题进正文
+            _title, prose, _err = Pipeline.parse_chapter_prose(full)
+            text = (prose or "").strip() or full
+        if not text:
+            return {"ok": False, "error": "续写结果为空"}
+        store.accept_chapter_prose(cid, text)
+        if mark_done:
+            store.set_chapter_status(cid, "已完成")
+        return {"ok": True,
+                "note": f"已写入本章正文（{len(text)} 字，旧稿已存快照，可回滚）"}
+    if role == "outline":
+        ch = store.get_chapter(cid)
+        if not ch:
+            return {"ok": False, "error": "目标章节不存在"}
+        if append:
+            new = full[base_len:].strip() if base_len < len(full) else ""
+            if not new:
+                return {"ok": False, "error": "本次没有新增内容可追加"}
+            old = (ch.get("outline_content") or "").strip()
+            if new in old:
+                return {"ok": True, "note": "新增段已在大纲中，未重复写入"}
+            text = join_continuation(old, new)
+        else:
+            text = full
+        store.update_chapter(cid, {"outline_content": text})
+        if mark_done:
+            store.set_outline_refined(cid, True)
+        return {"ok": True, "note": f"已写入本章大纲（{len(text)} 字）"}
+    return {"ok": False,
+            "error": f"角色「{role or '未知'}」的续写暂不支持一键应用，请用复制/另存"}
+
+
 def generation_fingerprint(role: str, build: dict, profile: dict,
                            temperature, max_tokens) -> str:
     """请求指纹（2026-10-27 生成结果缓存）：角色+模型+温度+max_tokens+完整报文
@@ -825,6 +986,16 @@ _SYN_VOL_HEADING_NUM_RE = re.compile(
     r"^[ \t]*(#{1,4})\s*分卷\s*([0-9〇一二三四五六七八九十百千]+)"
     r"(?:\s*[：:]\s*(.*))?$", re.M)
 
+# 迭代增量化两段式协议标记（总纲/切章迭代共用；iter_review.py 复用同一份定义）。
+# 必须独占一行（容忍 Markdown 标题/引用符号与冒号变体），避免把正文里提到的
+# 「【迭代评估】」当标记。pipeline 侧只用它判断「这段输出是增量协议」，
+# 保证候选解析不会把评估清单砍掉（2026-11-09 老板实测丢稿）。
+_ITER_EVAL_MARK_RE = re.compile(
+    r"^[ \t]*[#>*]*[ \t]*【[ \t]*迭代评估[ \t]*】[ \t]*[：:]?[ \t]*$", re.M)
+_ITER_BODY_MARK_RE = re.compile(
+    r"^[ \t]*[#>*]*[ \t]*【[ \t]*修订内容[ \t]*】[ \t]*[：:]?[ \t]*$", re.M)
+
+
 # 章标题前缀：『第1章：入城』/『第一章 入城』→ 剥前缀后取分隔后核心章名
 # 章号前缀（2026-09-05 收紧）：旧版「章?」可选，『十六磅』会被误剥成『磅』
 # （拳套磅数是正常章名）。改为必须出现「章/回」字，或裸数字后跟分隔符。
@@ -871,11 +1042,15 @@ def _md_split(text: str, pat) -> list[tuple[str, str]]:
 # 只认「整行剥装饰后以 分卷N / 第N卷 / 卷N 开头」的短行；『分卷一』『第一卷：名』
 # 『卷1』等形态都认。行长超限或以句读收尾的行多半是正文行文（「分卷一共有三章。」），
 # 不当标题——误切的代价是分卷错乱，不切的代价只是退回整篇 overview，后者更安全。
+# 卷号后的分隔符：冒号之外还认中文逗号/顿号等（2026-11-10 老板实测：自定义
+# 总纲模板产出的裸行卷标题是『分卷一，开幕检录与沙地俯卧撑』，只认『：』会让
+# 卷名带着前导「，」进库，迭代合成按卷名比对时也对不上）。
+_BARE_VOL_SEP = "：:，,、.．—-"
 _BARE_VOL_LINE_RE = re.compile(
     r"^[\s#■●◆◇·\-—]*(?:分卷\s*([一二三四五六七八九十百千\d]+)"
     r"|第\s*([一二三四五六七八九十百千\d]+)\s*卷"
     r"|卷\s*([一二三四五六七八九十百千\d]+))"
-    r"\s*[：:]?\s*(.*)$")
+    r"\s*([" + _BARE_VOL_SEP + r"])?\s*(.*)$")
 _BARE_OVERVIEW_LINE_RE = re.compile(r"^[\s*＊#■●◆◇·\-—]*整体层\s*[：:]?\s*(.*)$")
 _BARE_VOL_LINE_MAX = 60        # 裸标题行长度上限
 _BARE_VOL_TAIL_PUNCT = "。！？；，"  # 以句读结尾 = 行文句子，不是标题
@@ -886,6 +1061,76 @@ _SYNOPSIS_SECTION_MARK_RE = re.compile(
     r"【\s*分卷纲要\s*】|^[\s*＊#■●◆◇·\-—]*分卷纲要\s*[：:]?", re.M)
 
 
+def _bare_marks_trusted(marks: list[dict], has_vol_section: bool) -> bool:
+    """裸行卷标题可信门槛：≥2 行且序号严格递增；仅 1 行须有『分卷纲要』标记。"""
+    if not marks:
+        return False
+    if len(marks) < 2:
+        return has_vol_section
+    nums = [m["index"] for m in marks]
+    return all(b > a for a, b in zip(nums, nums[1:]))
+
+
+def bare_synopsis_volume_marks(text: str) -> list[dict] | None:
+    """裸行总纲（无任何 # / ■ 标记）的『分卷N』标题行清单。
+
+    返回 [{line_start, line_end, index, num_raw, sep, title, inline}]（按出现顺序）；
+    一行都不满足可信门槛 → None。门槛与切分函数完全一致：命中 ≥2 行且序号严格
+    递增，或只有 1 行但文本含『【分卷纲要】』分段标记（固定框架总纲）。
+    **不做可信判定就据此改原文会切错卷**，所以调用方拿到 None 必须放弃。
+    抽成独立函数是给迭代增量合成（iter_review 的裸行分卷原位替换）复用，
+    避免「切分认、替换不认」的两套判据漂移（2026-11-10 老板实测就是这么挂的）。
+
+    ``inline``：标题与正文写在同一行时的行内正文（2026-11-10 傍晚实测，见下）；
+    纯净标题行为空串，正文从下一行起算。
+
+    两种裸行标题都要认（2026-11-10 傍晚补）：
+    ① **独立行**『分卷一，蛛巢夜宴』——行长 ≤60、不以句读收尾（原判据）；
+    ② **标题与正文同一行**『分卷一：萨林博士的机器人部队接连击溃多国军队…』
+       —— 整行几百上千字、以句号收尾。老板自定义总纲模板这次就产出了这种形态，
+       旧判据按「行长超限 / 句读收尾」整行跳过 → 一条分卷都识别不到，
+       界面报「未识别到总纲候选」（19:15 邪恶博士项目实测）。
+    长行只在文本含『分卷纲要』分段标记时才认（明确在写分卷区才可信），且必须
+    真带行内正文；合流后仍要过「序号严格递增」，正文里引述「分卷五」不会误切。
+    """
+    text = text or ""
+    has_vol_section = bool(_SYNOPSIS_SECTION_MARK_RE.search(text))
+    strict: list[dict] = []
+    loose: list[dict] = []
+    pos = 0
+    for raw in text.splitlines(keepends=True):
+        line_start = pos
+        pos += len(raw)
+        s = raw.strip().strip("*＊").strip()
+        if not s:
+            continue
+        m = _BARE_VOL_LINE_RE.match(s)
+        if not m:
+            continue
+        rec = {
+            "line_start": line_start,
+            "line_end": line_start + len(raw.rstrip("\r\n")),
+            "index": _cn_to_int(m.group(1) or m.group(2) or m.group(3)),
+            "num_raw": (m.group(1) or m.group(2) or m.group(3) or "").strip(),
+            "sep": m.group(4) or "",
+            "title": (m.group(5) or "").strip(),
+            "inline": "",
+        }
+        if len(s) > _BARE_VOL_LINE_MAX or s[-1] in _BARE_VOL_TAIL_PUNCT:
+            if not has_vol_section or not rec["title"]:
+                continue
+            rec["inline"] = rec["title"]
+            rec["title"] = ""
+            loose.append(rec)
+        else:
+            strict.append(rec)
+    # 长行优先与严格行合并（按位置排序）；合流后序号不递增 → 退回只用严格行
+    for cand in (sorted(strict + loose, key=lambda x: x["line_start"]), strict):
+        if _bare_marks_trusted(cand, has_vol_section):
+            return cand
+    return None
+
+
 def _split_bare_synopsis_volumes(text: str) -> dict | None:
     """无任何 # / ■ 标记的总纲：按裸「分卷N」标题行切分 → {overview, volumes}。
 
@@ -893,38 +1138,32 @@ def _split_bare_synopsis_volumes(text: str) -> dict | None:
     仅 1 个标题行时，须文本含「【分卷纲要】」分段标记（固定框架总纲）才放行。
     不满足返回 None，调用方维持原行为（整篇当 overview）。
     """
-    lines = text.splitlines()
-    marks: list[tuple[int, int, str]] = []  # (行号, 卷号, 卷名)
-    for i, raw in enumerate(lines):
-        s = raw.strip().strip("*＊").strip()
-        if not s or len(s) > _BARE_VOL_LINE_MAX or s[-1] in _BARE_VOL_TAIL_PUNCT:
-            continue
-        m = _BARE_VOL_LINE_RE.match(s)
-        if not m:
-            continue
-        num = _cn_to_int(m.group(1) or m.group(2) or m.group(3))
-        marks.append((i, num, (m.group(4) or "").strip()))
-    if len(marks) < 2:
-        # 仅 1 个标题行：只有固定框架总纲（含「【分卷纲要】」分段标记）才放行单卷
-        if len(marks) != 1 or not _SYNOPSIS_SECTION_MARK_RE.search(text):
-            return None
-    else:
-        nums = [n for _, n, _ in marks]
-        if any(b <= a for a, b in zip(nums, nums[1:])):
-            return None
+    text = text or ""
+    marks = bare_synopsis_volume_marks(text)
+    if not marks:
+        return None
     volumes = []
-    for k, (i, num, title) in enumerate(marks):
-        end = marks[k + 1][0] if k + 1 < len(marks) else len(lines)
-        body = "\n".join(lines[i + 1:end]).strip()
-        volumes.append({"index": num, "title": title, "content": body})
+    for k, mk in enumerate(marks):
+        end = marks[k + 1]["line_start"] if k + 1 < len(marks) else len(text)
+        body = text[mk["line_end"]:end].strip()
+        # 标题与正文同一行（『分卷一：<整段正文>』）：行内正文属于本卷，
+        # 不能只从下一行起算，否则整卷正文凭空丢失。
+        inline = (mk.get("inline") or "").strip()
+        if inline:
+            body = inline + ("\n\n" + body if body else "")
+        volumes.append({"index": mk["index"], "title": mk["title"], "content": body})
     # 第一个分卷标题行之前 = 整体概述（「整体层：」标记行剥壳留肉）
     ov: list[str] = []
-    for raw in lines[:marks[0][0]]:
+    for raw in text[:marks[0]["line_start"]].splitlines():
         mo = _BARE_OVERVIEW_LINE_RE.match(raw.strip()) if raw.strip() else None
         if mo:
             inner = (mo.group(1) or "").strip()
             if inner:
                 ov.append(inner)
+            continue
+        # 纯『分卷纲要』分段标记行不是整体层内容，留在 overview 里会被
+        # 「同步整体层」之类操作重复写回总纲
+        if re.fullmatch(r"[\s*＊#■●◆◇·\-—]*分卷纲要\s*[：:]?", raw.strip()):
             continue
         ov.append(raw)
     return {"overview": "\n".join(ov).strip(), "volumes": volumes}
@@ -2018,6 +2257,42 @@ def batch_tail_two_paras(text: str, keep: int = 2) -> str:
 _BATCH_STATE_FIELD_RE = re.compile(
     r"^(?:摘要|to状态|配额登记|末句)\s*[:：]", re.IGNORECASE)
 
+# 状态栏开始判定的末尾窗口（行数，2026-11-11）：标记行/字段行只认输出末尾附近——
+# 分批协议固定顺序是 正文 →【滚动状态包】→【生成完毕】，状态栏永远在输出尾部。
+# 只扫末尾窗口的理由：思考段（输出头部）与正文中段复述模板标记不算「状态栏已
+# 开始」——截断在正文中间时输出末尾必然是正文行，不含标记与字段行，不会把
+# 没写完的正文误判成完整收货。
+_STATE_BAR_TAIL_LINES = 30
+
+
+def state_bar_started(text: str, tail_lines: int = _STATE_BAR_TAIL_LINES) -> bool:
+    """检测输出末尾是否已进入批尾状态栏阶段（2026-11-11 老板需求）。
+
+    背景：正文写完、渠道把输出掐在状态栏里（finish_reason=length）时，此前
+    会烧防截断续写轮再判「未写完」整章重写——正文明明完整。本函数给「收货
+    豁免」提供唯一判据（即老板说的「状态栏那些规定的字和符号」）：
+
+    - 末尾窗口内出现【滚动状态包】/【改写批包】标记行（文风改写执行批共用
+      _parse_batch_prose 解析骨架，包标记换形），或
+    - 末尾窗口内连续 ≥2 行命中状态包字段行（摘要：/to状态：/配额登记：/末句：，
+      与 _parse_batch_prose 标记缺失时的兜底口径一致）。
+
+    命中 = 状态栏已开始 = 正文已写完。纯函数，不碰数据库。
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    tail = lines[-tail_lines:] if tail_lines > 0 else lines
+    run = 0
+    for ln in tail:
+        if "【滚动状态包】" in ln or "【改写批包】" in ln:
+            return True
+        if _BATCH_STATE_FIELD_RE.match(ln):
+            run += 1
+            if run >= 2:
+                return True
+        else:
+            run = 0
+    return False
+
 # 批头章名行（分批模板的正文起点定位行，2026-10-09）：『第N章：章名（第M批）』。
 # 判定 = 行首『第N章/第N回』短行 + 行内含『（…批）』括注（（第3批）/（第16日）（第2批）
 # 这类嵌套变体都命中）。该行是提示词给模型的批界标，落库正文里不该有它；
@@ -2939,7 +3214,7 @@ class Pipeline:
         cache_fp: str | None = None
         # 全局开关兜底（设置「重复生成时复用上次结果」）：手动路径传 use_cache=True，
         # 用户关了开关就整体停用（读与写都不走），各调用点无需再判。
-        if use_cache and str(self.store.get_setting("regen_cache_enabled", "1") or "").strip() != "1":
+        if use_cache and str(self.store.get_setting("regen_cache_enabled", "0") or "").strip() != "1":
             use_cache = False
         # 拒答重试 → 自动升级协议栈（2026-09-23）：总纲首轮被拒后，重试轮无条件挂上
         # 协议栈，不再只看 `protocol_stack_enabled` 开关。依据 docs/酒馆破限对照排查SOP.md
@@ -3240,10 +3515,14 @@ class Pipeline:
         resp = client.complete(build["messages"], **complete_kwargs)
         # 截断自动续写（防截断）：只在 finish_reason=length（硬信号）、开关开、
         # 长文本创作角色、且已有正文时触发；JSON 类角色拼接必坏，永不续写。
+        # 状态栏已开始时跳过（2026-11-11 老板需求）：正文已写完，续写状态栏
+        # 纯属烧钱（渠道掐点固定，每轮必再被掐、每轮全上下文重新计费），直接
+        # 按完成收货——下方 end_mark 豁免会把完整性归一，自动模式不重试。
         continued_rounds = 0
         if (resp.get("truncated") and role in CONTINUABLE_ROLES
                 and self.store.get_setting_int("anti_truncate_enabled", 0) > 0
-                and (resp.get("text") or "").strip()):
+                and (resp.get("text") or "").strip()
+                and not state_bar_started(resp["text"])):
             max_rounds = max(1, min(5, self.store.get_setting_int("anti_truncate_rounds", 2)))
             continued_rounds = self._continue_loop(
                 client, build["messages"], temperature, request_max_tokens, stream,
@@ -3296,6 +3575,19 @@ class Pipeline:
             if fb_ok:
                 end_mark_found = True
                 complete_fallback = fb_note
+        # 状态栏截断收货豁免（2026-11-11 老板需求）：正文写完、渠道把输出掐在
+        # 批尾状态栏里（truncated=finish_reason=length 硬信号，safety_blocked
+        # 时 truncated 恒为 False 天然排除——平台审核掐断的处置协议不变）。
+        # 正文已完整，残缺状态栏只影响下一批的接力注入（parse_batch_prose 会
+        # 切走残栏；缺字段时下一批退化为「末尾两段」衔接），不值得烧续写轮
+        # 再整章重写。此处把 end_mark 归一为 True，自动模式/手动窗不再按
+        # 「未写完」重试；complete_fallback 让老板看得见这次收货的依据。
+        if (not end_mark_found and resp.get("truncated")
+                and role in ("prose", "prose_rewrite")
+                and state_bar_started(formal_text)):
+            end_mark_found = True
+            complete_fallback = ("状态栏已开始后被输出上限截断：正文已完整，"
+                                 "残缺状态栏不影响正文，按完成收货")
         # 中间残留标志兜底清理（2026-09-10）：模型把标志打在正文中间（分节/多段
         # 输出时常见）时，末尾剥离拿不到 → 标志随内容落库。这里对「强形式」标志行
         # 做一次全文清理（只认【生成完毕】这类，绝不碰「本章完/结束。」等正常行文）。
@@ -3554,6 +3846,9 @@ class Pipeline:
         if not content:
             return {"overview": "", "volumes": []}
         content = strip_model_output(content)[0].strip()
+        # 完成标志（【生成完毕】）是机器协议行，不属于总纲内容：不剥会跟着
+        # 最后一卷正文一起进库（2026-11-10 邪恶博士实测）。
+        content = strip_end_mark(content)[0].strip()
         if not content:
             return {"overview": "", "volumes": []}
         overview = ""
@@ -3665,6 +3960,213 @@ class Pipeline:
             return (content[:target.start()] + head + "\n" + body.strip()
                     + (ws or "\n\n") + content[end:])
         return (content[:target.start()] + head + "\n" + body.strip()).rstrip() + "\n"
+
+    @staticmethod
+    def append_synopsis_volume(content: str, index: int, title: str,
+                               body: str) -> str | None:
+        """总纲分卷区末尾追加一卷（迭代意见要求「新增一卷」时用，2026-11-09）。
+
+        replace_synopsis_volume 只在底稿已有该卷标题时原位替换；迭代意见要加卷时
+        底稿必然没有『分卷N』标题，整批拒绝等于把这条意见吞掉。这里按最后一个分卷
+        标题的级别与编号风格追加，其余文字逐字不动。
+        插入点取「最后一个分卷段之后的下一个 H1 标题之前」——分卷区后面还有别的
+        H1 大节（附录/台账）时，不能把新卷追加到文件末尾。
+        找不到任何分卷标题 / body 为空 → None（调用方按合成失败处理）。
+        """
+        if not content or not (body or "").strip():
+            return None
+        marks = list(_SYN_VOL_HEADING_NUM_RE.finditer(content))
+        if not marks:
+            return None
+        last = marks[-1]
+        level = last.group(1)
+        num_raw = last.group(2).strip()
+        num = str(int(index)) if num_raw.isdigit() else Pipeline._int_to_vol_num(int(index), "cn")
+        t = (title or "").strip()
+        head = f"{level} 分卷{num}：{t}" if t else f"{level} 分卷{num}"
+        block = head + "\n" + body.strip() + "\n"
+        nxt = next((m for m in _MD_H1_RE.finditer(content) if m.start() > last.start()), None)
+        if nxt is None:
+            return content.rstrip() + "\n\n" + block
+        return content[:nxt.start()].rstrip() + "\n\n" + block + "\n" + content[nxt.start():]
+
+    # ---------- 分卷段手术（分卷编排台结构同步，2026-11-09） ----------
+    # 只处理 Markdown「#~#### 分卷N」标题段；■/裸行形态一律返回 None，由
+    # 调用方走「显式确认后重建分卷区」的可见降级，绝不静默改写手写的总纲。
+    # 核心不变量：结构操作只改标题里的编号 token / 段顺序，段正文、卷名、
+    # 空行逐字不动（_renumber_joined 保证）。
+
+    @staticmethod
+    def _split_markdown_volume_sections(content: str) -> dict | None:
+        """把总纲切成「前置原文 + 若干 Markdown 分卷段」，供结构同步使用。
+
+        每段保存标题行原文、段体原文、编号 token 在标题行内的相对偏移，
+        重编号时只替换这一个 token。非 Markdown 形态 → None。
+        """
+        content = content or ""
+        marks = list(_SYN_VOL_HEADING_NUM_RE.finditer(content))
+        if not marks:
+            return None
+        prefix = content[:marks[0].start()]
+        segs = []
+        for i, m in enumerate(marks):
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(content)
+            num_raw = m.group(2)
+            segs.append({
+                "head": content[m.start():m.end()],
+                "body": content[m.end():end],
+                "level": m.group(1),
+                "num_raw": num_raw,
+                "num": _cn_to_int(num_raw),
+                "style": "ar" if num_raw.isdigit() else "cn",
+                "title": (m.group(3) or "").strip(),
+                "num_start": m.start(2) - m.start(),
+                "num_end": m.end(2) - m.start(),
+            })
+        return {"prefix": prefix, "segs": segs}
+
+    @staticmethod
+    def _int_to_vol_num(n: int, style: str) -> str:
+        """卷号整数 → 标题编号 token：中文 1~99，其余/>=100 用阿拉伯数字。
+
+        绝不产出「〇」（_CN_DIGITS 无此字，_cn_to_int 会读成 0）。
+        """
+        n = int(n)
+        if style != "cn" or n <= 0 or n >= 100:
+            return str(n)
+        digits = "零一二三四五六七八九"
+        if n < 10:
+            return digits[n]
+        tens, ones = divmod(n, 10)
+        head = "十" if tens == 1 else digits[tens] + "十"
+        return head + (digits[ones] if ones else "")
+
+    @staticmethod
+    def _renumber_joined(split: dict) -> str:
+        """按 segs 当前顺序把段号重写为 1..n；只改编号 token，其余逐字保留。
+
+        段被搬到中间而原本没有段尾换行时补一个段间分隔（必要的格式修复，
+        不改动任何原有正文字符）。
+        """
+        parts = [split["prefix"]]
+        segs = split["segs"]
+        last = len(segs) - 1
+        for i, s in enumerate(segs):
+            token = Pipeline._int_to_vol_num(i + 1, s["style"])
+            head = s["head"][:s["num_start"]] + token + s["head"][s["num_end"]:]
+            body = s["body"]
+            if i < last and not body.endswith("\n"):
+                body += "\n\n"
+            parts.append(head + body)
+        return "".join(parts)
+
+    @staticmethod
+    def insert_synopsis_volume(content: str, at_index: int, title: str,
+                               body: str) -> str | None:
+        """在第 at_index 位插入新分卷段（1-based，1..n+1），全部段号重排 1..n+1。
+
+        原有段正文/卷名/空行逐字不动，只重写标题编号。新段层级与编号风格
+        取插入点相邻段；非 Markdown 总纲 → None。
+        """
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return None
+        segs = split["segs"]
+        pos = max(0, min(int(at_index) - 1, len(segs)))
+        ref = segs[pos] if pos < len(segs) else (segs[-1] if segs else None)
+        level = ref["level"] if ref else "###"
+        style = ref["style"] if ref else "ar"
+        token = Pipeline._int_to_vol_num(pos + 1, style)
+        t = (title or "").strip()
+        head = f"{level} 分卷{token}" + (f"：{t}" if t else "")
+        prev_text = segs[pos - 1]["body"] if pos > 0 else split["prefix"]
+        lead = ""
+        if prev_text:
+            if not prev_text.endswith("\n"):
+                lead = "\n\n"
+            elif not prev_text.endswith("\n\n"):
+                lead = "\n"
+        offset = len(lead) + len(level) + 1 + len("分卷")
+        segs.insert(pos, {
+            "head": lead + head,
+            "body": "\n" + (body or "").strip() + "\n\n",
+            "level": level,
+            "num_raw": token,
+            "num": pos + 1,
+            "style": style,
+            "title": t,
+            "num_start": offset,
+            "num_end": offset + len(token),
+        })
+        return Pipeline._renumber_joined(split)
+
+    @staticmethod
+    def delete_synopsis_volume(content: str, index: int) -> str | None:
+        """删除第 index 个分卷段（1-based），其余段号回补为 1..n-1。"""
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return None
+        segs = split["segs"]
+        idx = int(index) - 1
+        if idx < 0 or idx >= len(segs):
+            return None
+        segs.pop(idx)
+        return Pipeline._renumber_joined(split)
+
+    @staticmethod
+    def reorder_synopsis_volumes(content: str, order: list) -> str | None:
+        """按 order（旧段号 1-based 的新排列）整段搬移，再重编号为 1..n。
+
+        heading 与 body 一起走，段体逐字不动；order 必须是 1..n 的排列。
+        """
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return None
+        segs = split["segs"]
+        if sorted(order) != list(range(1, len(segs) + 1)):
+            return None
+        split["segs"] = [segs[i - 1] for i in order]
+        return Pipeline._renumber_joined(split)
+
+    @staticmethod
+    def renumber_synopsis_volume_headings(content: str) -> str | None:
+        """把现有分卷段号规范成 1..n（修历史跳号/中文数字错位），段体不动。"""
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return None
+        return Pipeline._renumber_joined(split)
+
+    @staticmethod
+    def rebuild_synopsis_volume_sections(content: str, volumes: list) -> str:
+        """显式确认后的兜底：保留整体层原文，按分卷库生成标准「### 分卷N：卷名」段。
+
+        这是唯一会改变标题形态的路径，必须由 UI 弹窗确认后才调用。
+        """
+        parsed = Pipeline.parse_synopsis_volumes(content or "")
+        overview = (parsed.get("overview") or "").strip()
+        split = Pipeline._split_markdown_volume_sections(content or "")
+        prefix = (split["prefix"] if split else "").strip() or overview
+        parts = [prefix, ""] if prefix else []
+        for i, v in enumerate(volumes or [], 1):
+            t = (v.get("title") or "").strip()
+            b = (v.get("summary") or "").strip()
+            parts.append(f"### 分卷{i}" + (f"：{t}" if t else ""))
+            if b:
+                parts.append(b)
+            parts.append("")
+        return "\n".join(parts).rstrip() + "\n"
+
+    @staticmethod
+    def detect_synopsis_volume_style(content: str) -> str:
+        """总纲分卷段形态：markdown / marker(■) / bare(裸行) / none。"""
+        content = content or ""
+        if _SYN_VOL_HEADING_NUM_RE.search(content):
+            return "markdown"
+        if re.search(r"^[ \t]*■[ \t]*分卷", content, re.M):
+            return "marker"
+        if _split_bare_synopsis_volumes(content) is not None:
+            return "bare"
+        return "none"
 
     @staticmethod
     def parse_volume_chapters(text: str, limit: int = 50, min_chars: int = 0):
@@ -3885,6 +4387,14 @@ class Pipeline:
                 if content:
                     cands.append({"title": title, "content": content})
             return cands, None
+        # 迭代增量化输出（2026-11-09 老板实测丢稿修复）：模型按迭代协议只输出
+        # 【迭代评估】+【修订内容】，没有『# 方案N』一级标题，但修订内容里有
+        # 『## 整体层』。若走下面「从 ## 整体层 截取正式输出块」的兜底，评估清单会被
+        # 整段砍掉；调用方 parse_iter_review 再找不到协议标记，就当「模型没按协议」
+        # 静默降级成全量落库 → 只把修订片段存成总纲，未改的卷与整体层小节全丢。
+        # 协议标记齐全时整篇作唯一候选，原样交给增量合成。
+        if _ITER_EVAL_MARK_RE.search(text) and _ITER_BODY_MARK_RE.search(text):
+            return [{"title": "总纲", "content": text}], None
         # 单份总纲（无 # 方案N 分隔）：定位正式输出块（## 整体层 起），作为唯一候选
         if re.search(r"^\s*##\s*整体层", text, re.M):
             m = re.search(r"^\s*##\s*整体层", text, re.M)

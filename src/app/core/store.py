@@ -301,10 +301,15 @@ class ProjectStore(QObject):
 
     texts_changed(int) 信号：某章正文被「接受」落库后发出（参数=章节 id），
     供写作台在后台/自动模式落库后安全刷新编辑器。草稿保存不发（那是内存态）。
+
+    volumes_changed / synopsis_changed 信号（2026-11-09 分卷编排台）：分卷结构
+    （插入/删除/拖拽/改名/内容）与总纲 content 就地写回后发出，供总纲页自动刷新。
     """
 
     chapters_changed = Signal()
     texts_changed = Signal(int)
+    volumes_changed = Signal()
+    synopsis_changed = Signal()
 
     def __init__(self, folder: str, global_store: GlobalStore | None = None):
         super().__init__()
@@ -674,6 +679,198 @@ class ProjectStore(QObject):
         self.update_synopsis_in_place(new_content, s.get("title") or "")
         return True
 
+    # ---------- 分卷编排台：结构同步与增强写回（2026-11-09） ----------
+
+    def _write_synopsis_content_in_tx(self, content: str, title: str) -> bool:
+        """事务内只改 synopsis.content/title/updated_at + 锁定指纹。
+
+        仅供结构同步调用；事务内必须用 self.conn.execute（_exec/set_meta 的
+        commit 会拆散事务）。不调 _resync_volumes_from_synopsis。
+        """
+        row = self.conn.execute(
+            "SELECT id,title FROM synopsis ORDER BY version DESC LIMIT 1").fetchone()
+        if not row:
+            return False
+        self.conn.execute(
+            "UPDATE synopsis SET content=?, title=?, updated_at=? WHERE id=?",
+            (content, title, db.now(), row["id"]))
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("last_locked_synopsis_fingerprint", self.synopsis_fingerprint(content)))
+        return True
+
+    def _update_synopsis_content_only(self, content: str, title: str = "") -> dict | None:
+        """结构同步专用（非事务版）：只就地改总纲内容，**跳过 resync**。
+
+        绝不能走 update_synopsis_in_place()：它的
+        _resync_volumes_from_synopsis 按「库中第几卷 ↔ 总纲分卷N」位置比对
+        新旧段；插卷/拖拽后第 N 段语义已变，会错误回写分卷行并凭空生成
+        volume_versions 快照（2026-11-09 复核确认）。
+        """
+        r = self.current_synopsis()
+        if not r:
+            return None
+        self._exec("UPDATE synopsis SET content=?, title=?, updated_at=? WHERE id=?",
+                   (content, title, db.now(), r["id"]))
+        self.set_meta("last_locked_synopsis_fingerprint",
+                      self.synopsis_fingerprint(content))
+        return self._one("SELECT * FROM synopsis WHERE id=?", (r["id"],))
+
+    def _sync_sections_in_tx(self, op: str, *, expected_before=None,
+                             at_index=None, index=None, order=None,
+                             title="", body="") -> dict:
+        """在调用方事务内，以分卷库结构为源同步总纲分卷段。
+
+        expected_before = 结构改动**之前**的卷数，用来核对总纲段数是否对得上
+        （None = 不核对，供 renumber 修历史错位用）。对不上 / 非 Markdown 形态
+        → ok=False，交 UI 显式确认重建，绝不静默改写手写的总纲。
+        """
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        row = self.conn.execute(
+            "SELECT * FROM synopsis ORDER BY version DESC LIMIT 1").fetchone()
+        if not row or not (row["content"] or "").strip():
+            return {"ok": True, "action": "no_synopsis", "reason": ""}
+        content = row["content"]
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return {"ok": False, "action": "unsupported",
+                    "reason": Pipeline.detect_synopsis_volume_style(content)}
+        if expected_before is not None and len(split["segs"]) != int(expected_before):
+            return {"ok": False, "action": "mismatch",
+                    "reason": f"总纲 {len(split['segs'])} 段 / 改前 {expected_before} 卷"}
+        if op == "insert":
+            new = Pipeline.insert_synopsis_volume(content, at_index, title, body)
+        elif op == "delete":
+            new = Pipeline.delete_synopsis_volume(content, index)
+        elif op == "reorder":
+            new = Pipeline.reorder_synopsis_volumes(content, order)
+        elif op == "renumber":
+            new = Pipeline.renumber_synopsis_volume_headings(content)
+        else:
+            return {"ok": False, "action": "unknown_op", "reason": str(op)}
+        if new is None:
+            return {"ok": False, "action": "failed", "reason": str(op)}
+        if new != content:
+            self._write_synopsis_content_in_tx(new, row["title"] or "")
+        return {"ok": True, "action": op, "reason": ""}
+
+    def sync_synopsis_volume_sections(self, *, op: str, **kw) -> dict:
+        """公开入口：显式同步/重建总纲分卷区（供编排台「重建分卷区」按钮）。"""
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        with self._transaction():
+            row = self.conn.execute(
+                "SELECT * FROM synopsis ORDER BY version DESC LIMIT 1").fetchone()
+            if not row or not (row["content"] or "").strip():
+                res = {"ok": True, "action": "no_synopsis", "reason": ""}
+            elif op == "rebuild":
+                vols = [dict(x) for x in self.conn.execute(
+                    "SELECT * FROM volumes ORDER BY order_index,id")]
+                new = Pipeline.rebuild_synopsis_volume_sections(row["content"], vols)
+                self._write_synopsis_content_in_tx(new, row["title"] or "")
+                # 重建会改标题形态：全部卷的 synopsis_synced 基线一起重算，
+                # 否则注入覆盖仲裁会按旧基线误判「分卷侧修订」。
+                for v in vols:
+                    base = self._volume_synced_base(v.get("title") or "",
+                                                    v.get("summary") or "")
+                    self.conn.execute("UPDATE volumes SET synopsis_synced=? WHERE id=?",
+                                      (base, v["id"]))
+                res = {"ok": True, "action": "rebuild", "reason": ""}
+            else:
+                n = len(self.conn.execute("SELECT id FROM volumes").fetchall())
+                kw.setdefault("expected_before", None if op == "renumber" else n)
+                res = self._sync_sections_in_tx(op, **kw)
+        if res.get("ok"):
+            self.synopsis_changed.emit()
+            self.volumes_changed.emit()
+        return res
+
+    def _reconcile_sections(self, content: str, rows: list) -> str | None:
+        """兜底：总纲段数与分卷库不一致时，尾部补齐/裁掉，段体逐字不动。"""
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        split = Pipeline._split_markdown_volume_sections(content)
+        if split is None:
+            return None
+        cur = content
+        n, target = len(split["segs"]), len(rows)
+        if n < target:
+            for k in range(n, target):
+                v = rows[k]
+                nxt = Pipeline.insert_synopsis_volume(
+                    cur, k + 1, v.get("title") or "", v.get("summary") or "")
+                if nxt is None:
+                    return None
+                cur = nxt
+        elif n > target:
+            for k in range(n, target, -1):
+                nxt = Pipeline.delete_synopsis_volume(cur, k)
+                if nxt is None:
+                    return None
+                cur = nxt
+        return cur
+
+    def push_volume_to_synopsis_ex(self, volume_id: int) -> dict:
+        """分卷写回总纲本卷段的增强版：带兜底链、返回结构化结果，绝不静默失败。
+
+        精确 replace → 失败先规范段号再试 → 仍失败且 Markdown 形态则补齐/裁掉
+        多余段再试 → 非 Markdown 形态返回 needs_rebuild=True 由 UI 弹窗确认重建。
+        """
+        from .pipeline import Pipeline  # 延迟导入避免循环依赖
+        base = {"ok": False, "created_section": False, "renumbered": False,
+                "reason": "", "needs_rebuild": False}
+        s = self.current_synopsis()
+        if not s or not (s.get("content") or "").strip():
+            return {**base, "reason": "no_synopsis"}
+        rows = self.list_volumes()
+        idx = next((i for i, x in enumerate(rows, 1) if x["id"] == volume_id), None)
+        if idx is None:
+            return {**base, "reason": "volume_not_found"}
+        vol = rows[idx - 1]
+        title = (vol.get("title") or "").strip()
+        body = (vol.get("summary") or "").strip()
+        if not body:
+            return {**base, "reason": "empty_summary"}
+        content = s["content"]
+        new_content = Pipeline.replace_synopsis_volume(content, idx, title, body)
+        used_fallback = False
+        renumbered = False
+        created = False
+        if new_content is None:
+            fixed = Pipeline.renumber_synopsis_volume_headings(content)
+            if fixed and fixed != content:
+                new_content = Pipeline.replace_synopsis_volume(fixed, idx, title, body)
+                renumbered = new_content is not None
+                used_fallback = True
+        if new_content is None:
+            style = Pipeline.detect_synopsis_volume_style(content)
+            if style == "markdown":
+                rebuilt = self._reconcile_sections(content, rows)
+                if rebuilt:
+                    new_content = Pipeline.replace_synopsis_volume(
+                        rebuilt, idx, title, body)
+                    created = new_content is not None
+                    used_fallback = True
+                if new_content is None:
+                    return {**base, "reason": "section_mismatch",
+                            "needs_rebuild": True}
+            else:
+                return {**base, "reason": "unsupported_style:" + style,
+                        "needs_rebuild": True}
+        if new_content == content:
+            return {**base, "ok": True, "renumbered": renumbered,
+                    "created_section": created}
+        if used_fallback:
+            # 兜底路径改了段结构，绝不能走 resync（会按位置错误回写分卷行），
+            # 改为只写 content + 手动推进本卷基线。
+            self._update_synopsis_content_only(new_content, s.get("title") or "")
+            self._exec("UPDATE volumes SET synopsis_synced=? WHERE id=?",
+                       (self._volume_synced_base(title, body), volume_id))
+        else:
+            self.update_synopsis_in_place(new_content, s.get("title") or "")
+        self.synopsis_changed.emit()
+        return {**base, "ok": True, "renumbered": renumbered,
+                "created_section": created}
+
     # ---------- 章节 ----------
 
     def list_chapters(self, include_trash: bool = False) -> list[dict]:
@@ -759,8 +956,18 @@ class ProjectStore(QObject):
         更新时：data 未带 target_chapters 则保留原值（分卷页只编辑卷名+描述）；
         内容有任何变化自动把旧版存入 volume_versions 并递增 version
         （分卷迭代/手改都走此入口，历史可回看、可载入）。
+        新增时若带 at_index / before_id → 转 insert_volume 在指定位置插入
+        （后续卷号自动顺延）；否则沿用「追加到末尾」。
         """
+        if not data.get("id") and (data.get("at_index") or data.get("before_id")):
+            at = data.get("at_index")
+            if not at and data.get("before_id"):
+                at = next((i for i, v in enumerate(self.list_volumes(), 1)
+                           if v["id"] == data["before_id"]), None)
+            if at:
+                return self.insert_volume(int(at), data)
         created = db.now()
+        ret = None
         if data.get("id"):
             old = self.get_volume(data["id"])
             if old is None:
@@ -769,15 +976,65 @@ class ProjectStore(QObject):
                       else old.get("target_chapters"))
             self._update_volume_row(old, data.get("title", ""),
                                     data.get("summary", ""), target)
-            return self.get_volume(data["id"])
-        maxidx = self._one("SELECT COALESCE(MAX(order_index),0) AS m FROM volumes")
-        order = int(maxidx["m"]) + 1 if maxidx else 1
-        cur = self._exec(
-            "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (order, data.get("title", ""), data.get("summary", ""),
-             data.get("target_chapters"), created, created))
-        return self.get_volume(cur.lastrowid)
+            ret = self.get_volume(data["id"])
+        else:
+            maxidx = self._one("SELECT COALESCE(MAX(order_index),0) AS m FROM volumes")
+            order = int(maxidx["m"]) + 1 if maxidx else 1
+            cur = self._exec(
+                "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (order, data.get("title", ""), data.get("summary", ""),
+                 data.get("target_chapters"), created, created))
+            ret = self.get_volume(cur.lastrowid)
+        self.volumes_changed.emit()
+        return ret
+
+    def _renumber_volumes_in_tx(self) -> None:
+        """事务内把 order_index 归一成 1..n（消除删卷/插入留下的跳号）。"""
+        rows = self.conn.execute(
+            "SELECT id FROM volumes ORDER BY order_index,id").fetchall()
+        for i, r in enumerate(rows, 1):
+            self.conn.execute("UPDATE volumes SET order_index=? WHERE id=?",
+                              (i, r["id"]))
+
+    def renumber_volumes(self) -> None:
+        """公开版：归一卷号并发信号（供编排台/修复脚本调用）。"""
+        with self._transaction():
+            self._renumber_volumes_in_tx()
+        self.volumes_changed.emit()
+
+    def insert_volume(self, at_index: int, data: dict) -> dict:
+        """在第 at_index 位插入新卷（1-based，1..n+1），后续卷号自动顺延。
+
+        单个事务内完成：总纲分卷段同步 → 后续 order_index+1 → INSERT →
+        归一 1..n；事务提交后发 volumes_changed / synopsis_changed。
+        章节归属（chapters.volume_id）不动。同步失败的结果存
+        self.last_section_sync，由 UI 显式提示「重建分卷区」。
+        """
+        with self._transaction():
+            rows = self.conn.execute(
+                "SELECT id FROM volumes ORDER BY order_index,id").fetchall()
+            n = len(rows)
+            pos = max(1, min(int(at_index), n + 1))
+            title = (data.get("title") or "").strip()
+            body = (data.get("summary") or "").strip()
+            sync = self._sync_sections_in_tx(
+                "insert", expected_before=n, at_index=pos, title=title, body=body)
+            self.conn.execute(
+                "UPDATE volumes SET order_index=order_index+1 WHERE order_index>=?",
+                (pos,))
+            created = db.now()
+            cur = self.conn.execute(
+                "INSERT INTO volumes(order_index,title,summary,target_chapters,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (pos, title, body, data.get("target_chapters"), created, created))
+            new_id = cur.lastrowid
+            self._renumber_volumes_in_tx()
+        self.last_section_sync = sync
+        self.volumes_changed.emit()
+        if sync.get("ok") and sync.get("action") != "no_synopsis":
+            self.synopsis_changed.emit()
+        return self.get_volume(new_id)
 
     def list_volume_versions(self, volume_id: int) -> list[dict]:
         """本卷历史版本（被替换下来的旧版，按版本号降序；无则空表）。"""
@@ -1050,19 +1307,54 @@ class ProjectStore(QObject):
         return saved
 
     def delete_volume(self, volume_id: int):
-        """删除分卷：其下章节归入未分卷（volume_id=NULL）；版本历史一并清除。"""
-        # 事务内必须用 self.conn.execute：_exec 自带 commit 会提前结束事务，
-        # 导致「章节已脱离卷」先落库而「删卷」失败时留下孤儿数据。
+        """删除分卷：章节归入未分卷、历史清除、卷号回补 1..n-1、总纲本卷段移除。
+
+        事务内必须用 self.conn.execute：_exec 自带 commit 会提前结束事务，
+        导致「章节已脱离卷」先落库而「删卷」失败时留下孤儿数据。
+        """
         with self._transaction():
-            self.conn.execute("UPDATE chapters SET volume_id=NULL WHERE volume_id=?", (volume_id,))
-            self.conn.execute("DELETE FROM volume_versions WHERE volume_id=?", (volume_id,))
+            rows = self.conn.execute(
+                "SELECT id FROM volumes ORDER BY order_index,id").fetchall()
+            ids = [r["id"] for r in rows]
+            idx = ids.index(volume_id) + 1 if volume_id in ids else None
+            sync = (self._sync_sections_in_tx(
+                "delete", expected_before=len(ids), index=idx)
+                if idx else {"ok": True, "action": "no_op", "reason": ""})
+            self.conn.execute("UPDATE chapters SET volume_id=NULL WHERE volume_id=?",
+                              (volume_id,))
+            self.conn.execute("DELETE FROM volume_versions WHERE volume_id=?",
+                              (volume_id,))
             self.conn.execute("DELETE FROM volumes WHERE id=?", (volume_id,))
+            self._renumber_volumes_in_tx()
+        self.last_section_sync = sync
         self.chapters_changed.emit()
+        self.volumes_changed.emit()
+        if sync.get("ok") and sync.get("action") not in ("no_synopsis", "no_op"):
+            self.synopsis_changed.emit()
 
     def reorder_volumes(self, ids: list[int]):
+        """按传入 id 列表重排卷序：写 order_index=1..n 并同步重排总纲分卷段。
+
+        总纲段必须跟着重排，否则「库中第几卷 ↔ 总纲分卷N」会错位串卷。
+        chapters.volume_id 不动（章按卷 id 归属，与卷号解耦）。
+        """
         with self._transaction():
+            rows = self.conn.execute(
+                "SELECT id FROM volumes ORDER BY order_index,id").fetchall()
+            old_ids = [r["id"] for r in rows]
+            if sorted(ids) != sorted(old_ids):
+                raise ValueError("reorder_volumes: ids 与现存分卷集合不一致")
+            old_pos = {vid: i for i, vid in enumerate(old_ids, 1)}
+            order = [old_pos[vid] for vid in ids]
+            sync = self._sync_sections_in_tx(
+                "reorder", expected_before=len(old_ids), order=order)
             for i, vid in enumerate(ids, 1):
-                self.conn.execute("UPDATE volumes SET order_index=? WHERE id=?", (i, vid))
+                self.conn.execute("UPDATE volumes SET order_index=? WHERE id=?",
+                                  (i, vid))
+        self.last_section_sync = sync
+        self.volumes_changed.emit()
+        if sync.get("ok") and sync.get("action") != "no_synopsis":
+            self.synopsis_changed.emit()
 
     def set_chapter_volume(self, chapter_id: int, volume_id: int | None):
         self._exec("UPDATE chapters SET volume_id=?, updated_at=? WHERE id=?",
@@ -1146,6 +1438,33 @@ class ProjectStore(QObject):
             if not title and not summary:
                 continue
             lines.append(f"第{i}卷｜{title}" + (f"\n{summary[:2000]}" if summary else ""))
+        return "\n\n".join(lines)
+
+    def get_volume_global_view(self, volume_id: int | None,
+                               cap: int | None = None) -> str:
+        """全书所有分卷现状（含本卷），供 volume_iter 的「全局视野」注入。
+
+        与 get_all_volumes_summary 的区别：含本卷及其后各卷、标注本次要迭代
+        的卷、默认不截断（迭代单卷时要能看到全书框架）。cap 只作保险，
+        截断必须写可见标记，绝不悄悄删内容。
+        """
+        rows = self.list_volumes()
+        if not rows:
+            return ""
+        lines = [f"【全书分卷现状（共 {len(rows)} 卷，含本卷；仅供全局参照，"
+                 f"不得改写其它卷）】"]
+        for i, v in enumerate(rows, 1):
+            title = (v.get("title") or f"第{i}卷").strip()
+            summary = (v.get("summary") or "").strip()
+            mark = " ◀ 本次要迭代" if volume_id and v["id"] == volume_id else ""
+            lines.append(f"第{i}卷｜{title}{mark}")
+            if not summary:
+                lines.append("（本卷尚无分卷描述）")
+            elif cap and len(summary) > cap:
+                lines.append(summary[:cap]
+                             + f"\n（本卷描述较长，已截断 {len(summary) - cap} 字）")
+            else:
+                lines.append(summary)
         return "\n\n".join(lines)
 
     def replace_all_volumes(self, volumes: list[dict]) -> list[dict]:
@@ -2343,6 +2662,29 @@ class ProjectStore(QObject):
     def memory_vector_count(self) -> int:
         r = self._one("SELECT COUNT(*) AS n FROM memory_vectors")
         return int(r["n"]) if r else 0
+
+    def memory_vector_revision(self) -> str | None:
+        """语义检索跨次缓存用的「向量库版本签名」（2026-11-09）。
+
+        只做一条轻量 SQL，绝不把向量内容读进 Python —— 命中缓存时连
+        json.loads 全量向量都省掉。归档（新增版本）、回滚（stale 变化）、
+        重建（文本/向量长度变化）都会改变其中至少一项 → 缓存自动失效。
+        返回 None 表示查询异常，调用方应跳过跨次缓存、照旧走原逻辑。
+        """
+        try:
+            r = self._one(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(v.snapshot_version),0) AS mv,"
+                " COALESCE(SUM(LENGTH(v.text)),0) AS tl,"
+                " COALESCE(SUM(LENGTH(v.vector)),0) AS vl"
+                " FROM memory_vectors v"
+                " JOIN memory_snapshots s ON s.version=v.snapshot_version"
+                " WHERE s.stale=0")
+            if not r:
+                return "0:0:0:0"
+            return (f"{int(r['n'])}:{int(r['mv'])}:"
+                    f"{int(r['tl'])}:{int(r['vl'])}")
+        except Exception:
+            return None
 
     def rebuild_memory_vectors(self, embed_fn) -> int:
         """重建全部未过期快照的记忆向量（记忆页「重建语义向量」用）。

@@ -40,8 +40,9 @@ def start_generation(page, session, *, role, context, task, title, on_done,
         return
 
     def _send(extra: str):
+        # 2026-11-09 起手动生成一律出新的（旧稿去日志拿），不再传 use_cache=True
         _execute(page, pipe, role, context, task, title, on_done, on_text,
-                 bare_profile, max_tokens, extra, on_started, use_cache=True,
+                 bare_profile, max_tokens, extra, on_started, use_cache=False,
                  continue_round=continue_round)
 
     preview_sheet(page, build, profile, route, _send, title=title)
@@ -60,9 +61,8 @@ def _execute(page, pipe, role, context, task, title, on_done, on_text,
                 bare_profile, task, stream=True, on_chunk=tk._chunk,
                 stop_event=tk.stop_event, max_tokens=max_tokens,
                 extra=extra or "", continue_round=continue_round)
-        # 生成结果缓存（2026-10-27）：手动生成（preview=True 路径）按指纹复用
-        # 相同请求的上次完整结果；preview=False 是⚡自动模式，绝不缓存
-        # （失败重试不能拿到同一个坏结果）。开关判定在内核 pipeline.run 内。
+        # 生成结果缓存已于 2026-11-09 从所有手动生成链路摘除（老板：再点生成要新的，
+        # 旧稿去请求日志拿）；use_cache 参数保留给底层能力，两端调用点一律传 False。
         return pipe.run(
             role, ctx, task, stream=True, on_chunk=tk._chunk,
             stop_event=tk.stop_event, max_tokens=max_tokens, use_cache=use_cache,

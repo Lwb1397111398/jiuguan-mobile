@@ -67,8 +67,11 @@ GLOBAL_SETTING_DEFAULTS = {
     "rerank_model": "",                  # 重排模型名（如 bge-reranker-v2-m3 / gte-rerank-v2）
     "rerank_top_n": "5",                 # 精排后保留的记忆条数（1~10）
     "rerank_min_score": "0",             # 最低相关分：0=只排序不淘汰（各家分数分布不同，非 0 时低于该分的记忆不注入）
-    # ---------- 生成结果缓存（2026-10-27）----------
-    "regen_cache_enabled": "1",          # 手动重复生成时复用相同请求的上次完整结果（0=关；命中时 0 调用 0 费用，可点「重新生成」强制重跑）
+    # ---------- 生成结果缓存（2026-10-27；2026-11-09 起默认停用）----------
+    # 老板拍板：没接受的生成结果＝不满意，再点生成要的是新结果，旧稿到请求日志里取。
+    # 手动生成链路（桌面 common.run_generation / 手机 gen._execute）已不再传 use_cache，
+    # 底层 Pipeline.run(use_cache=True) 与缓存表保留供底层用例验证，默认 0 是第二道保险。
+    "regen_cache_enabled": "0",          # 0=关（默认）；置 1 才启用底层复用，UI 不再提供该开关
     "prose_mode": "chapter",             # 正文写法：chapter=一次性（整章一次写完，默认）/ batch=分批（按细纲块接力）/ outline=按大纲直写（不生成细纲，2026-10-17）
     "batch_split_by": "count",           # 分批口径：count=按计划总批数（默认，程序用 ceil(总数/批数) 算每批几项）/ size=按每批数量（旧口径）
     "prose_batch_size": "3",             # 分批模式每批覆盖的细纲块数（仅 batch_split_by=size 生效；1~8，末批可少）

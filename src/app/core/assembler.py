@@ -6,7 +6,9 @@ UI 在发送前展示；超预算时从低优先级模块开始裁剪，被裁�
 """
 import json
 import re
+import threading
 
+from . import retrieval_cache
 from .api import estimate_tokens, estimate_cost
 from .db import DEFAULT_CONTEXT_LENGTH
 from .draft_check import build_draft_text
@@ -362,7 +364,158 @@ class Assembler:
             parts.append("人物：" + "、".join(str(n) for n in names[:10]))
         return "\n".join(parts).strip()
 
-    def _semantic_pack(self, stage: str, context: dict) -> tuple[str, dict]:
+    # 2026-11-09：GUI 线程冷启动查询用短超时（预览框弹出前不该长时间卡住），
+    # 后台预热/归档链路用完整 30 秒；接口失败时后台自动补齐缓存。
+    _RETRIEVAL_UI_TIMEOUT = 12
+    _RETRIEVAL_BG_TIMEOUT = 30
+    # 本批范围词面重合达到该比例才前置（低于它就是噪声，保持原分数顺序）
+    _HINT_OVERLAP_MIN = 0.12
+
+    def _retrieval_batch_hint(self, context: dict) -> str:
+        """分批写作的「本批范围」文本（2026-11-09）。
+
+        只用于本地词面前置，**不进向量/重排请求**：分批各批共用同一份章级 query，
+        网络调用整章只跑一次；注入的【相关记忆】顺序再按本批范围做零成本调整。
+        非分批路径返回空串 = 完全保持旧行为。
+        """
+        parts: list[str] = []
+        txt = context.get("outline_batch_text")
+        if isinstance(txt, str) and txt.strip():
+            parts.append(txt.strip()[:300])
+        ids = context.get("batch_block_ids")
+        plan = context.get("chapter_plan") or []
+        if ids and plan:
+            for item in plan:
+                real = item[0] if isinstance(item, tuple) else item
+                if not isinstance(real, dict) or real.get("id") not in ids:
+                    continue
+                for k in ("must_have", "content", "summary"):
+                    v = real.get(k)
+                    if isinstance(v, (list, tuple)):
+                        v = "、".join(str(x) for x in v)
+                    if v:
+                        parts.append(str(v)[:120])
+                if sum(len(p) for p in parts) >= 300:
+                    break
+        return "\n".join(parts)[:300].strip()
+
+    @staticmethod
+    def _hint_bigrams(text: str) -> set:
+        s = re.sub(r"[^\u4e00-\u9fff]", "", text or "")
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+    def _boost_by_hint(self, hits: list, hint: str) -> list:
+        """与本批范围有词面重合的记忆稳定前置（不改分数、不改召回内容）。"""
+        if not hint or len(hits) < 2:
+            return hits
+        hg = self._hint_bigrams(hint)
+        if not hg:
+            return hits
+
+        def sort_key(pair):
+            i, (_s, u) = pair
+            overlap = len(hg & self._hint_bigrams(str(u.get("text") or ""))) / len(hg)
+            return (0 if overlap >= self._HINT_OVERLAP_MIN else 1, i)
+
+        return [h for _, h in sorted(enumerate(hits), key=sort_key)]
+
+    @staticmethod
+    def _slim_units(hits: list) -> list:
+        """缓存用：去掉体积最大的 vector 字段，其余原样保留。"""
+        return [[float(s), {k: v for k, v in u.items() if k != "vector"}]
+                for s, u in hits]
+
+    def _compute_hits(self, query: str, embed: dict, rk: dict | None,
+                      timeout: int) -> tuple[list, str, bool]:
+        """真正跑向量 + 重排：返回 (hits, 分数标签, 结果是否可信)。
+
+        可信=False 表示嵌入接口失败或重排调用失败回退纯余弦：本次结果照样用，
+        但**绝不写跨次缓存**（不把降级结果固化、下次仍能重试接口）。
+        无向量索引 / 余弦确实无命中都算可信（归档后版本签名变化会自动失效）。
+        """
+        units = self.store.all_memory_vectors()
+        if not units:
+            return [], "相似度", True
+        qv = embed_one(embed["base_url"], embed["api_key"], embed["model"],
+                       query, timeout=timeout)
+        if not qv:
+            return [], "相似度", False
+        scored = sorted(((cosine_similarity(qv, u["vector"]), u) for u in units),
+                        key=lambda x: (x[0], x[1].get("snapshot_version") or 0),
+                        reverse=True)
+        # rerank 二次精排（2026-10-26）：余弦只衡量「用词像不像」，分不清「同一话题」
+        # 和「同一写作意图」——宽召回（不看 0.25 阈值，取余弦 top N，同名去重保留
+        # 余弦最高）后由重排模型逐条打相关分，按分精挑。未启用 / 未配置 / 调用失败
+        # 一律回退旧路径（0.25 阈值 + 去重 + top5），与未加精排时行为完全一致。
+        rerank_used = False
+        trustworthy = True
+        hits: list | None = None
+        if rk:
+            cands: list = []
+            cand_keys: set = set()
+            for s, u in scored:
+                key = str(u.get("unit_key") or id(u))
+                if key in cand_keys:
+                    continue
+                cand_keys.add(key)
+                cands.append((s, u))
+                if len(cands) >= RERANK_CANDIDATES:
+                    break
+            ranked = rerank_documents(
+                rk["base_url"], rk["api_key"], rk["model"], query,
+                [u["text"][:RERANK_DOC_MAX_CHARS] for _, u in cands],
+                timeout=timeout)
+            if ranked:
+                picked = [r for r in ranked
+                          if rk["min_score"] <= 0 or r["score"] >= rk["min_score"]]
+                hits = [(r["score"], cands[r["index"]][1])
+                        for r in picked[:rk["top_n"]]
+                        if 0 <= r["index"] < len(cands)]
+                rerank_used = True
+            else:
+                trustworthy = False   # 重排失败 → 本次降级，但下次要能重试
+        if hits is None:
+            # 旧路径：阈值按实测分布取 0.25（llama-nemotron 等嵌入模型相关片段
+            # 约 0.3+，无关约 0.1）。同名去重（2026-09-08）：每个快照版本各存一份
+            # char:XXX 单元，不去重会把同一角色的多个历史版本全部召回、提示词里
+            # 重复注入。按 unit_key 只留相似度最高的那条——相似度最高的即与当前
+            # 剧情最相关（通常也是最新版本）。
+            hits = []
+            seen_keys: set = set()
+            for s, u in scored:
+                if s < 0.25:
+                    break
+                key = str(u.get("unit_key") or id(u))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                hits.append((s, u))
+                if len(hits) >= 5:
+                    break
+        return hits, ("相关度" if rerank_used else "相似度"), trustworthy
+
+    def _retry_retrieval_in_background(self, query: str, embed: dict,
+                                       rk: dict | None, project: str,
+                                       key: str | None):
+        """GUI 冷启动查询失败 → 后台用完整超时重算一次并写缓存（静默，绝不抛）。"""
+        def worker():
+            try:
+                if getattr(self.store, "is_closed", False):
+                    return
+                hits, label, trustworthy = self._compute_hits(
+                    query, embed, rk, self._RETRIEVAL_BG_TIMEOUT)
+                if trustworthy and key:
+                    retrieval_cache.put(project, key, {
+                        "hits": self._slim_units(hits), "score_label": label})
+            except Exception:
+                return
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            return
+
+    def _semantic_pack(self, stage: str, context: dict,
+                       prefetch: bool = False) -> tuple[str, dict]:
         """语义检索一次调用产出两样东西（2026-09-08 向量×词面协同唤醒）：
 
         1. text：注入【相关记忆（语义检索）】模块的情节参考文本；
@@ -378,15 +531,19 @@ class Assembler:
         配置了重排模型（rerank_enabled=1）时召回走二次精排：余弦宽取 top 24 候选
         → 重排按相关度精挑；重排失败/关闭自动回退纯余弦路径（0.25 阈值 + top5）。
 
-        性能：按 (章, 块) 缓存在 build 实例内（同章多块共享一次 embed 调用
-        与一次全量余弦扫描，大书 4650 向量单元纯 Python 余弦数百 ms）；
-        失败/空结果同样缓存（防同 build 重算、防重试反复打挂掉的嵌入接口）。
+        缓存两层（2026-11-09）：
+        - L1 实例级，按 (章, 块, 改写, 本批范围) 缓存最终结果，避免同一次 build
+          的预览/执行两遍组装重复计算；失败/空同样缓存（防反复打挂掉的接口）。
+        - L2 进程级（core/retrieval_cache.py），按「章级 query + 嵌入/重排配置
+          + 向量库版本签名」缓存召回结果，跨次生成、跨批次共享：提示词没变就
+          0 次嵌入 / 0 次重排。归档/回滚/重建向量、换模型、换 query 自动失效。
+          接口失败或重排降级不写 L2（下次仍会重试）。
         """
-        # 缓存键：章 id + 块 id（同章同块复用；无块用 0；改写用章 id）
+        hint = self._retrieval_batch_hint(context)
         chapter = context.get("chapter") or {}
         block = context.get("block") or {}
         cache_key = (chapter.get("id") or 0, block.get("id") or 0,
-                     bool(context.get("rewrite_text")))
+                     bool(context.get("rewrite_text")), hint)
         if not hasattr(self, "_retrieval_cache"):
             self._retrieval_cache: dict = {}
         if cache_key in self._retrieval_cache:
@@ -397,71 +554,35 @@ class Assembler:
             if not embed:
                 self._retrieval_cache[cache_key] = empty
                 return empty
-            units = self.store.all_memory_vectors()
-            if not units:
-                self._retrieval_cache[cache_key] = empty
-                return empty
             query = self._retrieval_query(stage, context)
             if len(query) < 10:
                 self._retrieval_cache[cache_key] = empty
                 return empty
-            qv = embed_one(embed["base_url"], embed["api_key"], embed["model"], query)
-            if not qv:
-                self._retrieval_cache[cache_key] = empty
-                return empty
-            scored = sorted(((cosine_similarity(qv, u["vector"]), u) for u in units),
-                            key=lambda x: (x[0], x[1].get("snapshot_version") or 0),
-                            reverse=True)
-            # rerank 二次精排（2026-10-26）：余弦只衡量「用词像不像」，分不清「同一话题」
-            # 和「同一写作意图」——宽召回（不看 0.25 阈值，取余弦 top N，同名去重保留
-            # 余弦最高）后由重排模型逐条打相关分，按分精挑。未启用 / 未配置 / 调用失败
-            # 一律回退旧路径（0.25 阈值 + 去重 + top5），与未加精排时行为完全一致。
-            rerank_used = False
-            hits: list[tuple[float, dict]] | None = None
             rk = load_rerank_config(self.store)
-            if rk:
-                cands: list[tuple[float, dict]] = []
-                cand_keys: set = set()
-                for s, u in scored:
-                    key = str(u.get("unit_key") or id(u))
-                    if key in cand_keys:
-                        continue
-                    cand_keys.add(key)
-                    cands.append((s, u))
-                    if len(cands) >= RERANK_CANDIDATES:
-                        break
-                ranked = rerank_documents(
-                    rk["base_url"], rk["api_key"], rk["model"], query,
-                    [u["text"][:RERANK_DOC_MAX_CHARS] for _, u in cands])
-                if ranked:
-                    picked = [r for r in ranked
-                              if rk["min_score"] <= 0 or r["score"] >= rk["min_score"]]
-                    hits = [(r["score"], cands[r["index"]][1])
-                            for r in picked[:rk["top_n"]]
-                            if 0 <= r["index"] < len(cands)]
-                    rerank_used = True
-            if hits is None:
-                # 旧路径：阈值按实测分布取 0.25（llama-nemotron 等嵌入模型相关片段
-                # 约 0.3+，无关约 0.1）。同名去重（2026-09-08）：每个快照版本各存一份
-                # char:XXX 单元，不去重会把同一角色的多个历史版本全部召回、提示词里
-                # 重复注入。按 unit_key 只留相似度最高的那条——相似度最高的即与当前
-                # 剧情最相关（通常也是最新版本）。
-                hits = []
-                seen_keys: set = set()
-                for s, u in scored:
-                    if s < 0.25:
-                        break
-                    key = str(u.get("unit_key") or id(u))
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    hits.append((s, u))
-                    if len(hits) >= 5:
-                        break
+            project = retrieval_cache.project_key(self.store)
+            rev = self.store.memory_vector_revision()
+            key = (retrieval_cache.make_key(query, embed, rk, rev)
+                   if rev is not None else None)
+            payload = retrieval_cache.get(project, key) if key else None
+            if payload is not None:
+                # 命中：连全量向量都不读，直接复用上次的召回结果
+                hits = [(float(s), dict(u)) for s, u in payload.get("hits", [])]
+                score_label = payload.get("score_label", "相似度")
+            else:
+                timeout = (self._RETRIEVAL_BG_TIMEOUT if prefetch
+                           else self._RETRIEVAL_UI_TIMEOUT)
+                hits, score_label, trustworthy = self._compute_hits(
+                    query, embed, rk, timeout)
+                if not trustworthy and not prefetch:
+                    self._retry_retrieval_in_background(query, embed, rk, project, key)
+                if trustworthy and key:
+                    retrieval_cache.put(project, key, {
+                        "hits": self._slim_units(hits), "score_label": score_label})
             if not hits:
                 self._retrieval_cache[cache_key] = empty
                 return empty
-            score_label = "相关度" if rerank_used else "相似度"
+            # 分批写作：本批范围只做本地词面前置（零网络），各批共用同一份召回
+            hits = self._boost_by_hint(hits, hint)
             lines = ["【相关记忆（语义检索·情节连贯参考，不得违背状态卡）】"]
             wake: dict = {"char": set(), "entity": set()}
             for s, u in hits:
@@ -1591,8 +1712,12 @@ class Assembler:
             lines.append("细纲中的时间推进须与当前故事时间衔接；涉及伤势的块须符合恢复进度。")
         return "\n".join(lines)
 
-    def _synopsis_text(self, volume_id=None) -> str:
+    def _synopsis_text(self, volume_id=None, *, force_full: bool = False) -> str:
         """已确认总纲注入文本（2026-10-08 起默认局部注入）。
+
+        force_full=True 时跳过局部窗口、强制注入总纲全文（2026-11-09 起仅供
+        volume_iter 使用：迭代单卷也要看到全书框架）。项目级开关
+        synopsis_full_inject 仍控制其余所有环节，两者互不干扰。
 
         默认只注入「整体层 + 当前卷及其前后各一卷」：各环节不再全书逐卷展开，
         省 token、防止远处卷剧情干扰本次生成。被裁掉的卷以一行清单留名，
@@ -1610,7 +1735,7 @@ class Assembler:
         content = s["content"]
         full_on = str(self.store.get_setting("synopsis_full_inject", "0")).strip() == "1"
         ovr = self._volume_overrides(s)
-        if volume_id and not full_on:
+        if volume_id and not full_on and not force_full:
             part = self._synopsis_partial(content, int(volume_id), ovr)
             if part:
                 return (f"【已确认总纲（不可违背的基础设定）】\n标题：{s.get('title','')}\n{part}")
@@ -2207,13 +2332,19 @@ class Assembler:
             add("前一卷最后一章（衔接）", "prior_volume",
                 self.store.get_prev_volume_last_chapter(context.get("volume_id")), 7)
         elif role == "volume_iter":
-            # 分卷迭代（2026-10-08）：修订一卷的分卷描述。注入 本卷现状+修改意见
-            # （置顶，直接施工对象）+ 总纲局部（本卷±一卷，衔接与整体层依据）。
-            # 本卷现状/意见同时随 volume_iter 模板发出（与总纲迭代双通道同口径）。
+            # 分卷迭代（2026-11-09 老板口径）：迭代第 N 卷也要看到全书框架，
+            # 因此注入「本卷现状+意见」+「总纲全文」+「全书所有分卷现状」三件。
+            # force_full 只作用于这一角色，其余环节仍走局部窗口省 token；
+            # 三模块全放报文前部且 critical，尾部「思考纪律/去 AI 味/完成标志/
+            # 破限推杆」四模块护栏不受影响。
             add("本卷迭代（现状与修改意见）", "user", context.get("user_req", ""),
                 5, order=0)
-            add("已确认总纲", "synopsis", self._synopsis_text(context.get("volume_id")),
-                3, order=1)
+            add("已确认总纲（全书全文）", "synopsis",
+                self._synopsis_text(context.get("volume_id"), force_full=True),
+                5, critical=True, order=1)
+            add("全书分卷现状（全卷·全局视野）", "volumes_all",
+                self.store.get_volume_global_view(context.get("volume_id")),
+                5, critical=True, order=2)
         elif role == "volume_chapters_iter":
             # 切章迭代（2026-10-17）：修订本卷已切的章节列表。注入 本卷现状+意见
             # （置顶，施工对象）+ 总纲局部 + 前一卷最后一章（衔接，与切章同口径）。
@@ -3132,3 +3263,88 @@ def _format_card(card: dict) -> str:
             if _fmt_value(v):
                 parts.append(f"{k}：{_fmt_value(v)}")
     return "\n".join(parts)
+
+
+# ---------------- 去破限视图（发送前预览专用，2026-11-07） ----------------
+# 老板用途：同一份提示词在本程序与酒馆(SillyTavern)各跑一次对比破限效果——
+# 需要拿到「本程序实际发送、但剔净全部破限模块」的报文，贴进酒馆重放。
+# 此前这个动作只能让编程助手离线组装（酒馆对照排查SOP 多轮对照都这么干），
+# 现在做进「发送前预览」：仅显示层面剔除，实际发送的 messages 一个字节不动。
+
+# 破限模块 kind 全集（与 _finalize 组装分支一一对应）：
+# 锚定/主机声明(jailbreak)、预确认与模型校准(jailbreak_prelude)、创作条款(jailbreak_order)、
+# 推杆与审稿许可(jailbreak_tail)、本轮复投(jailbreak_late)、运行时协议层(jailbreak_runtime)、
+# 预填充(jailbreak_prefill，独立 assistant 消息)、收尾指令(jailbreak_prefill_tail，独立 user 消息)。
+# 注意 output_anchor（改写·输出格式终裁）**不是破限**——它是任务格式指令，
+# 去破限视图里保留。
+JAILBREAK_KINDS = frozenset({
+    "jailbreak", "jailbreak_prelude", "jailbreak_order", "jailbreak_tail",
+    "jailbreak_runtime", "jailbreak_late", "jailbreak_prefill",
+    "jailbreak_prefill_tail",
+})
+
+
+def strip_jailbreak_build(build: dict) -> dict:
+    """从组装好的 build 里剔除全部破限模块文本，返回新 build（不改原 build）。
+
+    仅供「发送前预览」的去破限视图显示/复制；build() 产出的 messages 始终含
+    破限、实际发送不受本函数影响。
+
+    剔除规则（按 msg_modules 记录的模块级精确定位，逐字剔除、不靠文本匹配）：
+    - 拼接消息（system 锚定+置顶偏好、user 任务+推杆+复投+协议层…）→ 按 refs
+      的偏移删掉破限段，并吃掉紧邻的 "\\n\\n" 分隔符防残留空行；
+    - 删后内容为空的消息（纯预确认对话对、预填充 assistant、收尾指令 user）→
+      整条消息删除，msg_modules 平行缩减；
+    - 破限与非破限混排的消息（收尾指令 + 改写终裁共一条）→ 只删破限段，
+      终裁段保留、消息不丢；
+    - 消息缺 msg_modules 映射（防御，正常组装不会发生）→ 原样保留不删。
+
+    返回 dict 结构与 build() 一致（messages / modules / msg_modules / budget /
+    dropped），modules 为原列表引用（模块清单、kind 判定共用）。
+    """
+    modules = build.get("modules") or []
+    kinds = {i: str(m.get("kind") or "") for i, m in enumerate(modules)}
+    messages = build.get("messages") or []
+    msg_modules = build.get("msg_modules") or []
+
+    new_msgs: list[dict] = []
+    new_mm: list[list] = []
+    for i, msg in enumerate(messages):
+        content = str(msg.get("content") or "")
+        refs = list(msg_modules[i]) if i < len(msg_modules) else []
+        if not refs:
+            new_msgs.append(dict(msg))
+            new_mm.append([])
+            continue
+        cuts = sorted((off, off + len(txt))
+                      for idx, off, txt in refs
+                      if kinds.get(idx) in JAILBREAK_KINDS and txt)
+        new_content = content
+        for start, end in reversed(cuts):
+            if start >= 2 and new_content[start - 2:start] == "\n\n":
+                start -= 2          # 吃掉段前分隔符
+            elif end + 2 <= len(new_content) and new_content[end:end + 2] == "\n\n":
+                end += 2            # 段前无分隔（首段）则吃段后分隔符
+            new_content = new_content[:start] + new_content[end:]
+        new_content = new_content.strip()
+        if not new_content:
+            continue  # 剔净后为空 → 整条消息删除（预确认对 / 预填充 / 收尾指令）
+        new_msgs.append({"role": msg.get("role", "user"), "content": new_content})
+        kept = sorted((idx, off, txt) for idx, off, txt in refs
+                      if kinds.get(idx) not in JAILBREAK_KINDS and txt)
+        # refs 的偏移是旧 content 里的，重算成新 content 里的偏移（预览跳转定位用）
+        remapped, cursor = [], 0
+        for idx, _off, txt in kept:
+            pos = new_content.find(txt, cursor)
+            if pos < 0:
+                pos = cursor
+            remapped.append((idx, pos, txt))
+            cursor = pos + len(txt)
+        new_mm.append(remapped)
+    return {
+        "messages": new_msgs,
+        "modules": modules,
+        "msg_modules": new_mm,
+        "budget": build.get("budget", 0),
+        "dropped": build.get("dropped") or [],
+    }

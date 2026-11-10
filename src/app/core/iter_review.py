@@ -13,16 +13,45 @@
 import re
 
 from .pipeline import (Pipeline, _chapter_no_of, _clean_chapter_title,
-                       _cn_to_int, _strip_bold)
+                       _cn_to_int, _strip_bold, _ITER_BODY_MARK_RE,
+                       _ITER_EVAL_MARK_RE, _SYN_VOL_HEADING_NUM_RE,
+                       bare_synopsis_volume_marks)
 from .recall import norm as _recall_norm
 
-# 两个段标记行：容忍前导装饰（#>*、空白）与冒号变体，但必须独占一行
-_ITER_REVIEW_MARK_RE = re.compile(
-    r"^[ \t]*[#>*\s]*【\s*迭代评估\s*】\s*[：:]?\s*$", re.M)
-_ITER_BODY_MARK_RE = re.compile(
-    r"^[ \t]*[#>*\s]*【\s*修订内容\s*】\s*[：:]?\s*$", re.M)
+# 两个段标记行：定义在 pipeline（parse_synopsis_candidates 判断「这是增量协议输出」
+# 用同一份），此处复用，避免两处正则漂移。容忍前导装饰（#>*、空白）与冒号变体，
+# 但必须独占一行。
+_ITER_REVIEW_MARK_RE = _ITER_EVAL_MARK_RE
 # 兜底：评估清单区结束于下一个 Markdown 标题行（模型漏写【修订内容】标记时）
 _MD_ANY_TITLE_LINE_RE = re.compile(r"^[ \t]*#{1,6}\s+\S", re.M)
+
+# 整体层标题（任意级别）与段内【小节】标题行；整体层段的结束位置取「下一个同级或
+# 更高级标题」——老板的总纲常写成 H1『# 整体层』+ H2『## 【小节】』，旧实现只认
+# 『## 整体层』且把下一个任意级标题当段尾，会把整段整体层按小节边界切碎。
+_OVERVIEW_HEAD_RE = re.compile(r"^[ \t]*(#{1,6})[ \t]*(\S.*)$", re.M)
+# 裸行形态（2026-11-10 老板实测：「生成总纲」自定义模板产出的底稿没有任何 # 标记，
+# 整体层 / 伏笔台账 / 资产清单 / 分卷纲要 / 分卷N 全是独立裸行，卷名分隔符甚至是
+# 中文逗号）。只认 Markdown 时 replace_synopsis_overview 必然找不到 → 整批拒绝，
+# 界面表现成「识别出错」，实际是底稿格式不匹配。两套形态都要认。
+_BARE_OVERVIEW_HEAD_RE = re.compile(r"^[ \t]*整体层[ \t]*[：:]?[ \t]*$", re.M)
+# 裸行总纲的分卷区起点（『分卷纲要』独占一行）：整体层段到这里结束
+_BARE_VOL_SECTION_RE = re.compile(
+    r"^[ \t]*(?:【[ \t]*分卷纲要[ \t]*】|分卷纲要)[ \t]*[：:]?[ \t]*$", re.M)
+_SEC_HEAD_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?【[ \t]*([^】\n]{1,40}?)[ \t]*】[ \t]*(.*)$", re.M)
+# 小节体尾部分隔区（空行 / --- 分隔线）：替换小节内容时原样保留
+_SEC_TRAIL_RE = re.compile(r"(?:\n[ \t]*(?:-{3,}|\*{3,})[ \t]*)?[ \t]*\n*$")
+# 裸行形态的整体层里还有几个无标记大节（老板模板固定写这三个），按【小节】合并时
+# 必须当边界，否则最后一个小节的整节替换会把它们一起吃掉。
+_BARE_SUBHEAD_NAME_RE = re.compile(
+    r"^[ \t]*(伏笔台账|资产清单|分卷纲要|创意钩子总览|人物关系|时间线|附录)"
+    r"[ \t]*[：:]?[ \t]*$", re.M)
+# 通用裸行小标题判据（防老板改名后漏判）：独占一行、2~12 字、无标点数字。
+_BARE_SUBHEAD_BAD_CHARS = "。！？；，、：:（）()「」『』《》,.!?;:()[]{}\"'“”‘’…—"
+_BARE_SUBHEAD_MAX = 12
+# 「在某节/某段之后增补如下：…」式修订（指令而非完整小节，见 _split_additive）
+_ADDITIVE_HINT_RE = re.compile(
+    r"^[^\n。]{0,60}?(?:增补|补充|添加|插入|追加|加上)[^\n。]{0,40}?如下")
 
 # 评估清单行的 key 部分：整体层 / 分卷N / 第N卷 / 第N章（容忍列表符与装饰）
 _ITER_LINE_KEY_RE = re.compile(
@@ -164,30 +193,287 @@ def match_iter_chapters(parsed: list[dict], own: list[dict]) -> tuple[list[dict]
     return matched, unmatched
 
 
-def replace_synopsis_overview(content: str, body: str) -> str | None:
-    """总纲原文里就地替换『## 整体层』段为 body，其余文字逐字不动。
+def _strip_volumes_from_overview(text: str) -> str:
+    """整体层段里混进来的分卷段截掉，只留整体层正文。
 
-    段边界到下一个任意级 Markdown 标题（整体层下通常直接跟 ### 分卷）。
+    parse_synopsis_volumes 按 H2 切整体层、按 H3 切分卷；迭代输出里
+    『## 整体层』后面直接跟『### 分卷二』，H3 分卷会被整体层段整段吞进来。
+    不截掉就会把分卷文本塞进整体层小节，随后 replace_synopsis_volume 命中的
+    第一个『分卷二』恰好是这段错位文本，把中间所有小节/分卷一次吃掉。
+    裸行形态（『分卷纲要』+『分卷一，卷名』）同样要截，否则整体层合并会把
+    分卷纲要整段当小节内容。
+    """
+    text = text or ""
+    cut = len(text)
+    m = _SYN_VOL_HEADING_NUM_RE.search(text)
+    if m:
+        cut = min(cut, m.start())
+    m = _BARE_VOL_SECTION_RE.search(text)
+    if m:
+        cut = min(cut, m.start())
+    return text[:cut].strip()
+
+
+def _overview_span(content: str) -> tuple[int, int, int] | None:
+    """定位整体层段 → (标题行起点, 标题行终点, 段终点)；找不到返回 None。
+
+    Markdown 优先（标题任意级别，段尾取下一个同级或更高级标题）；没有 # 标记时
+    退裸行形态（『整体层』独占一行，段尾取第一个裸行卷标题行 / 下一个 Markdown
+    标题行）——老板的自定义总纲模板产出的就是这种无标记形态。
+    """
+    content = content or ""
+    for m in _OVERVIEW_HEAD_RE.finditer(content):
+        if m.group(2).strip().replace(" ", "").startswith("整体层"):
+            level = len(m.group(1))
+            nxt = next((x for x in _OVERVIEW_HEAD_RE.finditer(content)
+                        if x.start() > m.start() and len(x.group(1)) <= level), None)
+            return m.start(), m.end(), (nxt.start() if nxt else len(content))
+    m = _BARE_OVERVIEW_HEAD_RE.search(content)
+    if m is None:
+        return None
+    ends = [len(content)]
+    mk = next((x for x in (bare_synopsis_volume_marks(content) or [])
+               if x["line_start"] > m.start()), None)
+    if mk:
+        ends.append(mk["line_start"])
+    md = next((x for x in _MD_ANY_TITLE_LINE_RE.finditer(content)
+               if x.start() > m.start()), None)
+    if md:
+        ends.append(md.start())
+    return m.start(), m.end(), min(ends)
+
+
+def replace_synopsis_overview(content: str, body: str,
+                              notes: list | None = None) -> str | None:
+    """总纲原文里就地替换『整体层』段为 body，其余文字逐字不动。
+
+    - 标题级别不限（#~######），段边界取「下一个同级或更高级标题」：老板的总纲
+      常写成 H1『# 整体层』+ H2『## 【小节】』，旧实现只认『## 整体层』、又以
+      任意级标题为段尾，于是既找不到标题、又会按子标题把整段切碎。
+    - 无任何 # 标记的裸行形态同样支持（见 _overview_span）。
+    - 整体层内部按【小节】增量合并（见 _merge_overview_body）。
     找不到整体层标题 / body 为空 → None，调用方整体拒绝该候选——
     与 replace_synopsis_volume 同一纪律：宁可不写，不能写错位置。
     """
     if not (body or "").strip():
         return None
-    target = None
-    for m in re.finditer(r"^[ \t]*##(?!#)\s+(.*)$", content, re.M):
-        if m.group(1).strip().replace(" ", "").startswith("整体层"):
-            target = m
-            break
-    if target is None:
+    body = _strip_volumes_from_overview(body)
+    if not body:
         return None
-    nxt = next((m for m in _MD_ANY_TITLE_LINE_RE.finditer(content)
-                if m.start() > target.start()), None)
-    end = nxt.start() if nxt else len(content)
-    seg = content[target.start():end]
-    ws = seg[len(seg.rstrip("\n")):]  # 段尾原有空行分隔，保留给下一段
-    head = f"## {target.group(1).strip()}"
-    return (content[:target.start()] + head + "\n" + body.strip()
+    span = _overview_span(content)
+    if span is None:
+        return None
+    start, head_end, end = span
+    head = content[start:head_end]
+    merged = _merge_overview_body(content[head_end:end], body, notes)
+    return content[:start] + head + merged + content[end:]
+
+
+def _norm_sec_name(name: str) -> str:
+    """小节名归一化：去包裹符号与全半角空白（模型写『【主角设定】』，底稿可能是『## 主角设定』）。"""
+    return (name or "").strip().strip("【】[]").replace(" ", "").replace("　", "")
+
+
+def _sec_spans(text: str) -> list[dict]:
+    """【小节】标题位置清单（可带 Markdown 前缀）→ [{name, start, head_end}]。
+
+    head_end 收在闭括号『】』之后而非行尾：小节标题可能与正文写在同一行
+    （『【其他设定】一段中…』2026-11-10 实测），正文必须从标题闭合处开始算，
+    否则修订小节的首行正文会被当成标题行丢掉（表现为该节原文没被替换）。
+    """
+    out = []
+    for m in _SEC_HEAD_RE.finditer(text or ""):
+        close = text.find("】", m.end(1))
+        head_end = close + 1 if close >= 0 else m.end()
+        out.append({"name": m.group(1).strip(), "start": m.start(),
+                    "head_end": head_end})
+    return out
+
+
+def _split_tail(seg: str) -> tuple[str, str]:
+    """拆出「内容」与「尾部分隔区」（末尾空行 / --- 分隔线），替换时原样保留分隔区。"""
+    m = _SEC_TRAIL_RE.search(seg or "")
+    if not m:
+        return seg or "", ""
+    return (seg or "")[:m.start()], (seg or "")[m.start():]
+
+
+def _looks_like_bare_subhead(line: str) -> bool:
+    """一行是否像裸行小标题（伏笔台账/资产清单/分卷纲要 这类无标记大节名）。"""
+    s = (line or "").strip()
+    if not (2 <= len(s) <= _BARE_SUBHEAD_MAX):
+        return False
+    if any(ch in _BARE_SUBHEAD_BAD_CHARS for ch in s):
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
+    return s[0] not in "#【*>-—·"
+
+
+def _bare_subhead_starts(core: str) -> list[int]:
+    """整体层段内裸行小标题的字符位置（前面必须空行，即独立成段）。
+
+    只用于「收缩小节替换区间」：命中越少越保守（少替换 = 原文多保留），
+    绝不据此删除任何文字。
+    """
+    starts: list[int] = []
+    pos = 0
+    prev_blank = True
+    for raw in (core or "").splitlines(keepends=True):
+        s = raw.strip()
+        if not s:
+            prev_blank = True
+            pos += len(raw)
+            continue
+        if prev_blank and (_BARE_SUBHEAD_NAME_RE.match(raw.strip())
+                           or _looks_like_bare_subhead(s)):
+            starts.append(pos)
+        prev_blank = False
+        pos += len(raw)
+    return starts
+
+
+def _split_additive(rev_body: str) -> str | None:
+    """把「在某节/某段之后增补如下：<正文>」拆成 <正文>；不是这种写法 → None。
+
+    迭代协议要求修订小节写成「可直接替换的完整小节原文」，但模型常交指令式写法
+    （2026-11-10 实测：【其他设定】写的是「一段中，三条院规之后增补如下衔接：…」）。
+    整节替换会把这节原有内容顶掉（那次的「体院规矩三条」「力量铁律」全丢了），
+    所以识别成增补 → 原文保留、新内容追加。
+    """
+    s = (rev_body or "").strip()
+    if not s:
+        return None
+    first = s.split("\n", 1)[0][:150]
+    m = _ADDITIVE_HINT_RE.match(first)
+    if not m:
+        return None
+    rest = s[m.end():]
+    m2 = re.match(r"[^\n：:]{0,8}[：:]", rest)
+    if m2:
+        rest = rest[m2.end():]
+    else:
+        rest = rest.lstrip("，,。 \n")
+    return rest.strip() or None
+
+
+def _merge_overview_body(base_body: str, rev_body: str,
+                         notes: list | None = None) -> str:
+    """整体层按【小节】增量合并：只换修订里出现的同名小节，未提及小节逐字保留。
+
+    迭代协议里 AI 只输出「评估为修改的段」；改到整体层内部某一小节时，它只写
+    『【主角设定】』那一节（老板 2026-11-09 实测）。若把整段整体层替换成这一节，
+    世界观 / 反派设定 / 其他设定会被顶掉——这正是「没修改的部分消失」。
+    - 修订里没有任何【小节】→ 当完整整体层整段替换（模型重写了整段）；
+    - 底稿整体层没有【小节】结构 → 整段替换（无处对齐，只能整体接受）；
+    - 修订里出现底稿没有的小节名 → 追加到整体层末尾（不丢 AI 写的内容）。
+    """
+    base_body = base_body or ""
+    rev_body = (rev_body or "").strip()
+    if not rev_body:
+        return base_body
+    lead = base_body[:len(base_body) - len(base_body.lstrip("\n"))]
+    core, tail = _split_tail(base_body)
+    rev_secs = _sec_spans(rev_body)
+    base_secs = _sec_spans(base_body)
+    if not rev_secs or not base_secs:
+        return (lead or "\n\n") + rev_body + (tail or "\n")
+    rev_map: dict[str, str] = {}
+    for i, rs in enumerate(rev_secs):
+        end = rev_secs[i + 1]["start"] if i + 1 < len(rev_secs) else len(rev_body)
+        rev_map[_norm_sec_name(rs["name"])] = rev_body[rs["head_end"]:end].strip()
+    parts: list[str] = []
+    bare_starts = _bare_subhead_starts(core)
+    cursor = 0
+    for i, bs in enumerate(base_secs):
+        end = base_secs[i + 1]["start"] if i + 1 < len(base_secs) else len(core)
+        # 小节正文里混进裸行大节（伏笔台账 / 资产清单 / 分卷纲要）→ 替换区间收缩到
+        # 它之前。裸行形态没有 Markdown 标题可以当段尾，最后一个【小节】的区间会一直
+        # 延伸到整体层段末尾，整节替换会把台账/清单/纲要一起吃掉（2026-11-10 实测）。
+        cut = next((p for p in bare_starts if bs["head_end"] <= p < end), None)
+        if cut is not None:
+            end = cut
+        parts.append(core[cursor:bs["start"]])
+        rbody = rev_map.get(_norm_sec_name(bs["name"]))
+        if rbody is None:
+            parts.append(core[bs["start"]:end])
+        else:
+            add = _split_additive(rbody)
+            if add is not None:
+                # 指令式「增补」：保留原文该节，新内容补在后面（不整节替换）
+                parts.append(core[bs["start"]:end].rstrip() + "\n\n" + add + "\n\n")
+                if notes is not None:
+                    notes.append(f"{bs['name']}按增补合并")
+            else:
+                parts.append(core[bs["start"]:bs["head_end"]] + "\n\n" + rbody + "\n\n")
+        cursor = end
+    parts.append(core[cursor:])
+    # 不 rstrip：core 末尾的换行是原段与尾部分隔区（--- / 空行）之间的空行，
+    # 去掉会把『正文\n\n---』压成『正文\n---』。
+    rebuilt = "".join(parts)
+    base_names = {_norm_sec_name(b["name"]) for b in base_secs}
+    for rs in rev_secs:
+        key = _norm_sec_name(rs["name"])
+        if key in base_names:
+            continue
+        rebuilt = (rebuilt.rstrip("\n") + "\n\n【" + rs["name"] + "】\n\n"
+                   + (rev_map.get(key) or ""))
+    return rebuilt + (tail or "\n")
+
+
+def _bare_volume_head(num_raw: str, sep: str, title: str) -> str:
+    """裸行卷标题行：保留底稿的编号写法与分隔符（『分卷二，卷名』）。"""
+    num_raw = (num_raw or "").strip()
+    t = (title or "").strip()
+    if not t:
+        return f"分卷{num_raw}"
+    return f"分卷{num_raw}{sep or '：'}{t}"
+
+
+def replace_bare_synopsis_volume(content: str, index: int, title: str,
+                                 body: str) -> str | None:
+    """裸行形态总纲里原位替换『分卷N』段（无 # 标记，卷名分隔符可为中文逗号）。
+
+    与 Pipeline.replace_synopsis_volume 同一纪律：段边界只认裸行卷标题行
+    （可信门槛由 bare_synopsis_volume_marks 把关），找不到该卷 → None。
+    """
+    if not (body or "").strip():
+        return None
+    marks = bare_synopsis_volume_marks(content)
+    if not marks:
+        return None
+    k = next((i for i, m in enumerate(marks) if m["index"] == int(index)), None)
+    if k is None:
+        return None
+    mk = marks[k]
+    end = marks[k + 1]["line_start"] if k + 1 < len(marks) else len(content)
+    seg = content[mk["line_start"]:end]
+    ws = seg[len(seg.rstrip("\n")):]
+    head = _bare_volume_head(mk["num_raw"], mk["sep"], title)
+    return (content[:mk["line_start"]] + head + "\n" + body.strip()
             + (ws or "\n\n") + content[end:])
+
+
+def append_bare_synopsis_volume(content: str, index: int, title: str,
+                                body: str) -> str | None:
+    """裸行形态总纲末尾追加一卷（编号风格与分隔符跟随最后一卷）。"""
+    if not (body or "").strip():
+        return None
+    marks = bare_synopsis_volume_marks(content)
+    if not marks:
+        return None
+    last = marks[-1]
+    num_raw = last["num_raw"]
+    num = (str(int(index)) if num_raw.isdigit()
+           else Pipeline._int_to_vol_num(int(index), "cn"))
+    head = _bare_volume_head(num, last["sep"], title)
+    block = head + "\n" + body.strip() + "\n"
+    # 分卷区后面若还有 Markdown 大节（附录/台账），插在它之前，别追加到文件尾
+    nxt = next((x for x in _MD_ANY_TITLE_LINE_RE.finditer(content)
+                if x.start() > last["line_start"]), None)
+    if nxt is None:
+        return content.rstrip() + "\n\n" + block
+    return content[:nxt.start()].rstrip() + "\n\n" + block + "\n" + content[nxt.start():]
 
 
 def apply_synopsis_iter_patch(base: str, review: dict) -> tuple[str | None, str]:
@@ -197,8 +483,10 @@ def apply_synopsis_iter_patch(base: str, review: dict) -> tuple[str | None, str]
     - "noop"：AI 评估全部保留（修订内容只是「无需修订」类占位词）→ 返回底稿原样；
     - "ok..."：合成成功，note 带替换明细；含交叉校验——评估标「修改」但修订
       内容缺段时在 note 里点名（不阻塞，确认框提示）。
-    - (None, 说明)：某段在底稿中找不到原位（如 ■/裸行形态总纲）→ 整批拒绝该候选。
+    - (None, 说明)：某段在底稿中找不到原位 → 整批拒绝该候选。
       修订内容只是片段，绝不能当全文整存（会把未修订的卷全部弄丢）。
+    底稿的两种形态都认：Markdown（## 整体层 / ### 分卷N）与裸行（整体层 /
+    分卷一，卷名）——老板的自定义总纲模板产出的就是裸行形态（2026-11-10 实测）。
     """
     base = (base or "").strip()
     body = (review.get("body") or "").strip()
@@ -207,28 +495,45 @@ def apply_synopsis_iter_patch(base: str, review: dict) -> tuple[str | None, str]
     if not body or stripped in _ITER_NOOP_WORDS:
         return base, "noop"
     rev = Pipeline.parse_synopsis_volumes(body)
-    rev_overview = (rev.get("overview") or "").strip()
+    rev_overview = _strip_volumes_from_overview(rev.get("overview") or "")
     rev_volumes = rev.get("volumes") or []
     if not rev_overview and not rev_volumes:
-        return None, "修订内容里没有识别到『## 整体层』或『### 分卷N』段落"
+        return None, "修订内容里没有识别到『整体层』或『分卷N』段落"
     new = base
     replaced: list[str] = []
+    warn: list[str] = []
     if rev_overview:
-        patched = replace_synopsis_overview(new, rev_overview)
+        patched = replace_synopsis_overview(new, rev_overview, warn)
         if patched is None:
-            return None, "底稿中找不到『## 整体层』标题，无法原位替换"
+            return None, "底稿中找不到『整体层』段落标题，无法原位替换"
         new = patched
         replaced.append("整体层")
     base_titles = {v.get("index"): (v.get("title") or "")
                    for v in base_parsed_volumes(base)}
     for v in rev_volumes:
-        idx = v.get("index") or 0
+        idx = int(v.get("index") or 0)
         vtitle = (v.get("title") or "").strip() or base_titles.get(idx, "")
         patched = Pipeline.replace_synopsis_volume(new, idx, vtitle, v.get("content") or "")
         if patched is None:
-            return None, f"底稿中找不到『分卷{idx}』的 Markdown 标题，无法原位替换"
-        new = patched
-        replaced.append(f"分卷{idx}")
+            patched = replace_bare_synopsis_volume(new, idx, vtitle, v.get("content") or "")
+        if patched is not None:
+            new = patched
+            replaced.append(f"分卷{idx}")
+            continue
+        # 底稿没有这一卷：只有「紧接现行最后一卷的新增卷」才追加（迭代意见要求加卷）；
+        # 卷号断档 / 模型幻觉的幽灵卷仍然整批拒绝——绝不把凭空冒出的卷号写进总纲。
+        cur_max = max([int(x.get("index") or 0) for x in base_parsed_volumes(new)] or [0])
+        if idx == cur_max + 1:
+            appended = Pipeline.append_synopsis_volume(
+                new, idx, vtitle, v.get("content") or "")
+            if appended is None:
+                appended = append_bare_synopsis_volume(
+                    new, idx, vtitle, v.get("content") or "")
+            if appended is not None:
+                new = appended
+                replaced.append(f"分卷{idx}（新增）")
+                continue
+        return None, f"底稿中找不到『分卷{idx}』的标题行，无法原位替换"
     # 交叉校验：评估标「修改」但修订内容缺段 → note 点名（不阻塞）
     missed = []
     for it in upd:
@@ -240,7 +545,33 @@ def apply_synopsis_iter_patch(base: str, review: dict) -> tuple[str | None, str]
     note = "ok:已替换 " + "、".join(replaced)
     if missed:
         note += f"（评估标修改但未输出内容：{'、'.join(missed)}）"
+    if warn:
+        note += f"（{'；'.join(warn)}）"
     return new, note
+
+
+def looks_like_full_synopsis(cand: str, base: str) -> bool:
+    """候选是否可当「完整总纲」整份覆盖：整体层有内容，且分卷数不少于底稿。
+
+    迭代链路里模型没按两段式协议输出时，调用方靠它区分「真·全量重写」与
+    「只剩修订片段」（2026-11-09 老板实测：片段被当全文落库，未改的卷全丢）。
+    判不准一律当片段拒绝——宁可让用户重试，也不能把总纲写残。
+    """
+    try:
+        c = Pipeline.parse_synopsis_volumes(cand or "")
+        b = Pipeline.parse_synopsis_volumes(base or "")
+    except Exception:
+        return False
+    if not (c.get("overview") or "").strip():
+        return False
+    cv = c.get("volumes") or []
+    bv = b.get("volumes") or []
+    if not cv:
+        return False
+    if bv:
+        return len(cv) >= len(bv)
+    # 底稿解析不出分卷（旧 ■/裸行混排）：退回长度比，仍按保守口径
+    return len((cand or "").strip()) >= max(200, int(len((base or "").strip()) * 0.6))
 
 
 def base_parsed_volumes(base: str) -> list[dict]:

@@ -43,8 +43,12 @@ def _embedding_headers(api_key: str) -> dict[str, str]:
 
 
 def embed_texts(base_url: str, api_key: str, model: str,
-                texts: list[str]) -> list[list[float]] | None:
-    """批量文本 → 向量列表。失败返回 None（调用方静默降级），同时登记诊断提醒。"""
+                texts: list[str], timeout: int = 30) -> list[list[float]] | None:
+    """批量文本 → 向量列表。失败返回 None（调用方静默降级），同时登记诊断提醒。
+
+    timeout 可覆盖（2026-11-09）：GUI 线程冷启动查询用较短超时避免卡住预览框，
+    后台预热/归档建索引沿用默认 30 秒。行为与失败降级完全不变。
+    """
     if not texts:
         return []
     try:
@@ -53,7 +57,7 @@ def embed_texts(base_url: str, api_key: str, model: str,
             data=json.dumps({"model": model, "input": texts}).encode("utf-8"),
             headers=_embedding_headers(api_key),
             method="POST")
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             obj = json.loads(resp.read().decode("utf-8"))
         vecs = [d["embedding"] for d in obj.get("data", [])]
         if vecs and len(vecs) == len(texts):
@@ -72,9 +76,10 @@ def embed_texts(base_url: str, api_key: str, model: str,
         return None
 
 
-def embed_one(base_url: str, api_key: str, model: str, text: str) -> list[float] | None:
-    """单条文本 → 向量；失败返回 None。"""
-    vecs = embed_texts(base_url, api_key, model, [text])
+def embed_one(base_url: str, api_key: str, model: str, text: str,
+              timeout: int = 30) -> list[float] | None:
+    """单条文本 → 向量；失败返回 None。timeout 见 embed_texts。"""
+    vecs = embed_texts(base_url, api_key, model, [text], timeout=timeout)
     return vecs[0] if vecs else None
 
 

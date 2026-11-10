@@ -4,8 +4,9 @@
 桌面版装有 PySide6，直接用真 Qt 信号，行为与历史版本完全一致；
 安卓版（flet build apk 的 Python 运行时）没有 PySide6，回退到纯 Python 实现。
 
-core 里只用到了 QObject 继承 + 一个无参 Signal（store.ProjectStore.chapters_changed，
-emit-only，connect 发生在 UI 层），所以这里只需模拟这一小撮接口。
+core 里只用到了 QObject 继承 + 若干无参 Signal（store.ProjectStore 的
+chapters_changed / volumes_changed / synopsis_changed 等，emit-only，
+connect 发生在 UI 层），所以这里只需模拟这一小撮接口。
 """
 from __future__ import annotations
 

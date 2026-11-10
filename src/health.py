@@ -19,6 +19,20 @@ from bridge import run_bg
 _SEVERITY_ICON = {"danger": "🚨", "warn": "⚠️"}
 
 
+class _GlobalSettings:
+    """没打开项目时的设置代理：嵌入/重排都是全局配置，首页也能重测。
+
+    只实现 load_embed_config / load_rerank_config 用到的 get_setting。
+    """
+
+    def __init__(self, gstore):
+        self._gstore = gstore
+
+    def get_setting(self, key, default=""):
+        return self._gstore.get_global_setting(key, default)
+
+
+
 def _fmt_time(raw) -> str:
     try:
         dt = datetime.datetime.fromisoformat(str(raw))
@@ -65,21 +79,69 @@ def banner(page, session, on_refresh=None):
         _refresh()
 
     def _recheck(e):
+        """重测已启用 / 正在报错的接口（嵌入 + 重排，与桌面同一口径）。
+
+        旧版只测嵌入：重排失败时点「重新检测」不会真的重测，提醒永远消不掉。
+        """
         def job():
             from app.core.embedding import test_embedding, load_embed_config
-            from app.core.diagnostics import record_issue
-            store = session.store if session.has_project else None
-            embed = load_embed_config(store) if store is not None else None
-            if not embed:
-                return {"ok": False,
-                        "msg": "嵌入配置不完整（地址/模型/密钥），到「设置 → 嵌入接口」补全"}
-            r = test_embedding(embed["base_url"], embed["api_key"], embed["model"])
-            if not r.get("ok"):
-                record_issue("embed_call", "向量（嵌入）接口调用失败",
-                             str(r.get("error") or r.get("message") or "")[:300],
-                             hint="检查接口地址/密钥/模型后重试。")
-            return {"ok": bool(r.get("ok")),
-                    "msg": r.get("message") or r.get("error") or "未知结果"}
+            from app.core.rerank import test_rerank, load_rerank_config
+            from app.core.diagnostics import record_issue, clear_issue
+
+            store = (session.store if session.has_project
+                     else _GlobalSettings(session.app.gstore))
+            parts, failed = [], False
+
+            def setting(key):
+                try:
+                    return str(store.get_setting(key, "") or "").strip()
+                except Exception:
+                    return ""
+
+            # 嵌入：三项全空 = 没在用语义检索，不算问题也不测
+            if any(setting(k) for k in ("embed_base_url", "embed_model", "embed_api_key")):
+                cfg = load_embed_config(store)
+                if not cfg:
+                    parts.append("嵌入接口配置不完整（地址/模型/密钥）")
+                    failed = True
+                else:
+                    r = test_embedding(cfg["base_url"], cfg["api_key"], cfg["model"])
+                    ok = bool(r.get("ok"))
+                    msg = str(r.get("message") or r.get("error") or "未知结果")
+                    if ok:
+                        clear_issue("embed_call")
+                        parts.append("嵌入接口已恢复：" + msg)
+                    else:
+                        failed = True
+                        record_issue("embed_call", "向量（嵌入）接口调用失败", msg[:300],
+                                     hint="检查接口地址/密钥/模型后重试。")
+                        parts.append("嵌入接口仍不可用：" + msg)
+
+            # 重排：开关关着就清掉残留提醒（这个接口已不参与召回）
+            if setting("rerank_enabled") == "1":
+                cfg = load_rerank_config(store)
+                if not cfg:
+                    parts.append("重排接口配置不完整（模型名/地址/密钥）")
+                    failed = True
+                else:
+                    r = test_rerank(cfg["base_url"], cfg["api_key"], cfg["model"])
+                    ok = bool(r.get("ok"))
+                    msg = str(r.get("message") or r.get("error") or "未知结果")
+                    if ok:
+                        clear_issue("rerank_call")
+                        parts.append("重排接口已恢复：" + msg)
+                    else:
+                        failed = True
+                        record_issue("rerank_call", "重排（rerank）接口调用失败", msg[:300],
+                                     hint="本次召回退回纯向量排序，不影响写作；"
+                                          "检查地址/密钥/模型，或关掉「重排精排」。")
+                        parts.append("重排接口仍不可用：" + msg)
+            else:
+                clear_issue("rerank_call")
+
+            return {"ok": not failed,
+                    "msg": "；".join(parts) if parts
+                    else "没有可重测的接口（嵌入 / 重排都没启用）"}
 
         def done(r):
             r = r if isinstance(r, dict) else {}
