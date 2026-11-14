@@ -333,6 +333,110 @@ def _bare_subhead_starts(core: str) -> list[int]:
     return starts
 
 
+def _bare_section_name(line: str) -> str | None:
+    """裸行大节的名字：白名单名命中取标准名，通用判据命中取整行；都不是 → None。"""
+    s = (line or "").strip()
+    if not s:
+        return None
+    m = _BARE_SUBHEAD_NAME_RE.match(s)
+    if m:
+        return m.group(1)
+    if _looks_like_bare_subhead(s):
+        return s
+    return None
+
+
+def _bare_section_spans(text: str) -> list[dict]:
+    """独立成段的裸行大节 → [{name, start, head_end}]；head_end=标题行行尾。
+
+    与 _bare_subhead_starts 同一判据（前面必须空行），额外返回名字供同名对齐。
+    """
+    out: list[dict] = []
+    pos = 0
+    prev_blank = True
+    for raw in (text or "").splitlines(keepends=True):
+        s = raw.strip()
+        if not s:
+            prev_blank = True
+            pos += len(raw)
+            continue
+        if prev_blank:
+            name = _bare_section_name(s)
+            if name:
+                # head_end 不含行尾换行：标题行 + 「\n\n」+ 正文 = 恰一个空行
+                out.append({"name": name, "start": pos,
+                            "head_end": pos + len(raw.rstrip("\n"))})
+        prev_blank = False
+        pos += len(raw)
+    return out
+
+
+def _merge_overview_by_bare_sections(base_body: str, rev_body: str,
+                                     notes: list | None = None) -> str | None:
+    """修订没有行首【小节】但带裸行大节（伏笔台账/资产清单…）时按大节同名对齐合并。
+
+    背景（2026-11-14《催眠》实测）：模型把新『伏笔台账』写成裸行大节（不带【】），
+    前面还有一句说明（『仅【伏笔台账】一节涉及修订，整节替换如下…』）——【】夹在
+    句中不算小节，rev_secs 为空，旧逻辑走『整段替换』兜底，把整体层里的
+    【世界观与故事概述】【主角设定】【反派设定】【其他设定】与资产清单全顶掉。
+    此函数只在大节名能对上底稿时才动手：同名替换、未提及的节/小节逐字保留、
+    第一个大节标题前的说明句剥掉（协议要求修订内容是可直接替换的完整节原文，
+    标题前内容只可能是引导语）、底稿没有的新大节追加到末尾。
+    返回 None = 对不齐（调用方走自己的兜底；有结构的底稿绝不能整段替换）。
+    """
+    lead = base_body[:len(base_body) - len(base_body.lstrip("\n"))]
+    core, tail = _split_tail(base_body)
+    base_bare = _bare_section_spans(core)
+    if not base_bare:
+        return None
+    rev_bare = _bare_section_spans(rev_body)
+    if not rev_bare:
+        return None
+    known = ({_norm_sec_name(b["name"]) for b in base_bare}
+             | {_norm_sec_name(s["name"]) for s in _sec_spans(core)})
+    if not any(_norm_sec_name(r["name"]) in known for r in rev_bare):
+        return None
+    # base 的节边界：裸行大节 + 【小节】统一排序，替换区间到下一个边界为止
+    bounds = sorted({b["start"] for b in base_bare}
+                    | {s["start"] for s in _sec_spans(core)})
+    rev_map: dict[str, str] = {}
+    for i, rs in enumerate(rev_bare):
+        end = rev_bare[i + 1]["start"] if i + 1 < len(rev_bare) else len(rev_body)
+        rev_map[_norm_sec_name(rs["name"])] = rev_body[rs["head_end"]:end].strip()
+    parts: list[str] = []
+    cursor = 0
+    for b in base_bare:
+        end = next((p for p in bounds if p > b["head_end"]), len(core))
+        parts.append(core[cursor:b["start"]])
+        rbody = rev_map.get(_norm_sec_name(b["name"]))
+        if rbody is None:
+            parts.append(core[b["start"]:end])
+        else:
+            add = _split_additive(rbody)
+            if add is not None:
+                # 指令式「增补」：原文保留，新内容补在节尾
+                parts.append(core[b["start"]:end].rstrip() + "\n\n" + add + "\n\n")
+                if notes is not None:
+                    notes.append(f"{b['name']}按增补合并")
+            else:
+                parts.append(core[b["start"]:b["head_end"]] + "\n\n" + rbody + "\n\n")
+        cursor = end
+    parts.append(core[cursor:])
+    rebuilt = "".join(parts)
+    for rs in rev_bare:
+        if _norm_sec_name(rs["name"]) in known:
+            continue
+        # 新大节插在『分卷纲要』引导行之前——它是分卷区入口，新节追加在它
+        # 后面会落进分卷区（2026-11-14 测试样例实测）。
+        ins = rebuilt.rstrip("\n")
+        m = _BARE_VOL_SECTION_RE.search(ins)
+        if m:
+            ins = ins[:m.start()].rstrip("\n")
+        rebuilt = (ins + "\n\n" + rev_body[rs["start"]:rs["head_end"]].strip()
+                   + "\n\n" + (rev_map.get(_norm_sec_name(rs["name"])) or ""))
+    return (lead or "\n\n") + rebuilt + (tail or "\n")
+
+
 def _split_additive(rev_body: str) -> str | None:
     """把「在某节/某段之后增补如下：<正文>」拆成 <正文>；不是这种写法 → None。
 
@@ -377,6 +481,28 @@ def _merge_overview_body(base_body: str, rev_body: str,
     rev_secs = _sec_spans(rev_body)
     base_secs = _sec_spans(base_body)
     if not rev_secs or not base_secs:
+        # 2026-11-14：修订没有行首【小节】但带裸行大节（『伏笔台账』等）时先按
+        # 裸行大节同名对齐合并；整段替换只许底稿整体层没有任何节结构时用——
+        # 底稿有【小节】/裸行大节而修订对不上时整段替换，未提及的节会被整批
+        # 顶掉（《催眠》实测丢了世界观/主角/反派/其他设定与资产清单五个节）。
+        merged = _merge_overview_by_bare_sections(base_body, rev_body, notes)
+        if merged is not None:
+            return merged
+        if base_secs or _bare_section_spans(core):
+            # 底稿有节结构、修订完全对不上 → 追加到整体层末尾，原内容一个字不丢
+            #（改动可重试，底稿丢失不可逆）；note 里点名，确认框可见。
+            # 修订若自带节标题（裸行大节），从第一个标题行起追加，标题前的说明句
+            # 剥掉；新节插在『分卷纲要』引导行之前（它是分卷区入口）。
+            units = _bare_section_spans(rev_body)
+            if units:
+                rev_body = rev_body[units[0]["start"]:].strip()
+            ins = core.rstrip("\n")
+            m = _BARE_VOL_SECTION_RE.search(ins)
+            if m:
+                ins = ins[:m.start()].rstrip("\n")
+            if notes is not None:
+                notes.append("整体层修订无法按小节对齐，已追加到整体层末尾（原文保留）")
+            return lead + ins + "\n\n" + rev_body.strip() + (tail or "\n")
         return (lead or "\n\n") + rev_body + (tail or "\n")
     rev_map: dict[str, str] = {}
     for i, rs in enumerate(rev_secs):
