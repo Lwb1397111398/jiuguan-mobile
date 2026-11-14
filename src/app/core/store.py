@@ -1952,6 +1952,100 @@ class ProjectStore(QObject):
                        (db.now(), r["id"]))
         return len(rows)
 
+    # ---------- 一键清空全书正文（2026-11-13 老板需求：结构留着、正文重写） ----------
+
+    def prose_stats(self) -> dict:
+        """全书正文统计（写作台「清空全书正文」确认框展示用）。
+
+        只算存活章节（回收站里的章不算）；字数用 TEXT 字符数（中文一字算一）。
+        """
+        live_ch = "SELECT id FROM chapters WHERE deleted=0"
+        row = self._one(
+            "SELECT COUNT(*) AS blocks, COUNT(DISTINCT chapter_id) AS chapters,"
+            " COALESCE(SUM(LENGTH(TRIM(content))),0) AS chars"
+            f" FROM text_blocks WHERE chapter_id IN ({live_ch})")
+        snaps = self._one(
+            "SELECT COUNT(*) AS n FROM text_block_snapshots WHERE text_block_id IN"
+            f" (SELECT id FROM text_blocks WHERE chapter_id IN ({live_ch}))")
+        batches = self._one(
+            f"SELECT (SELECT COUNT(*) FROM prose_batches WHERE chapter_id IN ({live_ch}))"
+            f" + (SELECT COUNT(*) FROM rewrite_batches WHERE chapter_id IN ({live_ch})) AS n")
+        notes = self._one(
+            f"SELECT COUNT(*) AS n FROM chapter_notes WHERE chapter_id IN ({live_ch})")
+        total = self._one("SELECT COUNT(*) AS n FROM chapters WHERE deleted=0")
+        return {
+            "chapters": int((total or {}).get("n") or 0),
+            "prose_chapters": int((row or {}).get("chapters") or 0),
+            "blocks": int((row or {}).get("blocks") or 0),
+            "words": int((row or {}).get("chars") or 0),
+            "snapshots": int((snaps or {}).get("n") or 0),
+            "batches": int((batches or {}).get("n") or 0),
+            "notes": int((notes or {}).get("n") or 0),
+        }
+
+    def clear_all_prose(self, clear_memory: bool = False,
+                        clear_cache: bool = True) -> dict:
+        """一键清空全书正文：总纲/分卷/章节大纲/细纲块留着，只把正文清掉重写。
+
+        清掉（仅存活章节，回收站里的章一律不动）：
+        - text_blocks 全部正文块（整章 / 分块 / 风格样本）+ 它们的版本快照
+        - prose_batches / rewrite_batches（分批与改写的中间工作区，全是旧正文的底稿）
+        - chapter_notes（本章动态：块级事件提取 + 正文场景头，都是旧正文衍生）
+        - 细纲块状态回退「未生成」、章状态回退（写作中/已完成/已归档/已锁定 →
+          有细纲 / 有大纲 / 未规划，只降不升）
+        clear_memory=True 顺带重置记忆链：旧记忆来自旧正文，留着会让新正文的
+        注入带着旧剧情状态（人物关系/进度错位）。
+        clear_cache=True 只清正文任务的生成缓存（prose / prose_rewrite）：
+        不清的话「重新写」在报文完全一致时可能命中缓存原样回放旧稿；
+        大纲/细纲/记忆的缓存保留，不让老板为清正文多烧钱。
+
+        销毁前先整库备份（backup()）；备份失败直接抛异常、不动数据。
+        不动：总纲、分卷、章节大纲、细纲内容、伏笔台账、设定库、请求日志、回收站。
+        返回清理统计（含备份路径），供界面提示。
+        """
+        stats = self.prose_stats()
+        backup_path = self.backup()
+        live_ch = "SELECT id FROM chapters WHERE deleted=0"
+        live = f"chapter_id IN ({live_ch})"
+        touched = [int(r["chapter_id"]) for r in self._rows(
+            f"SELECT DISTINCT chapter_id FROM text_blocks WHERE {live}")]
+        now = db.now()
+        with self._transaction():
+            # 先删子表（快照）再删正文块，避免留下指向已删块的孤儿快照
+            self.conn.execute(
+                "DELETE FROM text_block_snapshots WHERE text_block_id IN"
+                f" (SELECT id FROM text_blocks WHERE {live})")
+            self.conn.execute(f"DELETE FROM text_blocks WHERE {live}")
+            self.conn.execute(f"DELETE FROM prose_batches WHERE {live}")
+            self.conn.execute(f"DELETE FROM rewrite_batches WHERE {live}")
+            self.conn.execute(f"DELETE FROM chapter_notes WHERE {live}")
+            self.conn.execute(
+                f"UPDATE scene_blocks SET status='未生成', updated_at=?"
+                f" WHERE status<>'未生成' AND {live}", (now,))
+            # 章状态回退：只改「正文之后」的状态（未规划/有大纲/有细纲本就在正文前）
+            self.conn.execute(
+                "UPDATE chapters SET status = CASE"
+                " WHEN EXISTS(SELECT 1 FROM scene_blocks b WHERE b.chapter_id=chapters.id)"
+                " THEN '有细纲'"
+                " WHEN COALESCE(TRIM(outline_content),'')<>'' OR outline_refined=1"
+                " THEN '有大纲'"
+                " ELSE '未规划' END, updated_at=?"
+                " WHERE deleted=0 AND status IN ('写作中','已完成','已归档','已锁定')",
+                (now,))
+        cache_deleted = 0
+        if clear_cache:
+            cur = self._exec("DELETE FROM generation_cache"
+                             " WHERE task_role IN ('prose','prose_rewrite')")
+            cache_deleted = max(0, int(cur.rowcount or 0))
+        if clear_memory:
+            self.reset_memory()
+        # 逐章发正文变更（写作台靠它把编辑器里的旧稿换掉）；再发一次章节变更刷状态
+        for cid in touched:
+            self.texts_changed.emit(cid)
+        self.chapters_changed.emit()
+        return {**stats, "backup": backup_path, "cache_deleted": cache_deleted,
+                "memory_reset": bool(clear_memory)}
+
     # ---------- 正文分批（prose_mode=batch：批次工作区，全部批完成后合并落库） ----------
 
     def list_prose_batches(self, chapter_id: int) -> list[dict]:
@@ -2043,8 +2137,33 @@ class ProjectStore(QObject):
         return ""
 
     def save_text_block_draft(self, block_id: int, content: str):
-        """保存草稿（不产生快照，可反复改）。"""
-        self._exec("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?", (content, db.now(), block_id))
+        """保存草稿（覆写 content，不改 status、不发信号，可反复改）。
+
+        2026-11-11 补「首改留痕」：此前这里直接覆写 content，而 accept_text_block 在
+        「内容与当前版相同」时幂等短路——于是「接受 → 手改 → 再接受」这条链上，
+        被手改覆盖掉的那个已接受版本永远进不了 text_block_snapshots，
+        「更多 → 版本快照/回滚」里查不到它，回滚只能跳到更早的版本。
+        现在覆写前先看该 version 有没有快照：没有就先补存一份当前 content。
+        边界：同一 version 内连续手改只保留「首次手改之前」的那一版，
+        中间草稿仍不入快照（否则每敲一次键都存档，库会迅速膨胀）。
+        """
+        with self._transaction():
+            row = self.conn.execute("SELECT * FROM text_blocks WHERE id=?", (block_id,)).fetchone()
+            if row is None:
+                return
+            row = dict(row)
+            old = row.get("content") or ""
+            if old and old != (content or ""):
+                has = self.conn.execute(
+                    "SELECT 1 FROM text_block_snapshots WHERE text_block_id=? AND version=?",
+                    (block_id, row["version"])).fetchone()
+                if not has:
+                    self.conn.execute(
+                        "INSERT INTO text_block_snapshots(text_block_id,version,content,created_at)"
+                        " VALUES(?,?,?,?)",
+                        (block_id, row["version"], old, db.now()))
+            self.conn.execute("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?",
+                              (content, db.now(), block_id))
 
     def accept_text_block(self, block_id: int, content: str):
         """接受正文：旧版自动存快照，version+1，状态→已接受（事务：读旧版+存快照+推进版本原子）。

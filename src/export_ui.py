@@ -27,8 +27,19 @@ _EXT = {"TXT": "txt", "Markdown": "md", "DOCX": "docx"}
 
 
 def exports_dir(session) -> str:
-    """导出目录（不存在则创建）。"""
+    """通用导出目录（项目 zip / 全量备份落这里）。"""
     d = os.path.join(session.app.data_dir, "exports")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def prose_export_dir(store) -> str:
+    """正文导出目录：跟着书走（本书文件夹/exports），与桌面版一致。
+
+    以前所有书都写同一个 data_dir/exports，两本书同名就互相覆盖，
+    导完也分不清是哪本（2026-11-13 与桌面同步修）。
+    """
+    d = os.path.join(store.folder, "exports")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -111,7 +122,7 @@ def export_prose_flow(page, session):
             if not cids:
                 toast(page, "所选范围内没有章节", error=True)
                 return
-        path = os.path.join(exports_dir(s), f"{safe_folder_name(title)}.{_EXT[fmt]}")
+        path = os.path.join(prose_export_dir(store), f"{safe_folder_name(title)}.{_EXT[fmt]}")
         try:
             page.pop_dialog()
         except Exception:
@@ -143,12 +154,12 @@ def export_prose_flow(page, session):
 
     body = ft.Column([
         section("导出作品正文"),
-        hint("只导出「已接受 / 已锁定」的正文块；章名与分卷标题会一并带上。"),
+        hint("只导出「已接受 / 已锁定」的正文；每章只有章节名 + 正文，不分卷、不加分隔线。"),
         fmt_dd,
         scope_dd,
         range_row,
         ft.Row([syn_cb, out_cb], spacing=12, wrap=True),
-        hint(f"输出目录：{exports_dir(s)}"),
+        hint(f"输出目录：{prose_export_dir(store)}"),
         ft.Row([ft.FilledButton("导出", on_click=_do),
                 ft.TextButton("取消", on_click=lambda e: page.pop_dialog())],
                alignment=ft.MainAxisAlignment.END, spacing=8),

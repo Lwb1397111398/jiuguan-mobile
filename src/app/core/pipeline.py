@@ -362,19 +362,72 @@ _DEFAULT_MAX_TOKENS = {
 }
 
 
+# 「部分拒绝 + 降级替代」型破甲失败（2026-11-11，老板「一键细化全部大纲」第 6 章实测）。
+# 模型不写「我无法完成这个请求」，而是先声明边界（「我不能协助细化…」／
+# 「这份任务我没法接」），再主动给一版「安全替代方向」的大纲，末尾还会照打
+# 【生成完毕】。_REFUSAL_PATTERNS 认的是「拒绝动词 + 任务类宾语」，而这类句式的
+# 宾语是具体素材描述 → 全部漏检；自动模式的字数闸与完成标志闸也全绿 → 拒答句
+# 被 parse_* 剥掉，剩下的「安全替代版」落库还置 outline_refined=1（垃圾显示完成）。
+#
+# 取舍：**只扫开头 300 字**（这类「声明段」必然在开头），不全文扫描——剧情台词、
+# 大纲条目里「我不能…」「拒绝」很常见，全文扫必然误伤。R1 还要求同段出现元话语
+# 词（内容/题材/虚构/尺度/大纲/…），避免「我不能帮他」这类台词被判拒答。
+# 真实日志回扫（极限体能 61 条）：命中 4 条全是此类拒答，其余 26 条正常产物 0 误报。
+_PARTIAL_REFUSAL_HEAD = 300
+_PR_REJECT = re.compile(
+    r"^[我咱俺]?(?:不能|无法|不便|不会|不愿|没法|拒绝)[^，。\n]{0,8}"
+    r"(?:协助|配合|帮助|扩写|细化|撰写|生成|续写|继续|展开|描写|描述|写成|处理|承接|接)")
+_PR_META = re.compile(
+    r"(?:内容|题材|请求|任务|情节|虚构|尺度|政策|边界|大纲|章节|场景|扩写|细化|替代)")
+_PR_DECLINE = re.compile(
+    r"(?:这类|这种|此类|该|这份)(?:内容|题材|请求|任务|素材)"
+    r"[^。\n]{0,24}(?:不适合|不宜|不能|无法|不会)"
+    r"[^。\n]{0,24}(?:生成|撰写|扩写|细化|做成|写成|展开|继续)")
+_PR_SUBSTITUTE = re.compile(
+    r"(?:替代方向|替代方案|安全版本|建议改写为|可以改成|"
+    r"我给(?:你|您)?(?:一个|一份)?[^，。\n]{0,6}版本|下面给(?:出)?(?:一个|一份)?(?:替代|安全))")
+# 宾语只留「任务/请求」且必须带第一人称：剧情台词「这活儿我可接不了」不命中
+# （回归 test_detect_refusal_省略主语与口语化拒绝 的反向锁）。
+_PR_COLLOQUIAL = re.compile(
+    r"^(?:这份|这个|该|本)?[^，。\n]{0,2}(?:任务|请求)"
+    r"[^，。\n]{0,2}[我咱俺][^，。\n]{0,3}(?:没法接|接不了|做不来|干不了)")
+
+
+def detect_partial_refusal(text: str) -> str:
+    """识别「部分拒绝 + 给一版安全替代方案」的破甲失败，命中返回片段，否则 ''。
+
+    只扫开头 `_PARTIAL_REFUSAL_HEAD` 字。这是 `detect_refusal` 的补充判据，
+    也是「判据唯一源」的一部分：调用方不要自己另写一套关键词。
+    """
+    head = (text or "").strip()[:_PARTIAL_REFUSAL_HEAD]
+    if not head:
+        return ""
+    m = _PR_REJECT.search(head)
+    if m and _PR_META.search(head):
+        return m.group(0)
+    for rx in (_PR_DECLINE, _PR_SUBSTITUTE, _PR_COLLOQUIAL):
+        m = rx.search(head)
+        if m:
+            return m.group(0)
+    return ""
+
+
 def detect_refusal(text: str, head_chars: int = 400, tail_chars: int = 300) -> bool:
     """检测输出是否疑似拒答/退缩（扫开头 + 结尾两段）。
 
-    破甲失败的两种形态：开头直接拒答（"我无法…"），或写了一段后中途自我审查
-    退缩（正文尾部冒出"抱歉，我不能继续"式句子）。只扫开头会漏掉第二种——
-    故同时扫结尾 tail_chars 字；拒答模式保守（要求"完成/提供/帮助"等任务词
-    组合），剧情台词（"我不能原谅你"）不会误判。
+    破甲失败的三种形态：开头直接拒答（"我无法…"）、写了一段后中途自我审查退缩
+    （正文尾部冒出"抱歉，我不能继续"式句子）、以及**部分拒绝 + 降级替代**
+    （开头声明边界后主动给一版「安全替代方向」，见 detect_partial_refusal）。
+    只扫开头会漏掉第二种——故同时扫结尾 tail_chars 字；拒答模式保守（要求
+    "完成/提供/帮助"等任务词组合），剧情台词（"我不能原谅你"）不会误判。
     """
     text = text or ""
     head = text[:head_chars]
     tail = text[-tail_chars:] if len(text) > head_chars else ""
-    return any(re.search(p, head) or (tail and re.search(p, tail))
-               for p in _REFUSAL_PATTERNS)
+    if any(re.search(p, head) or (tail and re.search(p, tail))
+           for p in _REFUSAL_PATTERNS):
+        return True
+    return bool(detect_partial_refusal(head))
 
 
 # 常见收尾标点：正文自然结束时以这些结尾；都不在末尾 → 疑似被中断/未写完
@@ -2475,6 +2528,32 @@ def number_paragraphs(text: str) -> str:
     """初稿 → 「P1：段落」编号稿（文风改写扫描/整章调用的输入形态）。"""
     paras = split_paragraphs(text)
     return "\n\n".join(f"P{i}：{p}" for i, p in enumerate(paras, 1))
+
+
+# 合段条目单条最多跨几段（含起止）。解析层先拦（超限的整条不进 repl），
+# 执行层再拦一次（merges 也可能来自外部调用或未同步的手机端）。
+MAX_MERGE_SPAN = 6
+
+
+class RewriteDiff(dict):
+    """改写差量条目 → {起始段号: 改写后的整段}，**另带合段区间表**。
+
+    2026-11-13 分段/合段：`parse_style_rewrite_diff` 的返回值原本是普通 dict，
+    合段条目（`P3-P5：合并后的整段`）的「3~5 要一起消失」这层信息无处可挂。
+    这里用 dict 子类捎带 `merges`，好处是**向后兼容**：
+
+    - `apply_diff(draft, repl, dels)` 的老调用点（手机版
+      `src/pages/writing.py::_do_style_rewrite` 等）一字不改也不会退化——
+      `apply_diff` 在 `merges=None` 时用 `getattr(replacements, "merges", ())` 兜底；
+    - 若返回普通 dict，忘传 merges 的调用点会把合段条目当成「只替换首段」，
+      后几段原样留着 → 正文内容重复，属于静默数据损坏。
+
+    dict 语义完全不变（`repl == {...}`、`len()`、`in` 的既有断言全部照旧）。
+    """
+
+    def __init__(self, *args, merges: "dict[int, int] | None" = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.merges: dict[int, int] = dict(merges or {})
 
 
 def _strip_batch_tail(text: str) -> str:
@@ -4884,6 +4963,23 @@ class Pipeline:
     _REWRITE_DIFF_ENTRY_RE = re.compile(
         r"^\s*(?:P\s*(\d{1,4})|(?:第)?\s*(\d{1,4})\s*段?)\s*[:：.、，,]\s*(.*)$",
         re.IGNORECASE)
+
+    # 合段条目头（2026-11-13 老板拍板：段落边界可调）：P3-P5：正文 / P3~P5 / P3—P5 /
+    # P3至P5 / 第3段至第5段。分隔符**只收连字符族与「至/到」**：
+    # 顿号与逗号绝不能当区间分隔符——条目正则把它们当「段号后的分隔符」，
+    # 「P3、P4：合并」会被吃成「段号 3 + 正文『P4：合并』」，那三个字就直接印进成书
+    # （旧版实测），为此另配 _REWRITE_BODY_LOOKS_LIKE_HEAD_RE 做误写拦截。
+    # 判定顺序必须在 _REWRITE_DIFF_ENTRY_RE **之前**：未识别的合段行会掉进
+    # 「条目续行」分支，被当作上一条的正文追加（内容重复）。
+    _REWRITE_DIFF_MERGE_RE = re.compile(
+        r"^\s*(?:P\s*(\d{1,4})\s*[~～\-—–－至到]\s*(?:P\s*)?(\d{1,4})"
+        r"|(?:第)?\s*(\d{1,4})\s*段?\s*[~～\-—–－至到]\s*(?:第)?\s*(\d{1,4})\s*段?)"
+        r"\s*[:：]\s*(.*)$", re.IGNORECASE)
+    # 误写拦截：条目正文一开头就是「P数字：」→ 说明条目头被顿号/逗号吃掉
+    # （`P3、P4：合并` 落成 `{3: "P4：合并"}`）。整条丢弃、原段保留：
+    # 宁可这一段不改，也绝不把「P4：」这串标记写进正文。
+    _REWRITE_BODY_LOOKS_LIKE_HEAD_RE = re.compile(r"^P\s*\d{1,4}\s*[:：]")
+
     # 「全章无病灶」的约定输出（模板要求带句号，末尾标点启发式才不会误判中断）
     _REWRITE_DIFF_NONE_RE = re.compile(r"^\s*无病灶[。.\s]*$")
 
@@ -4914,9 +5010,22 @@ class Pipeline:
         由 apply_diff 执行；判据从严（_REWRITE_DELETE_BODY_RE 整体匹配），
         必须先于占位判据——裸「删除」二字不带括号，不会命中占位判据，
         不拦截会被当成替换正文写进成书。
+
+        2026-11-13 分段/合段：正文里的空行是分段意图，**必须原样保留**（只归一
+        连续空行）——旧版 `if not s: continue` 把空行吞掉，模型按第十三条病灶
+        拆的段落地时又被压回一段。另加误写拦截：正文以「P数字：」开头说明条目头
+        被顿号吃掉（`P3、P4：合并`），整条丢弃、原段保留，绝不把假头行写进正文。
         """
         body = "\n".join(lines).strip()
         if not body:
+            return
+        # 条目内空行 = 分段意图（2026-11-13）：连续空行归一成一个段间隔，
+        # 段内绝不产生空段；尾部空行已被上面 strip() 裁掉（那是条目之间的分隔）。
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        # 误写拦截（2026-11-13）：`P3、P4：合并` 被条目正则吃成「段号 3 +
+        # 正文『P4：合并』」——绝不把这种假头行当正文落库，整条丢弃、原段保留。
+        if Pipeline._REWRITE_BODY_LOOKS_LIKE_HEAD_RE.match(body):
+            info.setdefault("bad_head_dropped", []).append(no)
             return
         # 删除条目先判（先于场景头过滤与占位判据）：裸「删除」不命中两者，
         # 但「删除（分批残留）」这类带括号原因的形态可能被占位判据误吞。
@@ -4926,12 +5035,15 @@ class Pipeline:
             if no not in dels:
                 dels.append(no)
             return
+        # 场景头过滤：空行（ln.strip() 为假）不会被这条推导吃掉，分段间隔保留。
         kept = [ln for ln in body.split("\n")
                 if not (ln.strip() and _is_scene_header_line(ln))]
+        # any(ln.strip()) 只看非空行：「只剩场景头 + 空行」仍正确判空丢弃。
         if not any(ln.strip() for ln in kept):
             info.setdefault("meta_dropped", []).append(no)
             return
-        body = "\n".join(kept).strip()
+        # 删掉夹在中间的场景头后可能又出现连续空行，再归一一次。
+        body = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
         if looks_like_meta_placeholder(body):
             info.setdefault("meta_dropped", []).append(no)
             return
@@ -4946,10 +5058,23 @@ class Pipeline:
         """解析差量替换输出 → {段号: 改写后的整段}（空 dict = 无病灶或无条目）。
 
         条目 = 条目头行 + 其后的续行（改写段落可能折行）；条目间空行可有可无。
+        2026-11-13 起**条目内空行有意义**：它是「分段」意图（一段拆成多段），
+        连续空行归一成一个段间隔后原样进条目正文，由 apply_diff 按空行还原成多段；
+        条目末尾的空行仍被 strip() 裁掉（那是条目之间的分隔），两种写法不冲突——
+        条目边界只认下一条「P段号：」头行，不按空行切。
+
+        合段条目（`P3-P5：合并后的整段`）：正文进 `repl[3]`，区间记进
+        `info["merges"]`（起→止），由 apply_diff 把 4、5 两段一并并掉。
+        合段区间**不参与删除护栏**（那是段落边界调整，不是删段）。
+
         info_out 写入 {"none_declared": 是否声明无病灶, "noise_lines": 被忽略的行数,
         "meta_dropped": 被丢弃的元信息占位条目段号列表,
         "deletions": 删除条目段号列表（2026-11-07：正文只写「删除/删去」的条目，
-        由调用方交 apply_diff 执行真删除）} 供调用方提示与执行。
+        由调用方交 apply_diff 执行真删除）,
+        "merges": 合段区间 {起: 止}（2026-11-13）,
+        "merge_dropped": 被丢弃的合段条目 [(起, 止)]（跨度超限/正文是删除/空体），
+        "bad_head_dropped": 因「P3、P4：」误写被丢弃的段号（正文以「P4：」开头）}
+        供调用方提示与执行。
         重复段号取后值（模型修正前文时以后一条为准；替换与删除同段号互相覆盖）。
         """
         info = info_out if info_out is not None else {}
@@ -4957,30 +5082,76 @@ class Pipeline:
         info["noise_lines"] = 0
         info["meta_dropped"] = []
         info["deletions"] = []
+        info["merges"] = {}
+        info["merge_dropped"] = []
+        info["bad_head_dropped"] = []
         repl: dict[int, str] = {}
+        # 与 info["merges"] 同一个对象：_flush 里记账即写 info，避免两处分叉。
+        merges: dict[int, int] = info["merges"]
         cur_no = 0
+        cur_end: int | None = None   # 合段条目的区间止段号；None = 普通条目
         cur_lines: list[str] = []
+
+        def _flush():
+            """收一条条目 + 合段记账（两处调用点收敛在这里）。
+
+            合段条目先做一次纯判定再交给 _push_rewrite_entry：**区间删除不在协议里**，
+            「P3-P5：删除」若走 push 会真删掉首段、后两段留着，是半截结果；
+            这里直接判废、原段全保留，且不污染 deletions。
+            """
+            nonlocal cur_no, cur_end, cur_lines
+            if not cur_no:
+                return
+            no, end, lines = cur_no, cur_end, cur_lines
+            cur_no, cur_end, cur_lines = 0, None, []
+            if end:
+                body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip())
+                if (not body
+                        or cls._REWRITE_BODY_LOOKS_LIKE_HEAD_RE.match(body)
+                        or _is_rewrite_delete_body(body)
+                        or end - no + 1 > MAX_MERGE_SPAN):
+                    info["merge_dropped"].append((no, end))
+                    return
+                cls._push_rewrite_entry(repl, info, no, lines)
+                if no in repl:
+                    merges[no] = end
+                else:
+                    # push 判成占位标记/场景头残留 → 整条不成立
+                    info["merge_dropped"].append((no, end))
+                return
+            cls._push_rewrite_entry(repl, info, no, lines)
+
         for ln in (text or "").replace("\r\n", "\n").split("\n"):
             s = ln.strip()
-            m = cls._REWRITE_DIFF_ENTRY_RE.match(s)
-            if m:
-                if cur_no:
-                    cls._push_rewrite_entry(repl, info, cur_no, cur_lines)
-                cur_no = int(m.group(1) or m.group(2))
-                cur_lines = [m.group(3)]
+            mm = cls._REWRITE_DIFF_MERGE_RE.match(s)
+            m = None if mm else cls._REWRITE_DIFF_ENTRY_RE.match(s)
+            if mm or m:
+                _flush()
+                if mm:
+                    start = int(mm.group(1) or mm.group(3))
+                    end = int(mm.group(2) or mm.group(4))
+                    cur_no = start
+                    # 倒置/单段（P5-P5）按普通替换处理，不算合段
+                    cur_end = end if end > start else None
+                    cur_lines = [mm.group(5)]
+                else:
+                    cur_no = int(m.group(1) or m.group(2))
+                    cur_end = None
+                    cur_lines = [m.group(3)]
                 continue
             if cls._REWRITE_DIFF_NONE_RE.match(s):
                 info["none_declared"] = True
                 continue
             if not s:
+                if cur_no:
+                    cur_lines.append("")  # 条目内空行 = 分段意图（flush 时归一/裁尾）
                 continue
             if cur_no:
                 cur_lines.append(s)      # 条目续行（改写段落折行）
             else:
                 info["noise_lines"] += 1  # 条目开始前的标题行/引导行：忽略
-        if cur_no:
-            cls._push_rewrite_entry(repl, info, cur_no, cur_lines)
-        return repl
+        _flush()
+        return RewriteDiff(repl, merges=merges)
 
     # ---------- 多章正文：手动导入批量入库（2026-09-16） ----------
 

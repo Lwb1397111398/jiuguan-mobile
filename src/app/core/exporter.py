@@ -17,61 +17,111 @@ from .api import encrypt_key, decrypt_key
 EXPORT_FORMATS = ["TXT", "Markdown", "DOCX"]
 
 
+def chapter_effective_text(store: ProjectStore, chapter_id: int) -> str:
+    """本章「当前生效」的正文（导出/统计都用这一份，保证导出与界面一致）。
+
+    取用优先级（越高越优先）：
+    1. 整章正文块 `kind='chapter'` 且已接受/已锁定 —— 整章写法和分批合并都落这里；
+    2. 已接受/已锁定的分块正文（细纲块写法，一块一段）；
+    3. 分批工作区 `prose_batches` 的合并稿 —— 分批写满但**还没点合并**时，
+       正文只在工作区里；不兜这一层，导出就会漏掉最新写完的章节。
+
+    整章块仍是「草稿」（AI 刚生成、用户未点接受）时按红线不导出，改用下一优先级。
+    """
+    tb = store.get_chapter_prose_block(chapter_id)
+    tb_id = tb.get("id") if tb else None
+    if tb and tb.get("status") in ("已接受", "已锁定") and (tb.get("content") or "").strip():
+        return tb["content"].strip()
+    accepted = [b for b in store.list_text_blocks(chapter_id)
+                if b.get("id") != tb_id
+                and b.get("status") in ("已接受", "已锁定")
+                and (b.get("content") or "").strip()]
+    if accepted:
+        return "\n\n".join(b["content"].strip() for b in accepted)
+    return store.prose_batch_merged(chapter_id).strip()
+
+
 def _chapter_text(store: ProjectStore, chapter: dict, include_outline: bool) -> str:
-    blocks = store.list_text_blocks(chapter["id"])
-    accepted = [b for b in blocks if b["status"] in ("已接受", "已锁定")]
     parts = []
     if include_outline:
         summary = chapter_outline_text(chapter)
         if summary:
             parts.append("（本章概要：\n" + summary + "）")
-        include_outline = False
-    parts.extend(b["content"] for b in accepted)
+    body = chapter_effective_text(store, chapter["id"])
+    if body:
+        parts.append(body)
     return "\n\n".join(parts)
 
 
-def _group_by_volume(store: ProjectStore, chapters: list[dict]) -> list[tuple[str, list[dict]]]:
-    """把章节按分卷分组，返回 [(卷标题, [章节...]), ...]。
+def chapter_heading(chapter: dict) -> str:
+    """章节标题行：`第N章 标题`（标题已自带章号时不再重复）。"""
+    idx = chapter.get("order_index", 0)
+    name = (chapter.get("title") or "").strip()
+    if name.startswith("第") and "章" in name[:8]:
+        return name          # 标题本身已含「第N章」，避免「第3章 第3章 入城」
+    return f"第{idx}章 {name}".rstrip()
 
-    项目已有分卷结构（volumes 表 + chapters.volume_id），导出时保留它才符合长篇阅读
-    习惯。无分卷数据时整本书归为一组（标题空串）——调用方据此跳过卷标题渲染，
-    行为与改动前完全一致（向后兼容）。未分卷的章节（volume_id 为空）归到最后的
-    「未分卷」组，不会因建了分卷就丢失。
+
+def export_warnings(store: ProjectStore, chapter_ids: list[int] | None = None) -> list[str]:
+    """导出前的确定性提示（不阻断导出）：告诉用户哪些章可能不是「最终稿」。
+
+    两类：
+    · 草稿态 —— 整章正文块是「草稿」（被另一种写法取代，如改用了细纲块写法），
+      导出按红线跳过它、改用已接受的那一份，提示一句避免用户以为丢了内容。
+    · 未合并 —— 分批写完但没合并落库，正文只在分批工作区里（导出已用工作区兜底，
+      提示一句让用户知道来源）。
+
+    注意：AI 生成/改写后**还没点「接受」**的稿子只存在写作台内存里、不在库中，
+    core 层看不到；界面上那句「未落库，点『接受』写入」才是它的唯一提示。
     """
-    volumes = store.list_volumes()
-    if not volumes:
-        return [("", chapters)]
-    by_id: dict[int, list[dict]] = {v["id"]: [] for v in volumes}
-    orphans: list[dict] = []
+    chapters = store.list_chapters()
+    if chapter_ids:
+        chapters = [c for c in chapters if c["id"] in chapter_ids]
+    pending, batch_only = [], []
     for c in chapters:
-        vid = c.get("volume_id")
-        if vid in by_id:
-            by_id[vid].append(c)
-        else:
-            orphans.append(c)
-    groups = []
-    for v in volumes:
-        if by_id[v["id"]]:
-            idx = v.get("order_index") or len(groups) + 1
-            title = (v.get("title") or "").strip()
-            groups.append((f"第{idx}卷 {title}".strip(), by_id[v["id"]]))
-    if orphans:
-        groups.append(("未分卷", orphans))
-    return groups
+        tb = store.get_chapter_prose_block(c["id"])
+        label = chapter_heading(c)
+        if tb and tb.get("status") == "草稿" and (tb.get("content") or "").strip():
+            pending.append(label)
+        elif not (tb and (tb.get("content") or "").strip()) \
+                and store.prose_batch_merged(c["id"]).strip():
+            batch_only.append(label)
+    out = []
+    if pending:
+        out.append(f"这 {len(pending)} 章的整章正文还是草稿（没点「接受」），"
+                   f"导出会用已接受的版本：\n"
+                   + "、".join(pending[:8]) + ("…" if len(pending) > 8 else ""))
+    if batch_only:
+        out.append(f"这 {len(batch_only)} 章只有分批工作区、还没合并进正文，"
+                   f"导出将直接使用工作区内容：\n"
+                   + "、".join(batch_only[:8]) + ("…" if len(batch_only) > 8 else ""))
+    return out
 
 
 def export_prose(store: ProjectStore, fmt: str, path: str,
                  chapter_ids: list[int] | None = None,
                  include_synopsis: bool = False,
                  include_outline: bool = False) -> tuple[bool, str]:
-    """导出正文。fmt: TXT/Markdown/DOCX；chapter_ids None=全部。返回 (ok, message)。"""
+    """导出正文。fmt: TXT/Markdown/DOCX；chapter_ids None=全部。返回 (ok, message)。
+
+    产物只含「章节名 + 正文」（2026-11-13 起不再写书名/分卷标题/分隔横线）；
+    正文取 `chapter_effective_text`（整章正文 > 已接受分块 > 未合并的分批工作区），
+    保证导出与写作台看到的最新稿一致。父目录不存在会自动创建。
+    """
     fmt = fmt.upper()
     if fmt not in ("TXT", "MARKDOWN", "DOCX"):
         return False, f"不支持的格式: {fmt}"
     chapters = store.list_chapters()
     if chapter_ids:
         chapters = [c for c in chapters if c["id"] in chapter_ids]
+    if not chapters:
+        return False, "没有可导出的章节"
     title = store.title
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        return False, f"无法创建目录：{e}"
 
     try:
         if fmt == "TXT":
@@ -82,53 +132,51 @@ def export_prose(store: ProjectStore, fmt: str, path: str,
     except ImportError:
         return False, "缺少 python-docx 库，无法导出 DOCX（TXT/Markdown 不受影响）"
     except OSError as e:
-        return False, f"写入失败：{e}"
+        return False, f"写入失败（文件可能正被 Word/WPS 打开）：{e}"
 
 
 def _heading_prefix(store: ProjectStore, include_synopsis: bool) -> str:
+    """勾选「包含总纲」时置顶的总纲段（不再用 ==== 分隔线）。"""
     if not include_synopsis:
         return ""
     s = store.current_synopsis()
     if not s:
         return ""
-    return (f"总纲：{s.get('title', '')}\n{s['content']}\n\n{'=' * 40}\n\n")
+    return (f"【总纲】{s.get('title', '')}\n{s['content']}\n").strip()
 
 
 def _export_txt(store, chapters, title, path, include_synopsis, include_outline) -> tuple[bool, str]:
-    lines = [f"{title}", "=" * 30, ""]
+    """TXT：章节名 + 正文，不加书名/分卷/分隔横线（2026-11-13 老板要求「简简单单」）。"""
+    blocks = []
     head = _heading_prefix(store, include_synopsis)
     if head:
-        lines.append(head)
-    for vol_title, group in _group_by_volume(store, chapters):
-        if vol_title:
-            lines += ["", vol_title, "=" * 30, ""]
-        for c in group:
-            lines.append(f"第{c['order_index']}章 {c.get('title', '')}")
-            lines.append("-" * 24)
-            lines.append(_chapter_text(store, c, include_outline))
-            lines.append("")
-            lines.append("")
+        blocks.append(head.strip())
+    for c in chapters:
+        blocks.append(chapter_heading(c))
+        body = _chapter_text(store, c, include_outline)
+        if body:
+            blocks.append(body)
+    text = "\n\n".join(blocks).strip() + "\n"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    return True, f"已导出 {len(chapters)} 章 → {path}"
+        f.write(text)
+    return True, f"已导出 {len(chapters)} 章（{len(text)} 字）→ {path}"
 
 
 def _export_md(store, chapters, title, path, include_synopsis, include_outline) -> tuple[bool, str]:
-    lines = [f"# {title}", ""]
+    """Markdown：`## 章节名` + 正文，不写书名/分卷标题。"""
+    blocks = []
     head = _heading_prefix(store, include_synopsis)
     if head:
-        lines.append(head)
-    for vol_title, group in _group_by_volume(store, chapters):
-        if vol_title:
-            lines += [f"# {vol_title}", ""]
-        for c in group:
-            lines.append(f"## 第{c['order_index']}章 {c.get('title', '')}")
-            lines.append("")
-            lines.append(_chapter_text(store, c, include_outline))
-            lines.append("")
+        blocks.append(head.strip())
+    for c in chapters:
+        blocks.append("## " + chapter_heading(c))
+        body = _chapter_text(store, c, include_outline)
+        if body:
+            blocks.append(body)
+    text = "\n\n".join(blocks).strip() + "\n"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    return True, f"已导出 {len(chapters)} 章 → {path}"
+        f.write(text)
+    return True, f"已导出 {len(chapters)} 章（{len(text)} 字）→ {path}"
 
 
 def _export_docx(store, chapters, title, path, include_synopsis, include_outline) -> tuple[bool, str]:
@@ -141,17 +189,15 @@ def _export_docx(store, chapters, title, path, include_synopsis, include_outline
         return _export_docx_minimal(store, chapters, title, path,
                                     include_synopsis, include_outline)
     doc = Document()
-    doc.add_heading(title, 0)
     head = _heading_prefix(store, include_synopsis)
     if head:
-        doc.add_paragraph(head)
-    for vol_title, group in _group_by_volume(store, chapters):
-        if vol_title:
-            doc.add_heading(vol_title, 1)
-        for c in group:
-            doc.add_heading(f"第{c['order_index']}章 {c.get('title', '')}", 2)
-            for para in _chapter_text(store, c, include_outline).split("\n\n"):
-                doc.add_paragraph(para)
+        doc.add_paragraph(head.strip())
+    for c in chapters:
+        doc.add_heading(chapter_heading(c), 1)   # 章即文档一级标题（导航窗格可跳转）
+        body = _chapter_text(store, c, include_outline)
+        for para in body.split("\n"):
+            if para.strip():
+                doc.add_paragraph(para.strip())
     doc.save(path)
     return True, f"已导出 {len(chapters)} 章 → {path}"
 
@@ -231,17 +277,14 @@ def _docx_paragraphs(text: str) -> str:
 
 def _export_docx_minimal(store, chapters, title, path,
                          include_synopsis, include_outline) -> tuple[bool, str]:
-    """零依赖 DOCX 导出（结构与 _export_docx 一致：书名/卷/章/正文）。"""
-    parts = [_docx_para(title, "Title")] if title else []
+    """零依赖 DOCX 导出（结构与 _export_docx 一致：章节名 + 正文，无书名/分卷）。"""
+    parts = []
     head = _heading_prefix(store, include_synopsis)
     if head:
-        parts.append(_docx_paragraphs(head))
-    for vol_title, group in _group_by_volume(store, chapters):
-        if vol_title:
-            parts.append(_docx_para(vol_title, "Heading1"))
-        for c in group:
-            parts.append(_docx_para(f"第{c['order_index']}章 {c.get('title', '')}", "Heading2"))
-            parts.append(_docx_paragraphs(_chapter_text(store, c, include_outline)))
+        parts.append(_docx_paragraphs(head.strip()))
+    for c in chapters:
+        parts.append(_docx_para(chapter_heading(c), "Heading1"))
+        parts.append(_docx_paragraphs(_chapter_text(store, c, include_outline)))
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
         zf.writestr("_rels/.rels", _DOCX_ROOT_RELS)

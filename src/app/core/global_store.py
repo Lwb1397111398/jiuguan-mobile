@@ -18,7 +18,7 @@ import threading
 from . import db
 from .outline_fields import effective_field_defs
 from .paths import app_data_dir
-from .sysprompts import (DEFAULT_ROLES, BUILTIN_CARDS,
+from .sysprompts import (DEFAULT_ROLES, BUILTIN_CARDS, ROLE_PIPELINE_ORDER,
                          PROSE_REWRITE_LEGACY_NAME, PROSE_REWRITE_LEGACY_PROMPT,
                          VOLUME_CHAPTERS_ITER_LEGACY_PROMPTS)
 
@@ -117,6 +117,13 @@ GLOBAL_SETTING_DEFAULTS = {
     # 带协议栈 4/6（8 个单段臂全 0，只测「整套挂」有效，故不可拆段）。
     # 默认关（省 token、也不干扰正常生成）；遇模型拒答时一键打开再试。
     "protocol_stack_enabled": "0",       # 协议栈增强：0 关 / 1 开（仅作用于总纲任务）
+    # ---------- 改写净删护栏（2026-11-11）----------
+    # 改写是「差量替换」：句内删走替换条目通道，整段删除护栏只数删除条目、管不到
+    # 句内删。模型若把每段都压成原长的几分之一，成稿可能只剩骨架却全都合法落地。
+    # 本键 = 成稿字数 / 原稿字数的下限（浮点字符串，读时用 float()，别走
+    # get_setting_int —— int("0.65") 会抛错）；0 = 关闭护栏。批量/自动模式低于
+    # 阈值不落库、原稿保留；写作台有人工预览，只给强警示、仍可确认落库。
+    "rewrite_min_keep_ratio": "0.65",
 }
 GLOBAL_SETTING_KEYS = frozenset(GLOBAL_SETTING_DEFAULTS)
 
@@ -841,20 +848,27 @@ class GlobalStore:
 
         self._patch_stale_prior_sentence()
         self._upgrade_prose_rewrite_identity()
+        self._upgrade_prose_rewrite_deletion_prompt()
+        self._upgrade_prose_rewrite_dialogue_prompt()
         self._upgrade_volume_chapters_iter_prompt()
         self._upgrade_iter_templates()
 
     def _upgrade_iter_templates(self) -> None:
-        """迭代类任务模板存量升级（幂等，2026-11-06 迭代增量化）。
+        """迭代/生成类任务模板存量升级（幂等，2026-11-06 起；2026-11-11 扩多代）。
 
         task_template_synopsis_iter / task_template_volume_chapters_iter 的全局
         meta 覆盖若仍是旧默认全文（用户没自定义过），清空回落新默认（两段式
         「AI 判断保留」协议）；自定义过的不动。角色层同款先例见
         _upgrade_volume_chapters_iter_prompt（基准元组追加即可，该函数无需改）。
+
+        ITER_TEMPLATES_LEGACY 的值允许 str 或 tuple：同一模板改过几代就登记几代，
+        2026-11-11「默认只出 1 个方案」给 brainstorm / synopsis_iter 各加了一代。
         """
         from .task_templates import ITER_TEMPLATES_LEGACY
         for key, legacy in ITER_TEMPLATES_LEGACY.items():
-            if self.get_meta(f"task_template_{key}", "") == legacy:
+            gens = (legacy,) if isinstance(legacy, str) else tuple(legacy)
+            cur = self.get_meta(f"task_template_{key}", "")
+            if cur and cur in gens:
                 self.set_meta(f"task_template_{key}", "")
 
     def _upgrade_volume_chapters_iter_prompt(self) -> None:
@@ -894,6 +908,52 @@ class GlobalStore:
         if (row.get("system_prompt") or "") == PROSE_REWRITE_LEGACY_PROMPT:
             self._exec("UPDATE task_routes SET system_prompt=? WHERE role='prose_rewrite'",
                        (new_prompt,))
+
+    def _upgrade_prose_rewrite_deletion_prompt(self) -> None:
+        """prose_rewrite 删除优先存量升级（幂等，2026-11-11）。
+
+        10-08 二合一后的默认系统提示词写着「段落信息覆盖面不动 / 未经要求改动的
+        句子原样保留」，与本次「删减优先」协议正面冲突；老库这行不会随种子更新。
+        把仍是那份旧默认全文的行升级成现行默认；用户自定义过的不动——与
+        _upgrade_prose_rewrite_identity 同纪律。不改 schema。
+        """
+        from .sysprompts import PROSE_REWRITE_PRE_DELETION_PROMPT
+        cur = DEFAULT_ROLES.get("prose_rewrite")
+        if not cur:
+            return
+        _name, _temp, new_prompt = cur
+        row = self._one("SELECT system_prompt FROM task_routes"
+                        " WHERE role='prose_rewrite'")
+        if not row:
+            return
+        if (row.get("system_prompt") or "") == PROSE_REWRITE_PRE_DELETION_PROMPT:
+            self._exec("UPDATE task_routes SET system_prompt=?"
+                       " WHERE role='prose_rewrite'", (new_prompt,))
+
+    def _upgrade_prose_rewrite_dialogue_prompt(self) -> None:
+        """prose_rewrite 对白口语化存量升级（幂等，2026-11-11）。
+
+        上午「删除优先」后的默认系统提示词（v2）末尾写着「人物对白里符合声口的
+        说法照常保留」，与本次【对白令】正面冲突；老库这行不会随种子更新。
+        把仍是那份 v2 全文的行升级成现行默认（v3）；用户自定义过的不动——
+        与 _upgrade_prose_rewrite_deletion_prompt 同纪律。不改 schema。
+
+        收敛：三个升级方法各匹配一代基准（v0/v1/v2），目标态都是同一个 v3
+        （动态取 DEFAULT_ROLES），且 v3 与三份基准全文都不相等 → 任一命中后
+        其余全部跳过，调用顺序无关，第二次启动幂等。
+        """
+        from .sysprompts import PROSE_REWRITE_PRE_DIALOGUE_PROMPT
+        cur = DEFAULT_ROLES.get("prose_rewrite")
+        if not cur:
+            return
+        _name, _temp, new_prompt = cur
+        row = self._one("SELECT system_prompt FROM task_routes"
+                        " WHERE role='prose_rewrite'")
+        if not row:
+            return
+        if (row.get("system_prompt") or "") == PROSE_REWRITE_PRE_DIALOGUE_PROMPT:
+            self._exec("UPDATE task_routes SET system_prompt=?"
+                       " WHERE role='prose_rewrite'", (new_prompt,))
 
     def _patch_stale_prior_sentence(self) -> None:
         """存量库修补（幂等，2026-09-05）：正文已移除「前文注入」板块，
@@ -1223,10 +1283,18 @@ class GlobalStore:
     # ---------- 任务角色 ----------
 
     def list_routes(self) -> list[dict]:
-        """角色路由 + 绑定档案信息。"""
-        return self._rows(
+        """角色路由 + 绑定档案信息，按创作管线环节顺序展示。
+
+        内置角色按 sysprompts.ROLE_PIPELINE_ORDER（总纲→分卷→大纲→细纲→正文→审→改→归档）；
+        未列出的自定义角色排在内置角色之后，按入库先后（id）。
+        """
+        rows = self._rows(
             "SELECT r.*, p.name AS profile_name, p.model AS profile_model, p.base_url AS profile_base_url"
             " FROM task_routes r LEFT JOIN model_profiles p ON r.profile_id=p.id ORDER BY r.id")
+        order = {role: i for i, role in enumerate(ROLE_PIPELINE_ORDER)}
+        custom_start = len(ROLE_PIPELINE_ORDER)
+        rows.sort(key=lambda r: (order.get(r["role"], custom_start), r["id"]))
+        return rows
 
     def get_route(self, role: str) -> dict | None:
         return self._one(

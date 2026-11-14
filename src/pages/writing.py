@@ -374,7 +374,7 @@ class WritingPage:
         def _cancel(ev):
             self.page.pop_dialog()
         self.page.show_dialog(ft.AlertDialog(
-            modal=True, title=ft.Text("生成总纲候选"),
+            modal=True, title=ft.Text("生成总纲"),
             content=ft.Container(req_field, width=460),
             actions=[ft.TextButton("取消", on_click=_cancel),
                      ft.FilledButton("下一步", on_click=_ok)],
@@ -439,10 +439,11 @@ class WritingPage:
             self.page.pop_dialog()
             self._syn_edit(preset_text=preview.value.strip())
 
+        head_text = (f"共 {len(cands)} 个候选：选择一版查看/调整，然后锁定"
+                     if len(cands) > 1 else "已生成总纲：查看/调整后锁定")
         self.page.show_dialog(ft.BottomSheet(
             content=ft.Container(ft.Column([
-                ft.Text(f"共 {len(cands)} 个候选：选择一版查看/调整，然后锁定",
-                        size=15, weight=ft.FontWeight.BOLD),
+                ft.Text(head_text, size=15, weight=ft.FontWeight.BOLD),
                 radio_group,
                 ft.Container(preview, height=300),
                 ft.Row([
@@ -480,10 +481,14 @@ class WritingPage:
 
     def _do_syn_iterate(self, title: str, content: str, fb: str):
         from app.core.pipeline import Pipeline
-        from app.core.task_templates import render as render_task
+        from app.core.task_templates import render as render_task, single_plan_task
         store = self.session.store
         current = f"标题：{title}\n{content}"
-        task = render_task("synopsis_iter", store, n=2, current=current, feedback=fb)
+        # 默认只出 1 个修订方案（2026-11-11 与桌面同口径）：单版改得更到位，
+        # 不满意直接重新生成；n=1 时做单方案化，压住角色提示词里的「每个候选」。
+        task = render_task("synopsis_iter", store, n=1, current=current, feedback=fb)
+        task = single_plan_task(task, heading="# 方案一：方案标题", noun="修订方案",
+                                detail="标题下分【迭代评估】【修订内容】两段写，")
         close_running = None
 
         def on_started(tk):
