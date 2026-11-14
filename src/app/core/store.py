@@ -1923,6 +1923,12 @@ class ProjectStore(QObject):
             self.accept_text_block(tb["id"], content)
         # 整章正文生效 → 该章旧的分块正文降为草稿（避免导出/检查/记忆读到双份）
         self.demote_block_prose_texts(chapter_id)
+        # 整章正文一更新，本章的分批工作区就整体过时：批次留着会让写作台主按钮
+        # 一直显示「合并批次写入正文」，再点一次就把旧批次重放覆盖最新正文
+        # （2026-11-14 事故：最新稿被几小时前的旧批次合并稿一键覆盖）。
+        # 中断恢复不受影响——那是「批次生成中、正文未落库」的场景，走不到这里。
+        if self.list_prose_batches(chapter_id):
+            self.clear_prose_batches(chapter_id)
         return self.get_text_block(tb["id"])
 
     def demote_block_prose_texts(self, chapter_id: int) -> int:
