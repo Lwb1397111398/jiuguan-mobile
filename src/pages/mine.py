@@ -6,7 +6,7 @@ import os
 import flet as ft
 
 import health
-from widgets import section, toast, confirm
+from widgets import section, menu_group, toast, confirm
 from bridge import run_bg
 
 
@@ -288,7 +288,7 @@ class MinePage:
 
     def build(self) -> ft.Control:
         # 子页面分派：有打开的子页面就先渲染它（页内返回按钮把 _sub 置回 None 并重建）。
-        # 缺了这段，子页面入口点了不会跳转（历史缺陷，2026-09-18 修）。
+        # 缺了这段，子页面入口点了不跳转（历史缺陷，2026-09-18 修）。
         if self._sub:
             sub = self._subs.get(self._sub)
             if sub is not None:
@@ -298,88 +298,73 @@ class MinePage:
         info = (f"数据目录：{s.app.data_dir}\n"
                 f"当前项目：{'《' + s.store.title + '》' if s.has_project else '未打开'}")
         banner = health.banner(self.page, s, self.on_refresh)
+
+        # 检查更新置顶（老板 2026-11-16：更新按钮不该藏在设置页二十张卡片后面）
+        from update_ui import update_card
+        ub = update_card(self.page, s)
+
+        def _tile(icon, title, subtitle, handler, async_handler=False):
+            """统一菜单条目：图标 + 标题 + 一行说明 + 右箭头。"""
+            return ft.ListTile(leading=ft.Icon(icon, size=22, color=ft.Colors.PRIMARY),
+                               title=ft.Text(title, size=14),
+                               subtitle=ft.Text(subtitle, size=11,
+                                                max_lines=1,
+                                                overflow=ft.TextOverflow.ELLIPSIS),
+                               trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, size=18),
+                               on_click=handler)
+
         body = ft.Column([
             ft.Text("我的", size=22, weight=ft.FontWeight.BOLD),
+            ub,                                     # ← 检查更新：顶部第一张卡
             *([banner] if banner else []),
-            section("双端同步"),
+            section("资料同步"),
             ft.Card(ft.Container(ft.Column([
                 ft.Row([ft.Icon(ft.Icons.SYNC, color=ft.Colors.PRIMARY),
-                        ft.Text("全量备份 / 恢复", weight=ft.FontWeight.W_600,
-                                expand=True)]),
+                        ft.Text("全量备份 / 恢复", size=14,
+                                weight=ft.FontWeight.W_600, expand=True)]),
                 ft.Text("导出一个文件带走全部资料（模型、API Key、提示词偏好、预设、"
                         "破甲库、任务模板、所有项目），电脑 ↔ 手机 导入即完全一致。"
-                        "备份含 API Key 明文，请妥善保管。", size=12,
+                        "备份含 API Key 明文，请妥善保管。", size=11,
                         color=ft.Colors.ON_SURFACE_VARIANT),
                 ft.Row([
                     ft.FilledButton("导出全量备份", on_click=self._export_full),
                     ft.OutlinedButton("导入全量备份", on_click=self._import_full),
                 ], spacing=8, wrap=True),
-            ], spacing=8), padding=14)),
-            section("工具"),
-            ft.ListTile(leading=ft.Icon(ft.Icons.SETTINGS),
-                        title=ft.Text("工具设置"),
-                        subtitle=ft.Text("前文注入 / 记忆联动 / 防截断 / 草稿自检 / "
-                                         "文风审校 / 嵌入 / 备份 / 电源",
-                                         size=11, max_lines=1,
-                                         overflow=ft.TextOverflow.ELLIPSIS),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._open_settings),
-            section("记录"),
-            ft.ListTile(leading=ft.Icon(ft.Icons.SHIELD),
-                        title=ft.Text("破甲库"),
-                        subtitle=ft.Text("新建 / 编辑四段 / 切换生效 / 强度档 / 删除",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._open_jailbreaks),
-            ft.ListTile(leading=ft.Icon(ft.Icons.TUNE),
-                        title=ft.Text("偏好卡片"),
-                        subtitle=ft.Text("全局 / 阶段 / 手动三级卡片，可置顶与限定注入阶段",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._open_cards),
-            ft.ListTile(leading=ft.Icon(ft.Icons.LAYERS),
-                        title=ft.Text("预设管理"),
-                        subtitle=ft.Text("导入酒馆预设、AI 识别破限并提取破甲", size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._open_presets),
-            ft.ListTile(leading=ft.Icon(ft.Icons.DESCRIPTION),
-                        title=ft.Text("任务模板"),
-                        subtitle=ft.Text("16 个任务提示词的跨阶段定制", size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=lambda e: self._open_templates("")),
-            ft.ListTile(leading=ft.Icon(ft.Icons.ARTICLE),
-                        title=ft.Text("提示词资产（只读概要）"),
-                        subtitle=ft.Text("随全量备份自动同步生效", size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._show_prompts),
-            ft.ListTile(leading=ft.Icon(ft.Icons.SAVE_ALT),
-                        title=ft.Text("导出作品正文"),
-                        subtitle=ft.Text("TXT / Markdown / Word，可选章节范围与总纲",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._export_prose),
-            ft.ListTile(leading=ft.Icon(ft.Icons.FOLDER_ZIP),
-                        title=ft.Text("导出项目 zip"),
-                        subtitle=ft.Text("打包当前项目（大纲/正文/记忆），跨设备搬单本",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._export_project),
-            ft.ListTile(leading=ft.Icon(ft.Icons.UNARCHIVE),
-                        title=ft.Text("导入项目 zip"),
-                        subtitle=ft.Text("从 zip 还原一个项目，与现有项目并存",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._import_project),
-            ft.ListTile(leading=ft.Icon(ft.Icons.RECEIPT_LONG),
-                        title=ft.Text("请求日志"),
-                        subtitle=ft.Text("筛选 / 成本统计 / 清空 / 查看完整提示词",
-                                         size=11),
-                        trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=self._show_logs),
-            section("关于"),
-            ft.Container(ft.Text(info, size=11,
-                                 color=ft.Colors.ON_SURFACE_VARIANT),
-                         bgcolor=ft.Colors.with_opacity(0.06, ft.Colors.ON_SURFACE),
-                         border_radius=8, padding=10),
+            ], spacing=6), padding=12)),
+            menu_group("项目 zip（搬单本书）", [
+                _tile(ft.Icons.FOLDER_ZIP, "导出项目 zip",
+                      "打包当前项目（大纲/正文/记忆），跨设备搬单本",
+                      self._export_project),
+                _tile(ft.Icons.UNARCHIVE, "导入项目 zip",
+                      "从 zip 还原一个项目，与现有项目并存",
+                      self._import_project),
+            ]),
+            section("创作工具"),
+            menu_group("", [
+                _tile(ft.Icons.SHIELD, "破甲库",
+                      "新建 / 编辑四段 / 切换生效 / 强度档 / 删除",
+                      self._open_jailbreaks),
+                _tile(ft.Icons.TUNE, "偏好卡片",
+                      "全局 / 阶段 / 手动三级卡片，可置顶与限定注入阶段",
+                      self._open_cards),
+                _tile(ft.Icons.LAYERS, "预设管理",
+                      "导入酒馆预设、AI 识别破限并提取破甲",
+                      self._open_presets),
+                _tile(ft.Icons.DESCRIPTION, "任务模板",
+                      "16 个任务提示词的跨阶段定制",
+                      lambda e: self._open_templates("")),
+                _tile(ft.Icons.ARTICLE, "提示词资产（只读概要）",
+                      "随全量备份自动同步生效",
+                      self._show_prompts),
+            ]),
+            section("产出与记录"),
+            menu_group("", [
+                _tile(ft.Icons.SAVE_ALT, "导出作品正文",
+                      "TXT / Markdown / Word，可选章节范围与总纲",
+                      self._export_prose),
+                _tile(ft.Icons.RECEIPT_LONG, "请求日志",
+                      "筛选 / 成本统计 / 清空 / 查看完整提示词",
+                      self._show_logs),
+            ]),
         ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=4)
         return ft.Container(body, padding=14, expand=True)

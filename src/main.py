@@ -16,9 +16,13 @@ def main(page: ft.Page):
     page.title = "酒馆小说生成器"
     page.padding = 0
     page.theme_mode = ft.ThemeMode.SYSTEM
-    seed = ft.Colors.DEEP_ORANGE_400
-    page.theme = ft.Theme(color_scheme_seed=seed, font_family="Microsoft YaHei UI")
-    page.dark_theme = ft.Theme(color_scheme_seed=seed, font_family="Microsoft YaHei UI")
+    # 品牌深蓝（与 APP 图标底色 #2A3550 一致）：Material 3 会从 seed 自动派生
+    # 整套配色；比旧橙色更贴合「书本/创作」气质，明暗两套主题都稳。
+    seed = "#2A3550"
+    page.theme = ft.Theme(color_scheme_seed=seed)
+    page.dark_theme = ft.Theme(color_scheme_seed=seed)
+    # 不指定 font_family：安卓自动用系统中文字体（旧值 "Microsoft YaHei UI"
+    # 在安卓上不存在，会触发不可控 fallback）
 
     session = Session()
     session.page = page

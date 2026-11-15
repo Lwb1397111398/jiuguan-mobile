@@ -6,7 +6,7 @@
 """
 import flet as ft
 
-from widgets import section, hint, toast, empty, confirm
+from widgets import section, hint, toast, empty, confirm, page_header
 from bridge import run_bg
 
 # 与桌面 app/ui/dialogs.py 的 SERVICE_TEMPLATES 一致（自动填地址/模型/单价）
@@ -727,11 +727,8 @@ class ModelsPage:
             ))
 
         body = ft.Column([
-            ft.Row([
-                ft.Text("模型", size=22, weight=ft.FontWeight.BOLD, expand=True),
-                ft.FilledButton("＋ 新建档案",
-                                on_click=lambda e: self._profile_dialog(e)),
-            ]),
+            page_header("模型", trailing=ft.FilledButton(
+                "＋ 新建档案", on_click=lambda e: self._profile_dialog(e))),
             section("破甲"),
             ft.Card(ft.Container(ft.Column([
                 ft.Row([
@@ -767,9 +764,13 @@ class ModelsPage:
             section("任务角色路由"),
             ft.Row([
                 hint("点角色可绑定模型、设温度、锁定、编辑提示词、配备用渠道"),
-                ft.TextButton("一键绑定全部角色", on_click=self._bind_all),
-                ft.TextButton("＋ 新增角色", on_click=self._add_role),
-            ], wrap=True, spacing=4),
+            ]),
+            ft.Row([
+                ft.FilledTonalButton("一键绑定全部角色", icon=ft.Icons.LINK,
+                                     on_click=self._bind_all),
+                ft.OutlinedButton("＋ 新增角色", icon=ft.Icons.PERSON_ADD_ALT,
+                                  on_click=self._add_role),
+            ], wrap=True, spacing=8),
             ft.Card(ft.Container(ft.Column(route_rows, spacing=0), padding=6)
                     if route_rows else empty("暂无任务角色")),
         ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=4)

@@ -24,6 +24,54 @@ from widgets import toast
 CHECK_DELAY = 8  # 启动后延迟秒数：避开启动高峰，也避免弹窗打断首屏
 
 
+# ---------- 检查更新卡片（「我的」页顶部 + 设置页共用） ----------
+
+def update_card(page, session) -> ft.Control:
+    """「当前版本 + 检查更新」卡片。
+
+    2026-11-16 从设置页最底部提升为「我的」页顶部第一张卡（老板：更新按钮
+    不该藏在二十张设置卡片后面）；设置页保留同款卡片（引用同一实现）。
+    桌面预览模式显示「仅手机版可用」。"""
+    from update import get_local_version, is_android, jnius_diag
+    code, name = get_local_version()
+    status = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+    ver_text = (f"{name}（build {code}）" if is_android()
+                else "电脑预览（更新仅手机版可用）")
+
+    def _check(e=None):
+        if not is_android():
+            toast(page, "检查更新仅手机版可用（电脑预览模式）")
+            return
+        status.value = "正在检查更新…"
+        try:
+            page.update()
+        except Exception:
+            return
+        job, done = manual_check(page)
+        from bridge import run_bg
+        run_bg(page, job, done)
+
+    rows = [
+        ft.Row([
+            ft.Icon(ft.Icons.SYSTEM_UPDATE_ALT, color=ft.Colors.PRIMARY, size=22),
+            ft.Column([
+                ft.Text("检查更新", size=15, weight=ft.FontWeight.W_600),
+                ft.Text(f"当前版本 {ver_text}", size=11,
+                        color=ft.Colors.ON_SURFACE_VARIANT),
+            ], spacing=2, expand=True),
+            ft.FilledTonalButton("检查", on_click=_check),
+        ]),
+    ]
+    diag = jnius_diag() if is_android() else ""
+    if diag:
+        # pyjnius 桥接异常时显示一行可复制的诊断（老板截图即可定位真因，
+        # 2026-11-16 平板真机 pyjnius 整链失败就是靠这个抓回来的）
+        rows.append(ft.Text(f"桥接诊断：{diag}", size=11,
+                            color=ft.Colors.ERROR, selectable=True))
+    rows.append(status)
+    return ft.Card(ft.Container(ft.Column(rows, spacing=6), padding=12))
+
+
 # ---------- 启动静默检查 ----------
 
 def schedule_silent_check(page, session):
@@ -199,7 +247,11 @@ class _UpdateFlow:
         try:
             started = install_apk(self._path)
         except Exception as ex:
-            toast(self.page, f"安装失败：{ex}", error=True)
+            # 2026-11-16 平板真机：pyjnius 桥接异常时安装唤不起来，说人话降级
+            # （检查/下载不受影响；从电脑重装新包是万能兜底）。
+            from update import jnius_diag
+            toast(self.page, "自动安装不可用（" + (jnius_diag() or str(ex)) +
+                  "）。请把新 APK 从电脑重新安装一次。", error=True)
             return
         if started:
             try:

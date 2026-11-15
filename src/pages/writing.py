@@ -400,8 +400,10 @@ class WritingPage:
                  "每批结束停下来确认（继续/收尾/微调/放弃），每卷概述更充分。"
                  "锁定时自动识别总纲里的「### 分卷一/二…」并导入分卷页。"),
         ], spacing=4)
-        return ft.Column(body_controls + [actions], scroll=ft.ScrollMode.AUTO,
-                         expand=True, spacing=2)
+        # 2026-11-16 美化改版：操作按钮排到内容前面（原来垫在长总纲后面，
+        # 要滚到底才够到「AI 生成总纲」）
+        return ft.Column([head, actions] + body_controls[1:],
+                         scroll=ft.ScrollMode.AUTO, expand=True, spacing=2)
 
     def _syn_toggle_stack(self, e):
         """协议栈增强开关：全局设置键，与桌面版共用（详见 docs/酒馆破限对照排查SOP.md §4.9）。
@@ -1517,15 +1519,17 @@ class WritingPage:
             ]),
             ft.Text((vol.get("title") or "") if vol else "未分卷", size=11,
                     color=ft.Colors.ON_SURFACE_VARIANT),
-            ft.Container(ft.Text(outline_txt or "（本章还没有大纲内容）", size=13,
-                                 selectable=True),
-                         bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
-                         border_radius=10, padding=12, margin=ft.Margin(left=0, right=0, top=8, bottom=8)),
+            # 2026-11-16 美化改版：细化/编辑按钮提到大纲内容前面（原来垫在
+            # 长大纲后面要滚到底才够到）
             ft.Row([
                 ft.FilledButton("AI 细化本章大纲", on_click=lambda e: self._outline_refine(ch),
                                 icon=ft.Icons.AUTO_AWESOME),
                 ft.TextButton("手动编辑", on_click=lambda e: self._outline_edit(ch)),
             ], spacing=8, wrap=True),
+            ft.Container(ft.Text(outline_txt or "（本章还没有大纲内容）", size=13,
+                                 selectable=True),
+                         bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
+                         border_radius=10, padding=12, margin=ft.Margin(left=0, right=0, top=8, bottom=8)),
             hint("细化只处理当前这一章：在 ①② 序号点初稿上补足场景/人物/信息推进/细节。"),
         ]
         return ft.Column(controls, scroll=ft.ScrollMode.AUTO, expand=True, spacing=2)
@@ -1754,24 +1758,25 @@ class WritingPage:
         ch = self._current_desk_chapter()
         mode = store.get_prose_mode()
         from app.core.chapter_outline import chapter_outline_text
-        controls = [
-            ft.Row([
-                ft.Text("写作台", size=17, weight=ft.FontWeight.BOLD),
-                ft.Container(ft.Text(f"第{ch.get('order_index')}章 {ch.get('title') or ''}",
-                                     size=13, expand=True, text_align=ft.TextAlign.END),
-                             expand=True),
-                ft.IconButton(ft.Icons.SWAP_HORIZONTAL_CIRCLE,
-                              on_click=lambda e: self._pick_chapter(self._pick_desk_ch)),
-            ]),
-            ft.Container(ft.Text(chapter_outline_text(ch) or "（本章无大纲）", size=11,
-                                 color=ft.Colors.ON_SURFACE_VARIANT, max_lines=3,
-                                 overflow=ft.TextOverflow.ELLIPSIS),
-                         bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
-                         border_radius=8, padding=8),
-        ]
+        # —— 固定区：头部 + 大纲摘要 + 诊断横幅 + 停靠条（不随内容滚动） ——
+        header = ft.Row([
+            ft.Text("写作台", size=17, weight=ft.FontWeight.BOLD),
+            ft.Container(ft.Text(f"第{ch.get('order_index')}章 {ch.get('title') or ''}",
+                                 size=13, expand=True, text_align=ft.TextAlign.END),
+                         expand=True),
+            ft.IconButton(ft.Icons.SWAP_HORIZONTAL_CIRCLE, tooltip="换一章",
+                          on_click=lambda e: self._pick_chapter(self._pick_desk_ch)),
+        ])
+        outline_box = ft.Container(
+            ft.Text(chapter_outline_text(ch) or "（本章无大纲）", size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT, max_lines=3,
+                    overflow=ft.TextOverflow.ELLIPSIS),
+            bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
+            border_radius=8, padding=8)
         banner = self._diag_banner()
-        if banner is not None:
-            controls.append(banner)
+        # —— 停靠条：高频操作固定可见（老板 2026-11-16：别让常用按钮躺在页面尽头） ——
+        dock = self._desk_dock(ch, mode)
+        # —— 滚动区：写作设置 + 模式控制 + 编辑器 + 批次/细纲卡片 ——
         auto_sw = ft.Switch(label="自动归档（写完接受即提取记忆，无需确认）",
                             value=self._auto_archive_on())
 
@@ -1781,23 +1786,118 @@ class WritingPage:
                   if auto_sw.value else
                   "已关闭自动归档：写完请点「归档本章」逐条确认后归档")
         auto_sw.on_change = _toggle_auto
-        controls.append(auto_sw)
-        controls.append(ft.Dropdown(
-            label="正文写法", value=mode, dense=True,
-            options=[ft.dropdown.Option("chapter", "一次性（整章写完）"),
-                     ft.dropdown.Option("batch", "分批（按细纲接力）"),
-                     ft.dropdown.Option("outline", "按大纲直写（不用细纲）")],
-            on_select=self._on_mode_change))
+        scroll_controls = [
+            auto_sw,
+            ft.Dropdown(
+                label="正文写法", value=mode, dense=True,
+                options=[ft.dropdown.Option("chapter", "一次性（整章写完）"),
+                         ft.dropdown.Option("batch", "分批（按细纲接力）"),
+                         ft.dropdown.Option("outline", "按大纲直写（不用细纲）")],
+                on_select=self._on_mode_change),
+        ]
         if mode == "batch":
-            controls += self._batch_desk_controls(ch)
+            scroll_controls += self._batch_desk_controls(ch)
         elif mode == "outline":
-            controls += self._outline_desk_controls(ch)
+            scroll_controls += self._outline_desk_controls(ch)
         else:
-            controls += self._chapter_desk_controls(ch)
-        controls.append(self._more_row(ch))
-        return ft.Column(controls, scroll=ft.ScrollMode.AUTO, expand=True, spacing=6)
+            scroll_controls += self._chapter_desk_controls(ch)
+        # 旧的 _more_row 已并入停靠条第二行（检查/审校/更多），不再挂页面底部。
+        scroll_col = ft.Column(scroll_controls, scroll=ft.ScrollMode.AUTO,
+                               expand=True, spacing=6)
+        return ft.Column([
+            header, outline_box, *([banner] if banner else []), dock,
+            scroll_col,
+        ], expand=True, spacing=6)
 
-    # ---------- 写作台：诊断横幅（三态提示的落点） ----------
+    # ---------- 写作台：停靠条（高频操作固定可见） ----------
+
+    def _desk_dock(self, ch: dict, mode: str) -> ft.Control:
+        """写作台停靠条（2026-11-16 界面美化改版）。
+
+        固定在写作台顶部、不随内容滚动：生成/停止/接受/归档/检查/审校/改写/更多
+        等高频操作不用划拉到页面尽头（老板 2026-11-16 点名痛点：原来「检查本章/
+        文风审校/更多」挂在整页最底部，分批模式下要滚过十几张批次/细纲卡片）。
+        滚动区内的重复按钮行已移除，动作函数与「更多」sheet 未动。
+        """
+        store = self.session.store
+        stopping = self._task is None or self._task.stopped
+        # —— 主按钮（随写法变化；文案与原滚动区按钮一致，测试契约不变） ——
+        if mode == "batch":
+            blocks = store.list_blocks(ch["id"])
+            if not blocks:
+                primary = ft.FilledButton(
+                    "开始分批写作", icon=ft.Icons.AUTO_AWESOME, disabled=True,
+                    tooltip="分批模式需要细纲：先到「大纲」页生成本章细纲")
+            else:
+                rows = store.list_prose_batches(ch["id"])
+                value, by_count = store.get_prose_batch_plan_value()
+                from app.core.pipeline import plan_batches
+                total = len(plan_batches(blocks, value, by_count)
+                            ) if blocks else 0
+                n = len(rows)
+                btn = ("合并批次写入正文" if n >= total else
+                       (f"继续第 {n + 1} 批" if rows else "开始分批写作"))
+                primary = ft.FilledButton(
+                    btn, icon=ft.Icons.AUTO_AWESOME,
+                    on_click=lambda e: self._generate_next_batch(ch))
+        elif mode == "outline":
+            split = store.get_outline_batch_split()
+            if split == "whole":
+                primary = ft.FilledButton(
+                    "生成整章正文", icon=ft.Icons.EDIT_NOTE,
+                    on_click=self._prose_generate)
+            else:
+                from app.core.chapter_outline import chapter_outline_text
+                outline = chapter_outline_text(ch)
+                if not outline.strip():
+                    primary = ft.FilledButton(
+                        "开始按大纲分批", icon=ft.Icons.AUTO_AWESOME, disabled=True,
+                        tooltip="本章还没有大纲：先到「大纲」页生成")
+                else:
+                    rows = store.list_prose_batches(ch["id"])
+                    value, by_count = store.get_outline_batch_plan_value()
+                    from app.core.pipeline import plan_outline_batches
+                    plans = plan_outline_batches(outline, value, by_count)
+                    total = len(plans)
+                    n = len(rows)
+                    btn = ("合并批次写入正文" if n >= total else
+                           (f"继续第 {n + 1} 批" if rows else "开始按大纲分批"))
+                    primary = ft.FilledButton(
+                        btn, icon=ft.Icons.AUTO_AWESOME,
+                        on_click=lambda e: self._generate_outline_batch(ch))
+        else:
+            primary = ft.FilledButton(
+                "生成整章正文", icon=ft.Icons.EDIT_NOTE,
+                on_click=self._prose_generate)
+        # —— 次操作行 ——
+        secondary = ft.Row([
+            ft.TextButton("检查本章", icon=ft.Icons.FACT_CHECK_OUTLINED,
+                          on_click=self._check_chapter),
+            ft.TextButton("文风审校", icon=ft.Icons.RATE_REVIEW_OUTLINED,
+                          on_click=self._style_check),
+            ft.TextButton("改写", icon=ft.Icons.AUTO_FIX_HIGH,
+                          on_click=lambda e: self._do_style_rewrite(ch)),
+            ft.TextButton("更多", icon=ft.Icons.MORE_HORIZ,
+                          on_click=lambda e: self._more_sheet(ch)),
+            ft.TextButton("清空编辑器", on_click=lambda e: self._set_editor("")),
+        ], spacing=2, wrap=True)
+        # —— 主操作行 + 次操作行，包一层浅色底 + 圆角 ——
+        return ft.Container(
+            ft.Column([
+                ft.Row([
+                    primary,
+                    ft.TextButton("停止", on_click=self._prose_stop, disabled=stopping),
+                    ft.FilledTonalButton("接受本章", on_click=self._prose_accept,
+                                         icon=ft.Icons.CHECK_CIRCLE),
+                    ft.TextButton("归档本章", on_click=self._archive_chapter,
+                                  icon=ft.Icons.ARCHIVE_OUTLINED),
+                ], spacing=6, wrap=True),
+                secondary,
+            ], spacing=4),
+            bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.PRIMARY),
+            border_radius=10,
+            padding=8,
+            margin=ft.Margin(left=0, right=0, top=2, bottom=2))
 
     def _diag_banner(self):
         """上次生成的诊断横幅。无问题时返回 None（完全不占位）。"""
@@ -1916,31 +2016,14 @@ class WritingPage:
                        "分批的合并预览显示在这里，检查/修改后「接受本章」落库；"
                        "也可手动写作"))
         self._desk_editor = editor
-        gen_row = [
-            *([ft.FilledButton("生成整章正文", on_click=self._prose_generate,
-                               icon=ft.Icons.EDIT_NOTE)] if whole else []),
-            ft.TextButton("改写", on_click=lambda e: self._do_style_rewrite(ch),
-                          icon=ft.Icons.AUTO_FIX_HIGH),
-            ft.TextButton("停止", on_click=self._prose_stop,
-                          disabled=self._task is None or self._task.stopped),
-        ]
+        # 2026-11-16 美化改版：生成/停止/改写/接受/归档/清空编辑器已上移到
+        # 顶部停靠条（_desk_dock，固定可见），滚动区只留编辑器与提示，不重复。
         tip = ("生成后可手动修改，再点「接受本章」落库（旧版自动存快照，可回滚）。"
                "「归档本章」= 逐条确认后写入记忆（自动归档关闭时用它）。")
         if not whole:
             tip = ("全部批次完成后点「合并批次写入正文」，或在这里检查合并预览后"
                    "「接受本章」落库（旧版自动存快照）。")
-        return [
-            editor,
-            ft.Row(gen_row, spacing=6, wrap=True),
-            ft.Row([
-                ft.FilledTonalButton("接受本章", on_click=self._prose_accept,
-                                     icon=ft.Icons.CHECK_CIRCLE),
-                ft.TextButton("归档本章", on_click=self._archive_chapter,
-                              icon=ft.Icons.ARCHIVE_OUTLINED),
-                ft.TextButton("清空编辑器", on_click=lambda e: self._set_editor("")),
-            ], spacing=4, wrap=True),
-            hint(tip),
-        ]
+        return [editor, hint(tip)]
 
     def _chapter_desk_controls(self, ch: dict) -> list:
         return self._desk_editor_block(ch, whole=True)
@@ -2001,21 +2084,8 @@ class WritingPage:
         value, by_count = store.get_prose_batch_plan_value()
         batches = plan_batches(blocks, value, by_count)
         total = len(batches)
-        n = len(rows)
-        if n == 0:
-            btn_text = "开始分批写作"
-        elif n >= total:
-            btn_text = "合并批次写入正文"
-        else:
-            btn_text = f"继续第 {n + 1} 批"
-        controls = [ft.Row([
-            ft.FilledButton(btn_text, icon=ft.Icons.AUTO_AWESOME,
-                            on_click=lambda e: self._generate_next_batch(ch)),
-            ft.TextButton("停止", on_click=self._prose_stop,
-                          disabled=self._task is None or self._task.stopped),
-            ft.TextButton("清空分批", on_click=lambda e: self._clear_batches(ch),
-                          disabled=not rows),
-        ], spacing=6, wrap=True)]
+        # 2026-11-16 美化改版：主按钮/停止已上移停靠条；「清空分批」并入「更多」sheet
+        controls = []
         controls.append(ft.Dropdown(
             label="分批口径", dense=True,
             value=store.get_batch_split_by(),
@@ -2455,17 +2525,8 @@ class WritingPage:
         value, by_count = store.get_outline_batch_plan_value()
         plans = plan_outline_batches(outline, value, by_count)
         rows = store.list_prose_batches(ch["id"])
-        n, total = len(rows), len(plans)
-        btn_text = ("开始按大纲分批" if n == 0 else
-                    ("合并批次写入正文" if n >= total else f"继续第 {n + 1} 批"))
-        controls.append(ft.Row([
-            ft.FilledButton(btn_text, icon=ft.Icons.AUTO_AWESOME,
-                            on_click=lambda e: self._generate_outline_batch(ch)),
-            ft.TextButton("停止", on_click=self._prose_stop,
-                          disabled=self._task is None or self._task.stopped),
-            ft.TextButton("清空分批", on_click=lambda e: self._clear_batches(ch),
-                          disabled=not rows),
-        ], spacing=6, wrap=True))
+        total = len(plans)
+        # 2026-11-16 美化改版：主按钮/停止已上移停靠条；「清空分批」并入「更多」sheet
         controls.append(ft.Dropdown(
             label="分批口径", dense=True,
             value=store.get_batch_split_by(),
@@ -2983,16 +3044,6 @@ class WritingPage:
     # 写作台 · 更多（本章备注 / 版本快照 / 风格样本 / 粘贴导入 / 改写设置）
     # =====================================================
 
-    def _more_row(self, ch: dict) -> ft.Control:
-        return ft.Row([
-            ft.TextButton("检查本章", icon=ft.Icons.FACT_CHECK_OUTLINED,
-                          on_click=self._check_chapter),
-            ft.TextButton("文风审校", icon=ft.Icons.RATE_REVIEW_OUTLINED,
-                          on_click=self._style_check),
-            ft.TextButton("更多", icon=ft.Icons.MORE_HORIZ,
-                          on_click=lambda e: self._more_sheet(ch)),
-        ], spacing=2, wrap=True)
-
     def _more_sheet(self, ch: dict):
         entries = [
             ("notes", ft.Icons.STICKY_NOTE_2_OUTLINED, "本章备注",
@@ -3005,6 +3056,8 @@ class WritingPage:
              "直接粘贴细纲文本入库（只剥不改，跳过 AI）"),
             ("prose", ft.Icons.CONTENT_PASTE_GO_OUTLINED, "粘贴正文…",
              "直接粘贴正文本入库（单章或多章，只剥不改）"),
+            ("clearbatch", ft.Icons.PLAYLIST_REMOVE, "清空分批",
+             "丢弃本章全部未合并批次（已接受正文不受影响）"),
             ("clearprose", ft.Icons.DELETE_FOREVER_OUTLINED, "清空全书正文",
              "结构保留，全书正文推倒重写（清前自动整库备份）"),
         ]
@@ -3021,6 +3074,8 @@ class WritingPage:
                 self._paste_dialog(ch, "detail")
             elif name == "prose":
                 self._paste_dialog(ch, "prose")
+            elif name == "clearbatch":
+                self._clear_batches(ch)
             elif name == "clearprose":
                 self._clear_all_prose()
 

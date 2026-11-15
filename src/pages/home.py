@@ -7,7 +7,7 @@ import flet as ft
 
 import health
 from state import safe_folder_name
-from widgets import section, hint, empty, toast, confirm
+from widgets import section, hint, empty, toast, confirm, page_header
 
 
 class HomePage:
@@ -69,10 +69,8 @@ class HomePage:
 
     def build(self) -> ft.Control:
         s = self.session
-        head = ft.Row([
-            ft.Text("我的作品", size=22, weight=ft.FontWeight.BOLD, expand=True),
-            ft.FilledButton("＋ 新建项目", on_click=self._new_project),
-        ])
+        head = page_header("我的作品", trailing=ft.FilledButton(
+            "＋ 新建项目", on_click=self._new_project))
         items = []
         for r in s.app.list_recent():
             exists = r.get("exists")

@@ -38,10 +38,55 @@ def confirm(page, title: str, msg: str, on_yes, yes_text="确定"):
 
 
 def section(text: str) -> ft.Container:
+    """分组小标题：左侧主题色竖条 + 粗体（比纯文字更有层级感）。"""
     return ft.Container(
-        ft.Text(text, size=15, weight=ft.FontWeight.BOLD),
-        margin=ft.Margin(left=0, right=0, top=14, bottom=6),
+        ft.Row([
+            ft.Container(width=3, height=14, bgcolor=ft.Colors.PRIMARY,
+                         border_radius=2),
+            ft.Text(text, size=14, weight=ft.FontWeight.W_700),
+        ], spacing=6),
+        margin=ft.Margin(left=2, right=0, top=14, bottom=6),
     )
+
+
+def pill(text: str, color, *, opacity=0.14, size=10) -> ft.Container:
+    """状态徽章（统一圆角、透明底色、小字号）。"""
+    return ft.Container(
+        ft.Text(text, size=size, color=color),
+        bgcolor=ft.Colors.with_opacity(opacity, color),
+        border_radius=999,
+        padding=ft.Padding(left=8, right=8, top=2, bottom=2),
+    )
+
+
+def page_header(title: str, subtitle: str = "", trailing=None) -> ft.Row:
+    """统一页头：大标题 + 可选副标题 + 右侧动作区。"""
+    col = ft.Column(
+        [ft.Text(title, size=22, weight=ft.FontWeight.BOLD)] +
+        ([ft.Text(subtitle, size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
+         if subtitle else []),
+        spacing=2, expand=True)
+    return ft.Row([col] + ([trailing] if trailing else []))
+
+
+def menu_group(title: str, tiles: list) -> ft.Control:
+    """分组菜单卡：Card 内嵌入一列 ListTile（条目间细分隔线），比一长串
+    ListTile 平铺更清爽、可分组扫读。"""
+    rows = []
+    for i, t in enumerate(tiles):
+        rows.append(t)
+        if i < len(tiles) - 1:
+            rows.append(ft.Divider(
+                height=1,
+                color=ft.Colors.with_opacity(0.07, ft.Colors.ON_SURFACE)))
+    return ft.Card(ft.Container(
+        ft.Column([
+            ft.Container(ft.Text(title, size=12, weight=ft.FontWeight.W_700,
+                                 color=ft.Colors.PRIMARY),
+                         padding=ft.Padding(left=14, right=14, top=10, bottom=0)),
+            *rows,
+        ], spacing=0),
+        padding=ft.Padding(left=0, right=0, top=0, bottom=6)))
 
 
 def hint(text: str) -> ft.Container:
