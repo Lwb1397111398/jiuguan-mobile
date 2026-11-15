@@ -18,7 +18,10 @@ class MinePage:
         self._sub = None        # 子页面（None=本页；"jailbreak"/"cards"/"templates"/"presets"）
         self._subs = {}         # 子页面实例缓存（惰性创建，保留页内状态）
         self._picker = ft.FilePicker()
-        page.overlay.append(self._picker)
+        # flet 0.86：FilePicker 是服务控件（不渲染），必须挂 page.services；
+        # 误挂 page.overlay（渲染层）会被前端画成红色错误块「Unknown control:
+        # FilePicker」，盖住页面左侧（2026-11-15 真机截图定位）。
+        page.services.append(self._picker)
 
     # ---------- 子页面 ----------
 
