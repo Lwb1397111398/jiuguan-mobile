@@ -57,7 +57,8 @@ rem 覆盖安装不被系统拒绝）。CI 传同一组参数，两边包指纹�
   --android-signing-key-store "%~dp0android\keystore\app.keystore" ^
   --android-signing-key-store-password android ^
   --android-signing-key-alias androiddebugkey ^
-  --android-signing-key-password android %*
+  --android-signing-key-password android ^
+  --android-adaptive-icon-background "#2A3550" %*
 if errorlevel 1 (
   echo.
   echo [失败] APK 构建失败 —— 请把上面的报错截图给 AI。
