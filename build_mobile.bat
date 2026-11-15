@@ -41,7 +41,23 @@ if not exist "%GRADLE_DISTS%" set "GRADLE_DISTS=%USERPROFILE%\.gradle\wrapper\di
 if not exist "%GRADLE_DISTS%" echo [提示] 尚无 Gradle 缓存，首次构建将自动下载（需网络）。
 
 echo [3/3] 开始构建 APK（10~25 分钟，不要关闭这个窗口）...
-"%VENV%\Scripts\flet.exe" build apk --yes %*
+rem 版本号 = git 提交数（与 CI 对同一提交算出同一个号，每推一次自动 +1）；
+rem App 内检查更新靠 versionCode 比较新旧，必须与本机/CI 一致
+for /f %%i in ('git rev-list --count HEAD') do set "BUILD_NUM=%%i"
+if not defined BUILD_NUM (
+  echo [警告] 取不到 git 提交数，回退 build-number 1（检查更新会比较不准）
+  set "BUILD_NUM=1"
+)
+echo 版本号：0.1.%BUILD_NUM% (build %BUILD_NUM%)
+rem 统一签名：keystore 已入库（android/keystore/app.keystore，口令 android /
+rem alias androiddebugkey，即本机历史 debug 密钥——与手机上已装包同签名，
+rem 覆盖安装不被系统拒绝）。CI 传同一组参数，两边包指纹一致。
+"%VENV%\Scripts\flet.exe" build apk --yes ^
+  --build-number %BUILD_NUM% --build-version 0.1.%BUILD_NUM% ^
+  --android-signing-key-store "%~dp0android\keystore\app.keystore" ^
+  --android-signing-key-store-password android ^
+  --android-signing-key-alias androiddebugkey ^
+  --android-signing-key-password android %*
 if errorlevel 1 (
   echo.
   echo [失败] APK 构建失败 —— 请把上面的报错截图给 AI。

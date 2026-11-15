@@ -1,0 +1,77 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (full history for build number)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute build number
+        id: ver
+        run: echo "num=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python for flet-cli
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install flet-cli 0.86.5
+        run: pip install flet-cli==0.86.5
+
+      - name: Set up Flutter 3.44.8 (pinned by flet)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.8
+          channel: stable
+
+      - name: Build APK (arm64, unified signing)
+        env:
+          FLET_ANDROID_SIGNING_KEY_STORE: ${{ github.workspace }}/android/keystore/app.keystore
+          FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: android
+          FLET_ANDROID_SIGNING_KEY_ALIAS: androiddebugkey
+          FLET_ANDROID_SIGNING_KEY_PASSWORD: android
+        run: |
+          flet build apk --yes             --build-number ${{ steps.ver.outputs.num }}             --build-version 0.1.${{ steps.ver.outputs.num }}             --target-arch arm64-v8a
+
+      - name: Stage APK
+        run: |
+          SRC="build/flutter/build/app/outputs/apk/release/app-release.apk"
+          test -f "$SRC" || { echo "APK not found: $SRC"; exit 1; }
+          cp "$SRC" jiuguan-novel.apk
+          ls -la jiuguan-novel.apk
+
+      - name: Release latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUM: ${{ steps.ver.outputs.num }}
+        run: |
+          {
+            echo "<!-- appupdate versionCode=$BUILD_NUM versionName=0.1.$BUILD_NUM -->"
+            echo ""
+            echo "## 更新内容"
+            echo ""
+            git log -5 --pretty=format:'- %s (%h)'
+          } > notes.md
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest jiuguan-novel.apk --clobber
+            gh release edit latest --notes-file notes.md --title "0.1.$BUILD_NUM"
+          else
+            gh release create latest jiuguan-novel.apk --notes-file notes.md --title "0.1.$BUILD_NUM"
+          fi
+          echo "release latest updated to 0.1.$BUILD_NUM"

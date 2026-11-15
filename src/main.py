@@ -64,6 +64,10 @@ def main(page: ft.Page):
     body.content = home.build()
     page.add(ft.Column([body, nav], expand=True, spacing=0))
 
+    # 启动后 8 秒静默检查更新（24h 节流，仅 Android；桌面预览直接跳过）
+    from update_ui import schedule_silent_check
+    schedule_silent_check(page, session)
+
 
 if __name__ == "__main__":
     ft.run(main)

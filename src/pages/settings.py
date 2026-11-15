@@ -11,6 +11,7 @@ import flet as ft
 
 from widgets import hint, toast
 from bridge import run_bg
+from update_ui import manual_check
 
 # 草稿自检阶段（键值与 core 的 draft_check_stages 一致）
 STAGES = [("synopsis", "总纲"), ("volume", "分卷"), ("outline", "大纲"),
@@ -291,6 +292,21 @@ class SettingsPage:
                 pass
         run_bg(self.page, job, done)
 
+    # ---------- 检查更新 ----------
+
+    def _check_update_manual(self, e=None):
+        from update import is_android
+        if not is_android():
+            toast(self.page, "检查更新仅手机版可用（电脑预览模式）")
+            return
+        self._update_status.value = "正在检查更新…"
+        try:
+            self.page.update()
+        except Exception:
+            return
+        job, done = manual_check(self.page)
+        run_bg(self.page, job, done)
+
     # ---------- 构建 ----------
 
     def build(self) -> ft.Control:
@@ -476,6 +492,26 @@ class SettingsPage:
                      "笔记本更耗电，一般不用开"),
         ])
 
+        # ---- 关于与更新（手机版专属；桌面预览下按钮提示不可用） ----
+        from update import get_local_version, is_android
+        code, name = get_local_version()
+        self._update_status = ft.Text("", size=12,
+                                      color=ft.Colors.ON_SURFACE_VARIANT)
+        ver_text = (f"{name}（build {code}）" if is_android()
+                    else "电脑预览（更新仅手机版可用）")
+        update_card = self._card("关于与更新", [
+            ft.Row([
+                ft.Text("当前版本", size=13),
+                ft.Container(expand=True),
+                ft.Text(ver_text, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+            ]),
+            ft.Row([ft.FilledTonalButton("检查更新",
+                                         on_click=self._check_update_manual)]),
+            self._update_status,
+            hint("新版自动从 GitHub 公开发布仓下载；国内网络不稳时自动走镜像兜底。"
+                 "启动时每 24 小时静默检查一次，发现新版会弹窗。"),
+        ])
+
         # ---- 任务模板入口 ----
         tpl_row = ft.Card(ft.Container(ft.Column([
             ft.Row([ft.Icon(ft.Icons.DESCRIPTION, color=ft.Colors.PRIMARY),
@@ -494,7 +530,7 @@ class SettingsPage:
 
         body = ft.Column(
             [head, inject, mem, est, anti, cont, draft] + stage_cards +
-            [deai, style, embed, backup, power, tpl_row,
+            [deai, style, embed, backup, power, update_card, tpl_row,
              ft.Row([ft.FilledButton("保存设置", on_click=self._save)],
                     alignment=ft.MainAxisAlignment.CENTER)],
             scroll=ft.ScrollMode.AUTO, expand=True, spacing=8)

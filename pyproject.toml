@@ -32,6 +32,13 @@ copyright = "Copyright (C) 2026 by JiuGuan"
 # 只构建 ARM64（现代安卓手机通用架构）：AOT 编译从 3-4 次减到 1 次，大幅省内存省时间
 [tool.flet.android]
 target_arch = ["arm64-v8a"]
+# 应用内自动更新（2026-11-15）：pyjnius 只打进 Android 包（Python 经它调
+# FileProvider/Intent 唤起系统安装器）；桌面 venv 不安装、不受影响
+dependencies = ["pyjnius==1.8.0"]
+
+# 自更新安装 APK 的前置权限：Android 8+ 没有它连「安装未知应用」开关页都进不去
+[tool.flet.android.permission]
+"android.permission.REQUEST_INSTALL_PACKAGES" = true
 
 # 7.3GB 内存机器：默认 -Xmx8G 会 OOM（Kotlin daemon 被杀），调小并限制并发
 [tool.flet.android.gradle_properties]
