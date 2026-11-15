@@ -40,6 +40,15 @@ jobs:
           flutter-version: 3.44.8
           channel: stable
 
+      - name: Generate _version.py (pyjnius bridge fallback for update screen)
+        run: |
+          cat > src/_version.py <<EOF
+          # -*- coding: utf-8 -*-
+          # AUTO-GENERATED in CI before flet build. Do not edit.
+          APP_VERSION_CODE = ${{ steps.ver.outputs.num }}
+          APP_VERSION_NAME = "0.1.${{ steps.ver.outputs.num }}"
+          EOF
+
       - name: Build APK (arm64, unified signing)
         env:
           FLET_ANDROID_SIGNING_KEY_STORE: ${{ github.workspace }}/android/keystore/app.keystore

@@ -8,6 +8,7 @@
 从 appstate 独立出来，供 appstate 与 global_store 共用（避免循环导入）。
 """
 import os
+import shutil
 import sys
 
 APP_DIR_NAME = "酒馆小说生成器"
@@ -41,19 +42,70 @@ def _android_app_dir(method: str) -> str:
         return ""
 
 
+def android_files_dir_from_env() -> str:
+    """不依赖 pyjnius 推导应用私有 files 目录：TMPDIR=.../<pkg>/cache →
+    同根 .../<pkg>/files。推导不出、目录不存在或不可写返回空串。
+
+    2026-11-16 平板真机实测：pyjnius 桥接整链失败（autoclass 抛异常），
+    数据目录落到 cache——系统清缓存会清掉项目数据。cache 与 files 同在
+    应用私有根下，TMPDIR 直接给出 cache 路径，零依赖即可推出 files。
+    供本模块、手机工程 bootstrap.py 与 update.py 共用。
+    """
+    tmp = os.environ.get("TMPDIR") or ""
+    if tmp.endswith("/cache"):
+        files = os.path.normpath(os.path.dirname(tmp) + "/files")
+        if os.path.isdir(files) and os.access(files, os.W_OK):
+            return files
+    return ""
+
+
+def _migrate_data_dir_away_from_cache(new_path: str) -> None:
+    """0.1.44 及以前 pyjnius 失败时数据落 cache（系统清缓存即丢项目数据）；
+    0.1.45 起落 files，首次启动把 cache 旧数据整体搬到 files。
+
+    只搬一次：copytree 成功后先写标记再删旧目录；rmtree 失败（文件占用等）
+    下次启动看到标记只重删不重拷，避免旧快照覆盖 files 上已更新的数据。
+    任何失败静默保留 cache，绝不崩 App。调用时机在 App 装配最早期、
+    任何数据库打开之前。
+    """
+    tmp = os.environ.get("TMPDIR") or ""
+    if not tmp.endswith("/cache"):
+        return
+    old = os.path.abspath(os.path.join(tmp, APP_DIR_NAME))
+    new = os.path.abspath(new_path)
+    if old == new or not os.path.isdir(old):
+        return
+    marker = os.path.join(old, ".migrated_to_files")
+    if os.path.exists(marker):
+        try:
+            shutil.rmtree(old)
+        except Exception:
+            pass
+        return
+    try:
+        shutil.copytree(old, new, dirs_exist_ok=True)
+        open(marker, "w").close()
+        shutil.rmtree(old)
+    except Exception:
+        pass
+
+
 def app_data_dir() -> str:
     """应用数据目录：Windows=%APPDATA%/酒馆小说生成器，安卓=应用私有目录同名子目录。"""
     override = os.environ.get("JIUGUAN_DATA_DIR")
     if override:
         path = override
     elif is_android():
-        # 顺序：Context.filesDir（权威、永不清）→ HOME（旧运行时设过）→
-        # TMPDIR（部分系统给到应用 cache）→ /data/local/tmp（最终兜底）
+        # 权威顺序：Context.filesDir（pyjnius，永不清）→ TMPDIR 推导 files
+        # （pyjnius 失败时的等价物）→ HOME（旧运行时设过）→ TMPDIR（应用 cache，
+        # 系统可清，仅剩最后兜底用）→ /data/local/tmp（最终兜底）
         base = (_android_app_dir("getFilesDir")
+                or android_files_dir_from_env()
                 or os.environ.get("HOME")
                 or os.environ.get("TMPDIR")
                 or "/data/local/tmp")
         path = os.path.join(base, APP_DIR_NAME)
+        _migrate_data_dir_away_from_cache(path)
     else:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         path = os.path.join(base, APP_DIR_NAME)

@@ -17,15 +17,23 @@ if os.path.isdir(os.path.join(_REPO, "app", "core")) and _REPO not in sys.path:
 
 # 安卓：趁早把 HOME 钉到应用私有 files 目录。
 # flet 的 dart-bridge 运行时不设 HOME，安卓进程 expanduser("~") 会经 bionic
-# 伪 passwd 表落到 /data（应用无权写，2026-11-15 真机安装即崩的根因）。
+# 伪 passwd 表落到 /data（应用无权写，2026-11-15 真机首启即崩的根因）。
 # 标准库里任何读 ~ 的代码（tempfile、Path.home() 等）都受益。
-# pyjnius 未就绪时静默跳过——core 的 paths.py 安卓分支还有自己的 pyjnius 尝试兜底。
+# pyjnius 失败时退读 TMPDIR 推导（app.core.paths.android_files_dir_from_env，
+# 与内核 paths.py 安卓分支共用一份推导），两头都失败才静默跳过。
 if os.path.isdir("/data/data") and not os.environ.get("HOME"):
+    _files = ""
     try:
         from jnius import autoclass
         _act = autoclass("com.flet.serious_python_android.PythonActivity")
         _files = _act.mActivity.getApplicationContext().getFilesDir().getAbsolutePath()
-        if _files:
-            os.environ["HOME"] = _files
     except Exception:
         pass
+    if not _files:
+        try:
+            from app.core.paths import android_files_dir_from_env
+            _files = android_files_dir_from_env()
+        except Exception:
+            _files = ""
+    if _files:
+        os.environ["HOME"] = str(_files)

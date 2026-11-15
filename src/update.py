@@ -68,40 +68,70 @@ def _headers(extra=None):
 
 
 def is_android() -> bool:
-    """跑在 Android 运行时（pyjnius 可用且宿主 Activity 就绪）？桌面预览为 False。"""
+    """跑在 Android 运行时？纯环境判定（与 app.core.paths.is_android 同源），
+    桌面预览为 False。
+
+    2026-11-16 平板真机：pyjnius 桥接整链失败，旧实现用它判定会把安卓机
+    误判成「电脑预览」→ 更新功能整页锁死。检查/下载/版本显示都不需要
+    pyjnius；pyjnius 是否可用只影响「唤起安装器」一步，另查 jnius_diag()。
+    """
     global _ANDROID
     try:
         return _ANDROID
     except NameError:
         pass
-    try:
-        from jnius import autoclass
-        act = autoclass("com.flet.serious_python_android.PythonActivity")
-        _ANDROID = bool(act.mActivity)
-    except Exception:
-        _ANDROID = False
+    import sys
+    _ANDROID = (sys.platform == "linux"
+                and ("ANDROID_DATA" in os.environ or os.path.isdir("/data/data")))
     return _ANDROID
 
 
+def jnius_diag() -> str:
+    """pyjnius 桥接自检：可用返回空串；失败返回「异常类型: 信息」摘要。
+
+    显示在设置页「关于与更新」卡片上（selectable 可长按复制），桥接异常时
+    老板截图即可把真因带回来，不用连 adb。
+    """
+    try:
+        from jnius import autoclass
+        act = autoclass("com.flet.serious_python_android.PythonActivity")
+        if act.mActivity:
+            return ""
+        return "桥接对象为空（mActivity 不可用）"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 def get_local_version():
-    """本地版本 (versionCode, versionName)。非 Android 返回 (0, "dev")。"""
+    """本地版本 (versionCode, versionName)。
+
+    pyjnius 读包 manifest 失败时退读构建脚本生成的 src/_version.py
+    （build_mobile.bat / CI 在 flet build 前写入），桥接异常时版本号与
+    「有更新吗」比较仍可用。非 Android 返回 (0, "dev")。
+    """
     if not is_android():
         return (0, "dev")
-    from jnius import autoclass
-    act = autoclass("com.flet.serious_python_android.PythonActivity")
-    ctx = act.mActivity.getApplicationContext()
-    info = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0)
-    return (int(info.versionCode), str(info.versionName or ""))
-
-
-def get_download_dir():
-    """更新包落盘目录：Android 用应用私有 cacheDir/updates（FileProvider 已暴露）；
-    桌面预览退回系统临时目录。"""
-    if is_android():
+    try:
         from jnius import autoclass
         act = autoclass("com.flet.serious_python_android.PythonActivity")
         ctx = act.mActivity.getApplicationContext()
-        base = ctx.getCacheDir().getAbsolutePath()
+        info = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0)
+        return (int(info.versionCode), str(info.versionName or ""))
+    except Exception:
+        pass
+    try:
+        from _version import APP_VERSION_CODE, APP_VERSION_NAME
+        return (int(APP_VERSION_CODE), str(APP_VERSION_NAME))
+    except Exception:
+        return (0, "")
+
+
+def get_download_dir():
+    """更新包落盘目录：Android 用应用私有 cacheDir/updates（FileProvider 已
+    暴露整个 cacheDir；cacheDir 从 TMPDIR 读，pyjnius 失败也能下载）；
+    桌面预览退回系统临时目录。"""
+    if is_android():
+        base = os.environ.get("TMPDIR") or tempfile.gettempdir()
     else:
         base = tempfile.gettempdir()
     d = os.path.join(str(base), "updates")

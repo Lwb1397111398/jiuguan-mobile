@@ -167,3 +167,88 @@ def test_manual_check_dispatch(monkeypatch):
     assert r["kind"] == "norelease"
     r = _job_of(lambda code: (_ for _ in ()).throw(update.NetworkError("x")))
     assert r["kind"] == "network" and r["message"]
+
+
+# ---------- is_android 环境判定 / 版本兜底 / 下载目录（2026-11-16 平板回归） ----------
+
+def _reset_android_cache():
+    """清掉 update.is_android 的全局缓存，每次重算。"""
+    if hasattr(update, '_ANDROID'):
+        del update._ANDROID
+
+
+def test_is_android_env_detection(monkeypatch):
+    """环境判定：linux + /data/data 或 ANDROID_DATA 标记 = 安卓，不依赖 pyjnius。"""
+    import sys
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(os.path, 'isdir', lambda p: p == '/data/data')
+    monkeypatch.setattr(update.os.path, 'isdir', lambda p: p == '/data/data')
+    assert update.is_android() is True
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'win32')
+    assert update.is_android() is False
+    _reset_android_cache()
+
+
+def test_get_local_version_falls_back_to_generated_version(monkeypatch):
+    """pyjnius 读包 manifest 失败 → 退读构建生成的 _version.py，不再显示 dev。"""
+    import types
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(os.path, 'isdir', lambda p: p == '/data/data')
+    monkeypatch.setitem(sys.modules, '_version', types.SimpleNamespace(
+        APP_VERSION_CODE=99, APP_VERSION_NAME='0.1.99'))
+    code, name = update.get_local_version()
+    assert (code, name) == (99, '0.1.99')
+    _reset_android_cache()
+
+
+def test_get_local_version_pyjnius_still_used_when_healthy(monkeypatch):
+    """pyjnius 可用时版本号仍以包 manifest 为准（_version.py 只是兜底）。"""
+    import types
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(os.path, 'isdir', lambda p: p == '/data/data')
+    fake_jnius = types.ModuleType('jnius')
+    fake_act = type('PythonActivity', (), {})
+    fake_act.mActivity = object()
+    fake_jnius.autoclass = lambda name: fake_act
+    monkeypatch.setitem(sys.modules, 'jnius', fake_jnius)
+    # pyjnius 可用但 getPackageManager 链没有 mock 到底：只要不再返回 (0, 'dev')
+    # 且 _version.py 未注入时返回 (0, '') 即视为走了 pyjnius 分支
+    monkeypatch.delitem(sys.modules, '_version', raising=False)
+    try:
+        code, name = update.get_local_version()
+    except AttributeError:
+        code, name = None, None
+    assert (code, name) != (0, 'dev')
+    _reset_android_cache()
+
+
+def test_get_download_dir_uses_tmpdir_without_pyjnius(tmp_path, monkeypatch):
+    """下载目录从 TMPDIR 读（=cacheDir），pyjnius 挂了也能下载更新包。"""
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(os.path, 'isdir', lambda p: p == '/data/data')
+    tmpdir = str(tmp_path / 'pkg' / 'cache').replace(chr(92), '/')
+    monkeypatch.setenv('TMPDIR', tmpdir)   # 真机 TMPDIR 是 POSIX 风格
+    d = update.get_download_dir()
+    assert d == os.path.join(tmpdir, "updates")
+    _reset_android_cache()
+
+
+def test_jnius_diag_reports_failure(monkeypatch):
+    """桥接诊断：jnius import 失败返回异常摘要，不抛出。"""
+    import types
+    _reset_android_cache()
+    fake_jnius = types.ModuleType('jnius')
+
+    def boom(name):
+        raise RuntimeError('bridge broken')
+
+    fake_jnius.autoclass = boom
+    monkeypatch.setitem(sys.modules, 'jnius', fake_jnius)
+    d = update.jnius_diag()
+    assert 'RuntimeError' in d and 'bridge broken' in d
+    _reset_android_cache()
