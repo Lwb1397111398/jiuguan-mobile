@@ -4,6 +4,25 @@
 状态机逻辑与桌面版 app/ui/auto_pilot.py 同源：总纲→锁纲→逐卷切章→逐章
 大纲/细纲/正文/归档。生成一律走 gen.start_generation(preview=False)
 （开启即授权），结果直接落库。
+
+两种范围（2026-11-15 从桌面移植 scope，桌面 2026-11-10「一键细化全部大纲」）：
+- scope="all"（默认）：上面那条完整流水线，全书完本才停；
+- scope="outline"：只跑「细化章节大纲」，全书章节细化完即停，**不进切章/
+  正文/归档**。进度记在 chapters.outline_refined 上：停机、关程序后再点一次，
+  已细化的章自动跳过，从没细化的那一章接着做；已锁定大纲（outline_locked）
+  一律不写。暂停/继续/断连续写与 all 范围共用同一份代码。
+
+断连续写（2026-11-15 从桌面移植，桌面 2026-11-06 / 6fcbba9）：
+- 正文生成中途断连（status=stopped 且非用户暂停）不再整步重写，也不再原地
+  停机：成规模的已产出攒成「断点」（内存态，与桌面同款不落盘），重试自动换
+  「继续生成」接力（build_continue_task + 上轮思考 + 降思考档）；
+- 断点最小规模 500 字（太短的碎段不值得续，按普通失败重写）；
+- 续写新增段单独体检（continuation_segment_issue）：第一次不合格丢弃该段、
+  保留底稿下轮重续，连续 2 次放弃断点整步重写；
+- 平台内容审核掐断（safety_blocked）是 fatal：断点一并作废，立即暂停。
+
+失败重试节拍（2026-11-15 对齐桌面）：30秒→1分→隔5分→30秒→1分→隔10分→
+30秒→1分，共 3 轮 9 次尝试，全败才暂停等用户（旧版是立即重试 3 次）。
 """
 import threading
 import time
@@ -18,13 +37,49 @@ STEP_LABELS = {
     "prose": "撰写正文", "archive": "归档记忆",
 }
 
+# scope="outline" 时细化大纲步骤的显示名（与 all 范围区分，让界面/日志看得出当前范围）
+OUTLINE_STEP_NAME = "⚡一键细化大纲"
+
+# 断连续写最小断点规模（对齐桌面 AUTO_CONTINUE_MIN_CHARS）：断片达到才攒断点
+# 走续写，太短的碎段按普通失败重写（碎片续写容易整篇重起）。
+AUTO_CONTINUE_MIN_CHARS = 500
+
+# 续写软失败容忍次数（对齐桌面 CONT_SOFT_FAIL_LIMIT）：新增段被判
+# 「空/拒答/省略收尾/过短」时，第一次只丢弃该段、保留底稿继续从上次正常处续；
+# 连续第 2 次就放弃断点、整步重写（宁可整章重写，不要自我审查的产物落库）。
+CONT_SOFT_FAIL_LIMIT = 2
+
+# 失败重试节拍（秒，与桌面 RETRY_DELAYS 同源）：轮内 30s→60s；第 3 次失败后
+# 隔 5 分钟进第二轮，第 6 次失败后隔 10 分钟进第三轮；第三轮 30s/60s 仍失败
+# → 暂停等用户。共 3 轮 × 3 次 = 9 次尝试。
+RETRY_DELAYS = (30, 60, 300, 30, 60, 600, 30, 60)
+MAX_RETRY = len(RETRY_DELAYS) + 1
+
+
+def _fmt_delay(sec: int) -> str:
+    """重试等待的人话时长：30 →「30 秒」，60/300/600 →「1/5/10 分钟」。"""
+    if sec >= 60 and sec % 60 == 0:
+        return f"{sec // 60} 分钟"
+    return f"{sec} 秒"
+
+
+def _step_owner(step: dict) -> str:
+    """断点归属：kind#章节id（对齐桌面）。断点只跟着同一步骤的重试走，
+    换步骤（暂停期间工程被手动改动等）即作废，防串章拼接。"""
+    ch = step.get("chapter")
+    cid = ch.get("id") if isinstance(ch, dict) else ""
+    return f"{step.get('kind', '')}#{cid}"
+
 
 class AutoPilot:
     """手机版自动模式引擎（回调式，无 Qt 依赖）。"""
 
-    def __init__(self, page, session):
+    def __init__(self, page, session, scope: str = "all"):
         self.page = page
         self.session = session
+        # 执行范围（2026-11-15 从桌面移植）：all=完整流水线（默认）；
+        # outline=只细化章节大纲，细化完即停（大纲页「一键细化全部大纲」）
+        self.scope = scope if scope in ("all", "outline") else "all"
         self.on_state = None        # callable(state: str, info: str)
         self.on_chunk = None        # callable(chars: int)
         self.on_step = None         # callable(label: str)
@@ -36,6 +91,42 @@ class AutoPilot:
         self._last_fail_blocked = False   # 上次生成是否被渠道内容策略拦下（见 _run_gen）
         self._chars = 0
         self._last_emit = 0.0
+        # 失败重试节拍定时器（对齐桌面 RETRY_DELAYS）：手机无 Qt，用
+        # threading.Timer 延时下一拍；暂停/停止时取消，防暂停后还触发。
+        self._retry_timer = None
+        # 断连续写断点（2026-11-15 从桌面移植）：断连时攒下的部分正文/上轮思考，
+        # 跨连续断连累加；成功/换步骤/停机/致命失败即作废。**内存态**，与桌面
+        # 同款不落盘（跨重启不续，重新接管从整步重写开始）。
+        self._cont_base = ""          # 已生成前文（断点底稿）
+        self._cont_thinking = ""      # 上轮思考（英文安全评估不攒）
+        self._cont_rounds = 0         # 续写模式请求数（成功说明用）
+        self._cont_step_id = ""       # 断点归属（kind#章节id），换步骤即作废
+        self._cont_soft_fails = 0     # 续写新增段连续不合格次数（第 2 次放弃断点）
+        self._cont_last_new_len = 0   # 最近一次合格续写新增字数
+
+    # ---------- 断点生命周期 ----------
+
+    def _cont_reset(self):
+        """断点整体作废：前文/思考/轮数清零（成功说明、换步骤、停机、fatal）。"""
+        self._cont_base = ""
+        self._cont_thinking = ""
+        self._cont_rounds = 0
+        self._cont_soft_fails = 0
+        self._cont_last_new_len = 0
+
+    def _cont_breakpoint_clear(self):
+        """断点使命完成（新增段体检合格，底稿已并入正文）后清底稿；
+        轮数留给成功说明（_apply_step 成功后播报）。"""
+        self._cont_base = ""
+        self._cont_thinking = ""
+        self._cont_soft_fails = 0
+
+    def _cancel_retry_timer(self):
+        """取消待触发的重试定时器（暂停/停止/重新安排时调用）。"""
+        t = getattr(self, "_retry_timer", None)
+        if t is not None:
+            t.cancel()
+        self._retry_timer = None
 
     # ---------- 状态 ----------
 
@@ -61,13 +152,21 @@ class AutoPilot:
             return
         self._running = True
         self._paused = False
+        self._retry = 0
         self._stop_event.clear()
-        self._set_state("running")
+        self._cont_reset()
+        self._cont_step_id = ""
+        self._cancel_retry_timer()
+        if self.scope == "outline":
+            self._set_state("running", "⚡一键细化大纲：逐章细化还没细化的大纲，完成后即停")
+        else:
+            self._set_state("running")
         self._tick()
 
     def pause(self):
         if self._task:
             self._task.stop()
+        self._cancel_retry_timer()   # 取消待执行的重试（继续后由 _tick 立即接手）
         self._paused = True
         self._set_state("paused", "已暂停")
 
@@ -83,6 +182,9 @@ class AutoPilot:
         self._paused = False
         if self._task:
             self._task.stop()
+        self._cancel_retry_timer()
+        self._cont_reset()   # 停机：断点一并作废（对齐桌面）
+        self._cont_step_id = ""
         try:
             self.session.store.pipeline().abort()
         except Exception:
@@ -99,7 +201,13 @@ class AutoPilot:
         run_bg(self.page, self._next_step, self._on_step_result)
 
     def _next_step(self) -> dict | None:
-        """状态机：找出下一个待办步骤。"""
+        """状态机：找出下一个待办步骤。
+
+        outline 范围（「一键细化全部大纲」）走另一条分支：只推进大纲细化，
+        不做总纲/锁定/切章/细纲/正文/归档。
+        """
+        if self.scope == "outline":
+            return self._next_outline_step()
         store = self.session.store
         s = store.current_synopsis()
         if not s or not (s.get("content") or "").strip():
@@ -121,6 +229,27 @@ class AutoPilot:
             todo = self._chapter_todo(ch)
             if todo:
                 return todo
+        return None
+
+    def _next_outline_step(self) -> dict | None:
+        """outline 范围专用：按章节顺序返回第一个「大纲还没细化」的章；全做完 → None。
+
+        不做总纲/锁定/切章/细纲/正文/归档——那个入口只买「细化大纲」这一件事。
+
+        跳过规则（都是「用户已经定过稿」的章，绝不覆盖）：
+        - `outline_refined=1`：已细化（或手动保存/粘贴过）= 本次任务的**进度标记**，
+          停机、关程序后重新点一次，就从第一个没细化的章接着做；
+        - `outline_locked=1`：本章大纲已锁定，视为定稿。
+
+        注意：这里自己就把这两类排除了，`_do_outline` 执行前还会再判一次——
+        两处都判，不会出现「跳过 → 又被评估成待办」的空转。
+        """
+        chapters = self.session.store.list_chapters()
+        total = len(chapters)
+        for i, ch in enumerate(chapters, 1):
+            if ch.get("outline_refined") or ch.get("outline_locked"):
+                continue
+            return {"kind": "outline", "chapter": ch, "pos": (i, total)}
         return None
 
     def _chapter_todo(self, ch: dict) -> dict | None:
@@ -154,10 +283,31 @@ class AutoPilot:
             return
         if step is None:
             self._running = False
-            self._set_state("done", "🎉 全书完本！")
+            if self.scope == "outline":
+                self._set_state("done", "✅ 全部章节大纲已细化完成")
+            else:
+                self._set_state("done", "🎉 全书完本！")
             return
+        if not isinstance(step, dict) or not step.get("kind"):
+            # _next_step 抛异常时 run_bg 会把异常包装成 {"ok": False, "error": ...}
+            # 传回来（没有 kind）：不处理会 KeyError 后被 run_bg 吞掉、状态机
+            # 静默卡死（界面停在旧状态不动），这里转为错误交还用户。
+            self._running = False
+            err = step.get("error", "步骤评估失败") if isinstance(step, dict) \
+                else str(step)
+            self._set_state("error", f"自动模式出错：{err}")
+            return
+        # 断点归属校验（对齐桌面）：步骤变了（暂停期间工程被手动改动等）就作废
+        # 旧断点，防止把上一章的前文接到这一章头上。
+        owner = _step_owner(step)
+        if owner != self._cont_step_id:
+            self._cont_reset()
+            self._cont_step_id = owner
         kind = step["kind"]
-        label = STEP_LABELS.get(kind, kind)
+        label = self._step_title(step)
+        if step.get("pos"):
+            # outline 范围带全书进度（i/total 章），让老板看得出还剩多少
+            label = f"{label}（{step['pos'][0]}/{step['pos'][1]} 章）"
         if step.get("chapter"):
             ch = step["chapter"]
             label = f"第{ch.get('order_index')}章 {ch.get('title') or ''} · {label}"
@@ -176,21 +326,45 @@ class AutoPilot:
             return
         fn(step)
 
+    def _step_title(self, step: dict) -> str:
+        """步骤显示名：outline 范围的细化大纲用专属名，界面/日志能看出当前范围。"""
+        if self.scope == "outline" and step.get("kind") == "outline":
+            return OUTLINE_STEP_NAME
+        return STEP_LABELS.get(step.get("kind", ""), "")
+
     def _run_gen(self, role, context, task, step, max_tokens=None):
-        """统一的自动生成调用（免预览、拒答重试、失败暂停）。
+        """统一的自动生成调用（免预览、重试节拍、断连续写、失败暂停）。
 
         重试推杆（2026-09-19 与桌面版对齐）：**被渠道内容策略拦下时不带**——
         拦下说明请求根本没送到模型，「请务必按原任务要求重新输出」按构造帮不上忙；
         桌面版实测该形态 42 条请求 0 条产出正文，而同时段干净报文 155 条里 26 条出文。
-        其余失败类型（拒答/空输出）仍带推杆。
+        其余失败类型（拒答/空输出）仍带推杆；**续写轮不带**（推杆治「不肯写」，
+        续写轮指令已明确写什么，与桌面同款）。
 
         推杆文案**必须与桌面同源**（`app.core.pipeline.REFUSAL_RETRY_EXTRA`）：
         本文件曾自带一份陈旧副本（文案已与桌面漂移），2026-09-19 改为延迟导入，
         与本工程其余部分一样在函数内 import（避免拖慢安卓冷启动）。
+
+        断连续写接力（2026-11-15 对齐桌面 _run 头部）：此前断连攒下的断点
+        （部分正文/上轮思考）→ 任务指令换成 build_continue_task 产物（前文/思考段
+        是 critical 模块，超预算不裁）；continue_round 只在真带上了上轮思考时给
+        （内核据此临时降思考档位，判据与手动「继续生成」同一口径：bool(思考)）。
         """
         from app.core.pipeline import REFUSAL_RETRY_EXTRA
-        retry_extra = (REFUSAL_RETRY_EXTRA
-                       if self._retry > 0 and not self._last_fail_blocked else "")
+        from app.core.pipeline import (build_continue_task,
+                                       continuation_segment_issue,
+                                       join_continuation)
+        cont_base = self._cont_base
+        cont_think = self._cont_thinking
+        cont_round = bool(cont_base.strip() or cont_think.strip())
+        cont_think_attached = bool(cont_think.strip())
+        cont_task = task  # 独立名字：不覆盖参数（闭包晚绑定教训，见 AGENTS.md）
+        if cont_round:
+            cont_task = build_continue_task(task, cont_base, cont_think)
+            retry_extra = ""
+        else:
+            retry_extra = (REFUSAL_RETRY_EXTRA
+                           if self._retry > 0 and not self._last_fail_blocked else "")
         ctx = {**context, "extra": retry_extra} if retry_extra else context
 
         def on_started(tk):
@@ -215,12 +389,20 @@ class AutoPilot:
                 self._fail(step, result.get("error", "生成失败"))
                 return
             if result.get("status") == "stopped":
-                self.pause()
+                # 「停止」区分（对齐桌面 2026-09-08）：用户主动暂停就停在当前
+                # 进度；流式半路网络中断/服务端掐断按断连处置——攒断点下一拍
+                # 自动续写接力，不再原地停机也不再整章重写。
+                if self._paused:
+                    self._set_state("paused", "已暂停")
+                    return
+                self._accumulate_breakpoint(step, role, result)
                 return
             if result.get("safety_blocked"):
                 # 平台内容审核掐断（2026-11-05，与桌面版对齐）：finish_reason=
                 # sensitive / content_filter。审核看的是内容本身，不看推杆，
                 # 同报文重试必然再被掐 → 不重试，直接停下交给人换渠道/降素材。
+                # fatal（对齐桌面）：断点一并作废。
+                self._cont_reset()
                 self._retry = 0
                 fr = result.get("finish_reason") or "content_filter"
                 self._fail(step, f"被平台内容审核在生成中途掐断（finish_reason={fr}）——"
@@ -231,37 +413,132 @@ class AutoPilot:
                 # 拦截占位说明不是正文，绝不能丢给解析器（解析成空只会报
                 # 「解析失败」，老板看不出真正原因）
                 self._retry += 1
-                if self._retry >= 3:
-                    self._retry = 0
-                    self._fail(step, "被渠道内容策略拦截（请求没送到模型就被上游拦下）")
-                else:
-                    self._tick()
+                self._bump_retry_or_fail(
+                    step, "被渠道内容策略拦截（请求没送到模型就被上游拦下）")
                 return
             if not text or detect_refusal(text):
                 self._retry += 1
-                if self._retry >= 3:
-                    self._retry = 0
-                    self._fail(step, "连续 3 次输出为空或疑似拒答")
-                else:
-                    self._tick()
+                self._bump_retry_or_fail(step, "输出为空或疑似拒答")
                 return
+            # 续写轮：先**单独体检这一轮新写出来的那段**，合格才拼回前文
+            # （对齐桌面 2026-11-10）。旧闸门看的是合并稿：前文够长就必然过闸，
+            # 「续写 0 字」「只补一句此处省略」都会落库。现在不合格只丢弃该段、
+            # 底稿保留（下轮仍从上次正常处续）；连续 2 次放弃断点整步重写。
+            if cont_round:
+                issue = continuation_segment_issue(role, text, cont_base)
+                if issue:
+                    self._cont_soft_fails += 1
+                    fails = self._cont_soft_fails
+                    self._retry += 1
+                    if fails >= CONT_SOFT_FAIL_LIMIT:
+                        self._cont_reset()   # 放弃断点：下一拍按原始任务整步重写
+                        self._bump_retry_or_fail(
+                            step, f"续写连续 {fails} 次不合格（{issue}），"
+                                  "已放弃断点，下一拍整步重写")
+                    else:
+                        self._bump_retry_or_fail(
+                            step, f"续写新增段不合格（{issue}）：已丢弃该段，"
+                                  f"保留前文 {len(cont_base)} 字，下轮从断点重续")
+                    return
+                self._cont_last_new_len = len(text)
+                head = cont_base.strip()[:60]
+                if head and text.startswith(head):
+                    # 整篇重写护栏（对齐桌面）：模型以断点开头整篇重写 → 以新输出为准
+                    pass
+                else:
+                    text = join_continuation(cont_base, text)
+                self._cont_rounds += 1
+                self._cont_breakpoint_clear()  # 新增段合格：断点使命完成，轮数留给说明
             self._retry = 0
             self._apply_step(step, result, text)
 
         start_generation(self.page, self.session, role=role, context=ctx,
-                         task=task, title=STEP_LABELS.get(step["kind"], ""),
+                         task=cont_task, title=self._step_title(step),
                          on_done=on_done, on_text=on_text, on_started=on_started,
-                         preview=False, max_tokens=max_tokens)
+                         preview=False, max_tokens=max_tokens,
+                         continue_round=cont_think_attached)
+
+    def _accumulate_breakpoint(self, step, role, result):
+        """断连处置（对齐桌面）：成规模的已产出攒成断点，下一拍重试自动续写
+        而不是从头重写。断点跨连续断连累加（join_continuation 接缝去重 +
+        trim_unfinished_tail 裁半句），思考同理累加；英文安全评估不攒。
+
+        断片也要体检：模型在断连前可能已经开始写「抱歉」「此处省略」，把这种
+        断片攒进底稿 = 下次续写从垃圾后面接，越接越歪。命中即丢弃该断片，
+        底稿保持在上一次正常内容上。太短的断片不攒（碎片续写容易整篇重起），
+        按普通失败走既有重写节拍。
+        """
+        from app.core.pipeline import (detect_blocked_output, detect_refusal,
+                                       detect_soft_evasion, detect_upstream_block,
+                                       is_safety_thinking, join_continuation,
+                                       trim_unfinished_tail)
+        part = (result.get("text") or "").strip()
+        if part and (detect_refusal(part) or detect_blocked_output(part)
+                     or detect_upstream_block(part) or detect_soft_evasion(part)):
+            self._retry += 1
+            self._bump_retry_or_fail(
+                step, "生成中途断连，但断片疑似拒答/自我审查，已丢弃"
+                      "（底稿保留上次正常内容）")
+            return
+        pthink = (result.get("thinking") or "")
+        keep_think = bool(pthink.strip()) and not is_safety_thinking(pthink)
+        if len(part) >= AUTO_CONTINUE_MIN_CHARS or (not part and keep_think):
+            if part:
+                self._cont_base = join_continuation(
+                    self._cont_base, trim_unfinished_tail(part))
+            if keep_think:
+                self._cont_thinking = (self._cont_thinking + "\n" + pthink).strip()
+            self._cont_rounds += 1
+            self._retry += 1
+            extra = f"，思考 {len(self._cont_thinking)} 字" if self._cont_thinking else ""
+            self._bump_retry_or_fail(
+                step, "生成中途断连（疑似网络中断/服务端掐断）｜已保留断点"
+                      f"（前文 {len(self._cont_base)} 字{extra}），稍后自动续写")
+            return
+        self._retry += 1
+        self._bump_retry_or_fail(
+            step, "生成中途断连（断片太短，不值得续写），按普通失败重试")
+
+    def _bump_retry_or_fail(self, step, err):
+        """计入本次失败并按节拍安排下一拍（与桌面 RETRY_DELAYS 同源）。
+
+        手机无 Qt 定时器，用 threading.Timer 延时下一拍（daemon 线程，
+        暂停/停止时取消）。超过 MAX_RETRY（3 轮 9 次）才暂停交还用户；
+        **断点保留**（点「继续」从断点接着接力，对齐桌面）。
+        """
+        self._cancel_retry_timer()
+        if self._retry >= MAX_RETRY:
+            self._retry = 0
+            self._fail(step, f"{err}｜连续 {MAX_RETRY} 次失败，已暂停")
+            return
+        delay = RETRY_DELAYS[self._retry - 1]
+        self._set_state("retrying",
+                        f"{err}；{_fmt_delay(delay)}后自动重试"
+                        f"（第 {self._retry + 1}/{MAX_RETRY} 次）")
+        t = threading.Timer(delay, self._tick)
+        t.daemon = True
+        self._retry_timer = t
+        t.start()
 
     def _fail(self, step, msg):
         self._paused = True
-        self._set_state("error", f"{STEP_LABELS.get(step['kind'], '')}：{msg}")
+        self._set_state("error", f"{self._step_title(step)}：{msg}")
 
     def _apply_step(self, step, result, text):
         """解析并落库（工作线程回调里执行；落库后 tick 下一步）。"""
         from app.core.pipeline import Pipeline
         store = self.session.store
         kind = step["kind"]
+        # 断点接力成功说明（对齐桌面 ok note：「断点续写 N 轮接力」）：
+        # 续写轮走到这里就算使命完成（底稿已并入 text），无论本步解析成败
+        # 轮数都归零——解析失败的重试是不带断点的普通重试。
+        cont_note = ""
+        if self._cont_rounds:
+            tail = (f"（末轮新增 {self._cont_last_new_len} 字）"
+                    if self._cont_last_new_len else "")
+            cont_note = f"断点续写 {self._cont_rounds} 轮接力{tail}"
+        self._cont_rounds = 0
+        self._cont_last_new_len = 0
         try:
             if kind == "synopsis":
                 cands, err = Pipeline.parse_synopsis_candidates(text)
@@ -325,12 +602,10 @@ class AutoPilot:
                 raise ValueError(f"未知步骤 {kind}")
         except ValueError as e:
             self._retry += 1
-            if self._retry >= 3:
-                self._retry = 0
-                self._fail(step, str(e))
-            else:
-                self._tick()
+            self._bump_retry_or_fail(step, str(e))
             return
+        if cont_note:
+            self._set_state("running", f"{self._step_title(step)}：{cont_note}")
         # 成功 → 归档步骤紧随正文
         if kind == "prose" and step.get("chapter"):
             self._do_archive({"chapter": step["chapter"]})
@@ -377,6 +652,16 @@ class AutoPilot:
         from app.core.task_templates import render as render_task
         store = self.session.store
         ch = store.get_chapter(step["chapter"]["id"])
+        if not ch:
+            # 章已被删除（评估到执行之间）：跳过，直接评估下一步（对齐桌面）
+            self._tick()
+            return
+        if self.scope == "outline" and ch.get("outline_locked"):
+            # 只细化范围：锁定=用户已定稿，绝不覆盖。_next_outline_step 同样
+            # 排除锁定章，两处都判不会「跳过→又被评估成待办」空转
+            # （对齐桌面 _step_outline）；all 范围保持原行为（照常细化）。
+            self._tick()
+            return
         vol = store.get_volume(ch.get("volume_id")) if ch.get("volume_id") else None
         vol_summary = (vol.get("summary") if vol else "") or ""
         chapters_in_vol = [c for c in store.list_chapters()

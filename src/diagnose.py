@@ -35,7 +35,7 @@ def diagnose(result, role: str, text: str, batch_continue: bool = False):
     if not text:
         return "", "", ""
 
-    from app.core.pipeline import detect_refusal, detect_unfinished
+    from app.core.pipeline import detect_refusal, detect_unfinished, state_bar_started
 
     # 1) 上游输入端拦截：请求没送到模型，回传的是渠道的拦截说明（与破甲无关）
     if result.get("upstream_blocked"):
@@ -73,8 +73,17 @@ def diagnose(result, role: str, text: str, batch_continue: bool = False):
                 "（如 100 秒）或网络波动，内容可能没写完。若反复出现，"
                 "建议到「模型」页把该档案的超时调大，并确认渠道没有短超时限制。")
 
-    # 5) 上限截断（finish_reason=length）
+    # 5) 上限截断（finish_reason=length）——带状态栏收货豁免（2026-11-11 桌面同款）：
+    #    正文已写到批尾状态栏（【滚动状态包】标记行 / 连续字段行出现在输出末尾窗口）
+    #    时，正文本身已完整，渠道只是掐在状态栏里 → 不判「疑似不完整」（reason 留空，
+    #    落库前不弹确认），只给一条正常提示——对齐桌面 TaskRunDialog：正文完整
+    #    不亮异常、不设 _incomplete_reason。
     if result.get("truncated"):
+        if state_bar_started(text):
+            return ("", "",
+                    "输出在末尾状态栏处被长度上限截断——正文已完整收下，残缺状态栏"
+                    "不影响正文（分批接力缺字段时自动退化为末尾两段衔接），"
+                    "可直接落库。")
         cont = int(result.get("continued") or 0)
         reason = (f"输出被长度上限截断（已自动续写 {cont} 轮仍被截断）" if cont > 0
                   else "输出被长度上限截断")

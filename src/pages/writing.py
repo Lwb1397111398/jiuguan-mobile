@@ -4,6 +4,11 @@
 流程与落库对齐桌面版（总纲候选→锁定导入分卷→切章→细化大纲→整章正文→归档），
 UI 面向手机：确认环节用 bottom sheet / 对话框。
 
+总纲支持「分批生成」（对齐桌面 2026-11-07）：超大故事专用，AI 每批写几卷就停、
+批末带【分批进度】标记，每批停下四选确认（继续/收尾/微调/放弃），跨会话可续跑；
+写作台「更多」含「清空全书正文」（删什么/留什么摊开确认，清前内核自动整库备份）；
+大纲页含「⚡一键细化全部大纲」（AutoPilot scope="outline"，细化完即停）。
+
 写作台支持两种写法（`store.get_prose_mode()`）：
 - `chapter` 一次性（整章写完）：编辑器 + 生成整章 + 改写 + 接受本章；
 - `batch` 分批（接力写作）：按细纲块分组逐批生成，滚动状态包自动衔接
@@ -52,6 +57,25 @@ class WritingPage:
         self._desk_chapter_id = None
         # 改写来源的章（接受后即使已有快照也自动重归档，见 _after_prose_done）
         self._pending_rewrite: set = set()
+        # 切章接力队列（总纲迭代保存后 _try_relay 填充，_relay_pump 串行推进）
+        self._relay_queue: list = []
+        # ⚡自动模式引擎：全书流水线（build 时创建）与一键细化大纲（确认后创建，
+        # scope="outline"）。同一时间只允许一台在跑（_ap_running_any 统一互斥）。
+        self._ap = None
+        self._ap_outline = None
+        # 「retrying」状态的顶栏提示文本（引擎重试等待期间如实显示，非完成非出错）
+        self._ap_retrying = ""
+        # 总纲分批生成状态机（对齐桌面 synopsis_page 2026-11-07 两轮 af9aa94/37fe742）：
+        # _batch_no=0 空闲；>0 链活着（_batch_running=True 运行中 / False 暂停微调，
+        # 总纲页按钮变「继续下一批（第N+1批）」）。桌面把累积原文放在编辑器里，
+        # 手机无持久编辑器 → 累积在 _batch_partial（内存），并同步 4 个项目设置键
+        # （synopsis_batch_partial/no/req/plan）支持跨会话续跑。
+        self._batch_running = False
+        self._batch_no = 0
+        self._batch_snapshot = ""   # 发起分批前的总纲原文（「放弃全部」时恢复）
+        self._batch_req = ""        # 分批创作要求（每批注入）
+        self._batch_plan = ""       # 批次规划文本（每批注入，可重新规划）
+        self._batch_partial = ""    # 已累积的全部批次原文（尚未落库）
 
     # ---------- 通用 ----------
 
@@ -88,8 +112,24 @@ class WritingPage:
 
     # ---------- ⚡ 自动模式 ----------
 
+    def _ap_active(self):
+        """当前应显示在顶栏的引擎：outline 一键细化在跑时优先显示它
+        （互斥保证同一时间只有一台在跑）。"""
+        ap2 = getattr(self, "_ap_outline", None)
+        if ap2 is not None and ap2.running:
+            return ap2
+        return getattr(self, "_ap", None)
+
+    def _ap_running_any(self) -> bool:
+        """任一自动引擎在跑（⚡全书流水线 / ⚡一键细化大纲 共用同一互斥判据，
+        对齐桌面「同一本书一台引擎」）。"""
+        for ap in (getattr(self, "_ap", None), getattr(self, "_ap_outline", None)):
+            if ap is not None and ap.running:
+                return True
+        return False
+
     def _ap_bar(self) -> ft.Control:
-        ap = self._ap
+        ap = self._ap_active()
         label = (self._ap_label or {}).get("v", "") if hasattr(self, "_ap_label") else ""
         if ap is None or not ap.running:
             return ft.Row([
@@ -103,10 +143,17 @@ class WritingPage:
                                        on_click=lambda e: ap.resume())
             color = ft.Colors.ORANGE
         else:
-            state_text = label or "自动推进中…"
+            retrying = getattr(self, "_ap_retrying", "")
+            if retrying:
+                # 重试等待中（2026-11-15 接线）：引擎到点自动续跑，这里如实显示，
+                # 不当「完成」也不当「出错」处理；「暂停」可取消本次等待
+                state_text = f"⚠ 重试等待中：{retrying}"
+                color = ft.Colors.ORANGE
+            else:
+                state_text = label or "自动推进中…"
+                color = ft.Colors.GREEN
             btn = ft.OutlinedButton("暂停", icon=ft.Icons.PAUSE,
                                     on_click=lambda e: ap.pause())
-            color = ft.Colors.GREEN
         return ft.Container(
             ft.Row([
                 ft.Text(state_text, size=12, expand=True,
@@ -152,6 +199,9 @@ class WritingPage:
         ))
 
     def _ap_confirm_start(self):
+        if self._ap_running_any():
+            toast(self.page, "已经有一个自动任务在跑，不能同时开第二台", error=True)
+            return
         self._ap.start()
         self.refresh()
 
@@ -160,6 +210,12 @@ class WritingPage:
                 lambda: (self._ap.stop(), self.refresh()))
 
     def _ap_state(self, state: str, info: str = ""):
+        if state == "retrying":
+            # 重试等待中：只更新顶栏提示，等引擎定时器到点自动续跑；
+            # 绝不能误触「done（全书完本）」或「error（暂停交还用户）」语义
+            self._ap_retrying = info or ""
+        elif state in ("running", "paused", "idle", "done", "error"):
+            self._ap_retrying = ""
         if state == "done":
             toast(self.page, info or "全书完本！")
         elif state == "error":
@@ -182,6 +238,15 @@ class WritingPage:
         self.refresh()
 
     def refresh(self):
+        # 总纲分批运行中：批次成果在内存累积区（库内容还是旧总纲），整页重建会把
+        # 界面刷回旧库内容、盖掉确认框底下的批次展示——只做轻量刷新（对齐桌面
+        # synopsis_page.refresh 的跳过防呆）；批次链结束走落库/放弃 → 恢复正常刷新。
+        if getattr(self, "_batch_running", False):
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         if self.on_refresh:
             self.on_refresh()
         else:
@@ -189,6 +254,13 @@ class WritingPage:
                 self.page.update()
             except Exception:
                 pass
+
+    def _dlg_h(self, base: int) -> int:
+        """对话框高度兜底（Flet 0.86 小屏坑）：不超过页面可用高度。"""
+        ph = getattr(self.page, "height", 0) or 0
+        if ph and ph > 320:
+            return max(240, min(base, int(ph - 96)))
+        return base
 
     def _running(self, tk: StreamTask, title: str):
         """生成中模态框：字数进度 + 停止。返回关闭函数。"""
@@ -267,27 +339,50 @@ class WritingPage:
     def _synopsis_view(self) -> ft.Control:
         store = self.session.store
         s = store.current_synopsis()
-        content = (s.get("content") or "").strip() if s else ""
         locked = bool(s.get("is_locked")) if s else False
+        # 总纲分批链活着：展示区改显已累积的批次原文（尚未落库，桌面=编辑器内容）
+        chain_alive = self._batch_no > 0
+        content = ((self._batch_partial or "").strip() if chain_alive
+                   else ((s.get("content") or "").strip() if s else ""))
         head = ft.Row([
             ft.Text("故事总纲", size=17, weight=ft.FontWeight.BOLD, expand=True),
             ft.Chip(ft.Text("已锁定" if locked else "未锁定"),
                     bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.TEAL if locked
                                                    else ft.Colors.GREY)),
         ])
-        body_controls = [
-            head,
-            *( [ft.Container(ft.Text(content, size=13, selectable=True),
+        body_controls = [head]
+        if chain_alive:
+            body_controls.append(hint(
+                f"分批进行中：已写到第 {self._batch_no} 批，全部完成后才会落库为新总纲"
+                + ("（本批生成中…）" if self._batch_running
+                   else "（已暂停：可点下方「微调」改已生成部分，再点「继续下一批」）")))
+        if content:
+            body_controls.append(ft.Container(ft.Text(content, size=13, selectable=True),
                              bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
                              border_radius=10, padding=12,
-                             margin=ft.Margin(left=0, right=0, top=8, bottom=8))]
-               if content else [empty("还没有总纲\n点下方「AI 生成总纲」开始，"
-                                       "或「手动编辑」直接写")]),
-        ]
+                             margin=ft.Margin(left=0, right=0, top=8, bottom=8)))
+        elif chain_alive:
+            body_controls.append(empty("第 1 批生成中…\n每批完成会停下来让你确认"))
+        else:
+            body_controls.append(empty("还没有总纲\n点下方「AI 生成总纲」开始，"
+                                       "或「手动编辑」直接写"))
+        # 分批按钮双态（对齐桌面 _batch_btn_sync）：链活着→「继续下一批（第N+1批）」
+        # 运行中禁用；空闲→「分批生成」。gen/iter 在链活着期间禁用——一次生成/迭代
+        # 落库会覆盖批次累积内容。
+        batch_label = (f"继续下一批（第{self._batch_no + 1}批）" if chain_alive
+                       else "分批生成")
         actions = ft.Column([
             ft.Row([
                 ft.FilledButton("AI 生成总纲", on_click=self._syn_generate,
-                                icon=ft.Icons.AUTO_AWESOME),
+                                icon=ft.Icons.AUTO_AWESOME, disabled=chain_alive),
+                ft.FilledTonalButton(batch_label, on_click=self._generate_batched,
+                                     icon=ft.Icons.PLAYLIST_ADD,
+                                     disabled=(self._batch_running if chain_alive
+                                               else bool(locked))),
+                ft.TextButton("微调" if chain_alive else "AI 迭代",
+                              on_click=lambda e: self._batch_tune_dialog()
+                              if chain_alive else self._syn_iterate(e),
+                              disabled=chain_alive and self._batch_running),
             ], spacing=8, wrap=True),
             # 协议栈增强开关（2026-09-23）：全局设置，与桌面版共用同一个键。
             # 破不了甲时打开（仅总纲任务生效，会多耗 token）。
@@ -295,14 +390,15 @@ class WritingPage:
                       value=str(store.get_setting("protocol_stack_enabled", "0")) == "1",
                       on_change=self._syn_toggle_stack),
             ft.Row([
-                ft.TextButton("AI 迭代", on_click=self._syn_iterate,
-                              disabled=not content),
                 ft.TextButton("手动编辑", on_click=self._syn_edit,
                               disabled=bool(locked)),
                 ft.TextButton("锁定并导入分卷", on_click=self._syn_lock,
-                              icon=ft.Icons.LOCK, disabled=not content or locked),
+                              icon=ft.Icons.LOCK,
+                              disabled=not content or locked or chain_alive),
             ], spacing=4, wrap=True),
-            hint("锁定时自动识别总纲里的「### 分卷一/二…」并导入分卷页。"),
+            hint("一般故事用「AI 生成总纲」；超大故事用「分批生成」——AI 每次只写几卷，"
+                 "每批结束停下来确认（继续/收尾/微调/放弃），每卷概述更充分。"
+                 "锁定时自动识别总纲里的「### 分卷一/二…」并导入分卷页。"),
         ], spacing=4)
         return ft.Column(body_controls + [actions], scroll=ft.ScrollMode.AUTO,
                          expand=True, spacing=2)
@@ -363,6 +459,11 @@ class WritingPage:
                 "确定锁定？", _yes)
 
     def _syn_generate(self, e):
+        # 分批链活着时总纲页按钮已禁用；这里再拦一层防程序化重入
+        # （一次生成落库会覆盖批次累积内容，对齐桌面 gen_btn 禁用语义）
+        if self._batch_no > 0:
+            toast(self.page, "总纲分批进行中——收尾或放弃后再生成总纲", error=True)
+            return
         req_field = ft.TextField(label="创作要求（可选）", multiline=True, min_lines=2,
                                  max_lines=4,
                                  hint_text="题材、主角、金手指、风格、结局倾向…留空让 AI 自由发挥")
@@ -407,8 +508,407 @@ class WritingPage:
                          context={"user_req": user_req}, task=task,
                          title="生成总纲", on_done=on_done, on_started=on_started)
 
-    def _pick_candidate(self, cands: list):
-        """候选选择 sheet → 确认全文 → 锁定。"""
+    # ---------- 总纲分批生成（超大故事专用，对齐桌面 2026-11-07 两轮） ----------
+    # 与一次生成（brainstorm）并行的可选通道：AI 每批写几卷就停，批末输出
+    # 【分批进度】标记（Pipeline.parse_synopsis_batch_marker 解析），下一批把
+    # 此前所有批次完整原文注入（context["synopsis_prev_batches"] → 内核
+    # assembler critical 模块）。每批停下四选确认（继续/收尾/微调/放弃）。
+    # 状态机：_batch_no=0 空闲；>0 链活着（_batch_running=True 运行中 /
+    # False 暂停微调）。累积原文桌面放编辑器，手机放 _batch_partial，
+    # 并同步 4 个项目设置键跨会话续跑。
+
+    def _generate_batched(self, e=None):
+        """「分批生成」入口（对齐桌面 _generate_batched）：链活着→续下一批；
+        检测到未完成分批 → 问「接着写 / 丢弃重新开始 / 取消」；否则收创作要求
+        → 收批数 → 规划 → 确认后跑第 1 批。"""
+        store = self.session.store
+        if store is None:
+            return
+        if self._batch_no > 0:
+            # 链活着：运行中拒绝重入（防两条分批链互相覆盖）；暂停态直接续下一批
+            if self._batch_running:
+                toast(self.page, "上一批还在生成中，等本批完成弹出确认框")
+                return
+            self._run_batch(self._batch_no + 1, self._batch_req)
+            return
+        partial = str(store.get_setting("synopsis_batch_partial", "") or "")
+        if partial.strip():
+            self._batch_resume_dialog(store)
+            return
+        self._batch_ask_request()
+
+    def _batch_resume_dialog(self, store):
+        """跨会话/中断检测（对齐桌面三问框，Esc=取消）：
+        接着写第N+1批 / 丢弃重新开始 / 取消。"""
+        no = int(str(store.get_setting("synopsis_batch_no", "0") or "0") or 0)
+
+        def _next(ev):
+            self.page.pop_dialog()
+            self._batch_resume_from_persisted()
+
+        def _discard(ev):
+            self.page.pop_dialog()
+            self._batch_clear_state()
+            self.refresh()
+            self._batch_ask_request()
+
+        def _cancel(ev):
+            self.page.pop_dialog()
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("检测到未完成的分批总纲"),
+            content=ft.Container(ft.Text(
+                f"上次分批写到第{no}批未完成，已生成部分已保存。怎么处理？\n\n"
+                "（接着写会恢复已生成部分，从下一批继续，规划与创作要求一并恢复）",
+                size=13), width=440),
+            actions=[ft.TextButton("取消", on_click=_cancel),
+                     ft.TextButton("丢弃重新开始", on_click=_discard),
+                     ft.FilledButton("接着写", on_click=_next)],
+            actions_alignment=ft.MainAxisAlignment.END))
+
+    def _batch_resume_from_persisted(self):
+        """跨会话/中断后接着写（对齐桌面 _batch_resume_from_persisted）：
+        4 个设置键恢复累积原文与内存态，直接续跑下一批。"""
+        store = self.session.store
+        if store is None:
+            return
+        no = int(str(store.get_setting("synopsis_batch_no", "0") or "0") or 0)
+        self._batch_no = no
+        self._batch_req = str(store.get_setting("synopsis_batch_req", "") or "")
+        self._batch_plan = str(store.get_setting("synopsis_batch_plan", "") or "")
+        self._batch_partial = str(store.get_setting("synopsis_batch_partial", "") or "")
+        self._batch_running = True
+        self.refresh()
+        self._run_batch(no + 1, self._batch_req)
+
+    def _batch_ask_request(self):
+        """收创作要求（对齐桌面 ask_long_text）→ 接着收批数。"""
+        req_field = ft.TextField(label="创作要求（可选）", multiline=True, min_lines=2,
+                                 max_lines=4,
+                                 hint_text="题材、主角、金手指、风格、结局倾向…留空让 AI 自由发挥")
+
+        def _ok(ev):
+            req = (req_field.value or "").strip()
+            self.page.pop_dialog()
+            self._batch_ask_count(req)
+
+        def _cancel(ev):
+            self.page.pop_dialog()
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("创作要求（分批生成）"),
+            content=ft.Container(req_field, width=460),
+            actions=[ft.TextButton("取消", on_click=_cancel),
+                     ft.FilledButton("下一步", on_click=_ok)],
+            actions_alignment=ft.MainAxisAlignment.END))
+
+    def _batch_ask_count(self, req: str):
+        """收批数（对齐桌面 ask）：留空 = AI 按故事体量自判（1~8 批，>8 夹 8）。"""
+        count_field = ft.TextField(label="打算分几批写完？",
+                                   hint_text="留空 = AI 按故事体量自判（1~8 批）")
+
+        def _ok(ev):
+            raw = (count_field.value or "").strip()
+            self.page.pop_dialog()
+            if raw and not raw.isdigit():
+                toast(self.page, "批数请填数字（1~8），留空让 AI 自判", error=True)
+                return
+            batch_hint = (f"用户要求全书共分 {min(int(raw), 8)} 批，"
+                          f"务必恰好 {min(int(raw), 8)} 批。" if raw
+                          else "批数由你根据故事体量判断（1~8 批）。")
+            self._call_batch_plan(req, batch_hint, prev_hint="")
+
+        def _cancel(ev):
+            self.page.pop_dialog()
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("分批规划"),
+            content=ft.Container(count_field, width=460),
+            actions=[ft.TextButton("取消", on_click=_cancel),
+                     ft.FilledButton("下一步", on_click=_ok)],
+            actions_alignment=ft.MainAxisAlignment.END))
+
+    def _call_batch_plan(self, req: str, batch_hint: str, prev_hint: str = ""):
+        """发规划调用（对齐桌面 _call_batch_plan）：轻量一调出批次安排，
+        结果经用户确认后才开跑。"""
+        from app.core.task_templates import render as render_task
+        store = self.session.store
+        task = render_task("synopsis_batch_plan", store,
+                           batch_hint=batch_hint, prev_hint=prev_hint)
+        close_running = None
+
+        def on_started(tk):
+            nonlocal close_running
+            close_running = self._running(tk, "总纲分批·批次规划…")
+
+        def on_done(result):
+            nonlocal close_running
+            if close_running:
+                close_running()
+                close_running = None
+            self._on_plan_done(req, batch_hint, prev_hint, result)
+
+        start_generation(self.page, self.session, role="synopsis",
+                         context={"user_req": req}, task=task,
+                         title="总纲分批·批次规划",
+                         on_done=on_done, on_started=on_started)
+
+    def _on_plan_done(self, req: str, batch_hint: str, prev_hint: str, result):
+        """规划完成（对齐桌面 _on_plan_done）：展示规划三选——按此开始 /
+        重新规划（带上次规划重调）/ 放弃（未跑批无损失）。"""
+        if not isinstance(result, dict) or not result.get("ok"):
+            return  # 失败 toast 已在 gen 里统一弹
+        plan = str(result.get("text") or "").strip()
+        if not plan:
+            toast(self.page, "批次规划输出为空，请重新点「分批生成」", error=True)
+            return
+
+        def _go(ev):
+            self.page.pop_dialog()
+            self._batch_plan = plan
+            self._batch_no = 1
+            self._batch_running = True
+            s = self.session.store.current_synopsis()
+            self._batch_snapshot = (s.get("content") or "") if s else ""
+            self._batch_partial = ""
+            self._batch_save_state()   # 规划随状态一并持久化（中断后可恢复）
+            self.refresh()
+            self._run_batch(1, req)
+
+        def _re(ev):
+            self.page.pop_dialog()
+            self._call_batch_plan(req, batch_hint,
+                                  prev_hint=f"上一版规划如下（用户认为不合适）：\n{plan}\n"
+                                            f"请调整后重新给出。")
+
+        def _no(ev):
+            self.page.pop_dialog()
+        self.page.show_dialog(ft.BottomSheet(
+            content=ft.Container(ft.Column([
+                ft.Text("批次规划（确认后开跑）", size=15, weight=ft.FontWeight.BOLD),
+                hint("这是 AI 对「全书分几批、每批写哪些卷」的安排，"
+                     "每批执行时都会整体注入。"),
+                ft.Container(ft.Text(plan, size=12, selectable=True),
+                             bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
+                             border_radius=8, padding=8),
+                ft.Row([
+                    ft.TextButton("放弃", on_click=_no),
+                    ft.TextButton("重新规划", on_click=_re),
+                    ft.FilledButton("按此开始", on_click=_go),
+                ], alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+                padding=16, height=self._dlg_h(520)),
+            show_drag_handle=True))
+
+    def _run_batch(self, batch_no: int, req: str):
+        """发一批（对齐桌面 _run_batch）：模板按批号选首批/续批；注入内容=
+        累积原文现值（暂停微调后的内容也生效）+ 批次规划。"""
+        from app.core.task_templates import render as render_task
+        store = self.session.store
+        self._batch_running = True   # 防重入：续批/恢复续跑/四选续批统一在此置位
+        prev = (self._batch_partial or "").strip()
+        task = render_task("synopsis_batch_first" if batch_no == 1
+                           else "synopsis_batch_next", store, batch_no=batch_no)
+        close_running = None
+
+        def on_started(tk):
+            nonlocal close_running
+            close_running = self._running(tk, f"总纲分批·第{batch_no}批…")
+
+        def on_done(result):
+            nonlocal close_running
+            if close_running:
+                close_running()
+                close_running = None
+            self._on_batch_done(store, batch_no, req, result)
+
+        start_generation(self.page, self.session, role="synopsis",
+                         context={"user_req": req, "synopsis_prev_batches": prev,
+                                  "synopsis_batch_plan": self._batch_plan},
+                         task=task, title=f"总纲分批·第{batch_no}批",
+                         on_done=on_done, on_started=on_started)
+
+    def _on_batch_done(self, store, batch_no: int, req: str, result):
+        """批次完成（对齐桌面 _on_batch_done）：解析批末标记 → 累积原文 →
+        分支：完结或达上限 → 收尾落库；未完结 → 四选确认。
+        失败/取消/项目关闭走中断框。"""
+        if store is None or store.is_closed:
+            self._batch_interrupted(batch_no, req, "项目已关闭，本批结果未返回")
+            return
+        if not isinstance(result, dict) or not result.get("ok"):
+            err = result.get("error", "生成失败") if isinstance(result, dict) \
+                else "生成被取消"
+            self._batch_interrupted(batch_no, req, err)
+            return
+        from app.core.pipeline import SYNOPSIS_BATCH_MAX, Pipeline
+        clean, vol_no, finished = Pipeline.parse_synopsis_batch_marker(
+            result.get("text") or "")
+        cur = (self._batch_partial or "").rstrip()
+        # 防呆①本批有效内容 <30 字疑似空转；②与已累积内容完全相同（复读）
+        if len(clean) < 30 or (cur and clean == cur.strip()):
+            self._batch_interrupted(batch_no, req,
+                                    "本批输出过短或与已生成部分完全相同，疑似空转")
+            return
+        self._batch_partial = clean if not cur else cur + "\n\n" + clean
+        self._batch_no = batch_no
+        self._batch_save_state()   # 每批完成即持久化（中断后可跨会话续）
+        self.refresh()
+        if finished or batch_no >= SYNOPSIS_BATCH_MAX:
+            if not finished:
+                toast(self.page, f"已达 {SYNOPSIS_BATCH_MAX} 批上限，强制收尾（AI 未报完结）")
+            self._batch_finish(store)
+            return
+        self._batch_confirm_sheet(store, batch_no, req, vol_no)
+
+    def _batch_confirm_sheet(self, store, batch_no: int, req: str, vol_no: int):
+        """每批完成四选确认（对齐桌面四问框）：继续下一批 / 就此收尾 /
+        暂停微调 / 放弃全部。拖下手柄关闭 sheet = 暂停微调（桌面 Esc 同款防误触）。"""
+        clicked = {"v": False}
+
+        def _next(ev):
+            clicked["v"] = True
+            self.page.pop_dialog()
+            self._run_batch(batch_no + 1, req)
+
+        def _finish(ev):
+            clicked["v"] = True
+            self.page.pop_dialog()
+            self._batch_finish(store)
+
+        def _pause(ev):
+            clicked["v"] = True
+            self.page.pop_dialog()
+            self._batch_running = False
+            self.refresh()
+            self._batch_tune_dialog()
+
+        def _abort(ev):
+            clicked["v"] = True
+            self.page.pop_dialog()
+            # 先落暂停态再确认：取消确认 = 留在暂停态（桌面同语义，防误触丢内容）
+            self._batch_running = False
+            self.refresh()
+            confirm(self.page, "放弃分批总纲",
+                    "已生成部分将丢弃并恢复分批前的原总纲。确定放弃？",
+                    lambda: self._batch_abort(), yes_text="放弃")
+
+        def _dismiss(e=None):
+            # 拖下手柄/点外部关闭：没点过按钮才按「暂停微调」处理
+            if not clicked["v"] and self._batch_running:
+                self._batch_running = False
+                self.refresh()
+        self.page.show_dialog(ft.BottomSheet(
+            on_dismiss=_dismiss,
+            content=ft.Container(ft.Column([
+                ft.Text(f"总纲分批·第{batch_no}批完成", size=15,
+                        weight=ft.FontWeight.BOLD),
+                ft.Text(f"第{batch_no}批已写到：分卷{vol_no}。"
+                        "继续下一批将把已生成部分整体注入下一批提示词。",
+                        size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Container(ft.Text((self._batch_partial or "")[-1200:], size=12,
+                                     selectable=True),
+                             bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
+                             border_radius=8, padding=8),
+                ft.Row([
+                    ft.TextButton("放弃全部", on_click=_abort),
+                    ft.TextButton("暂停，先微调", on_click=_pause),
+                    ft.FilledButton("继续下一批", on_click=_next),
+                    ft.FilledTonalButton("就此收尾", on_click=_finish),
+                ], alignment=ft.MainAxisAlignment.END, spacing=6, wrap=True),
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+                padding=16, height=self._dlg_h(560)),
+            show_drag_handle=True))
+
+    def _batch_tune_dialog(self):
+        """暂停微调（手机版「编辑器」）：把已累积原文放进可编辑框，
+        保存后「继续下一批」注入的是这里的现值。取消 = 保持原样。"""
+        def _save(text: str):
+            if text.strip():
+                self._batch_partial = text.strip()
+                self._batch_save_state()
+            self.refresh()
+        self._text_dialog("微调已生成的总纲",
+                          "总纲内容（点「继续下一批」时以此内容整体注入下一批）",
+                          self._batch_partial, on_ok=_save, ok_text="保存微调")
+
+    def _batch_finish(self, store):
+        """收尾（对齐桌面 _batch_finish）：清分批状态后走候选识别+选择落库链路
+        （与一次生成共用 _pick_candidate，同一落库口径）。"""
+        from app.core.pipeline import Pipeline
+        full = (self._batch_partial or "").strip()
+        self._batch_clear_state()
+        self.refresh()
+        if not full:
+            toast(self.page, "总纲分批：已生成部分为空，无法收尾", error=True)
+            return
+        cands, err = Pipeline.parse_synopsis_candidates(full)
+        if err or not cands:
+            toast(self.page, f"总纲候选解析失败：{err or '结果为空'}", error=True)
+            return
+        self._pick_candidate(cands)
+
+    def _batch_abort(self):
+        """放弃全部（对齐桌面 _batch_abort）：恢复发起分批前的快照，清状态。"""
+        self._batch_partial = self._batch_snapshot
+        self._batch_clear_state()
+        self.refresh()
+        toast(self.page, "已放弃分批，已恢复分批前的原总纲")
+
+    def _batch_interrupted(self, batch_no: int, req: str, reason: str):
+        """批次链中断（失败/取消/项目关闭/防呆）——有已生成内容时问「保留/恢复」。
+
+        「保留」= 暂停态+持久化，按钮变「继续下一批（第N+1批）」点击即续，
+        重启后也可从设置键恢复；「恢复」= 恢复分批前快照并清状态。
+        """
+        if not (self._batch_partial or "").strip():
+            self._batch_abort()
+            return
+
+        def _keep(ev):
+            self.page.pop_dialog()
+            self._batch_running = False
+            self._batch_save_state()
+            self.refresh()
+            toast(self.page, "已保留并暂停：点「继续下一批」接着写（重启后也可续）")
+
+        def _restore(ev):
+            self.page.pop_dialog()
+            self._batch_abort()
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("总纲分批中断"),
+            content=ft.Container(ft.Text(f"{reason}\n\n已生成部分仍保留着。怎么处理？",
+                                         size=13), width=440),
+            actions=[ft.TextButton("恢复原总纲", on_click=_restore),
+                     ft.FilledButton("保留已生成部分", on_click=_keep)],
+            actions_alignment=ft.MainAxisAlignment.END))
+
+    def _batch_save_state(self):
+        """分批链状态持久化到项目设置键（对齐桌面 _batch_save_state）：每批完成/
+        暂停/规划确认时调用——重启或切页回来点「分批生成」仍可接着写。"""
+        store = self.session.store
+        if store is None:
+            return
+        store.set_setting("synopsis_batch_partial", self._batch_partial or "")
+        store.set_setting("synopsis_batch_no", str(self._batch_no))
+        store.set_setting("synopsis_batch_req", self._batch_req or "")
+        store.set_setting("synopsis_batch_plan", self._batch_plan or "")
+
+    def _batch_clear_state(self):
+        """清 4 个分批持久化键并复位状态机（完结落库/放弃恢复/丢弃重开时）。"""
+        store = self.session.store
+        if store is not None:
+            for k in ("synopsis_batch_partial", "synopsis_batch_no",
+                      "synopsis_batch_req", "synopsis_batch_plan"):
+                store.set_setting(k, "")
+        self._batch_no = 0
+        self._batch_running = False
+        self._batch_plan = ""
+
+    def _pick_candidate(self, cands: list, iter_base: str | None = None,
+                        iter_feedback: str | None = None):
+        """候选选择 sheet → 增量合成/完整性校验 → 落库。
+
+        iter_base（对齐桌面 2026-11-06 迭代增量化 / 2026-11-09 防丢稿）：迭代链路
+        传入迭代前的底稿原文——应用候选时先增量合成进底稿，不再把候选整体当
+        新总纲保存。生成/手动粘贴链路不传（全量候选直接落地）。
+        """
         content_holder = {"text": cands[0].get("content", ""),
                           "title": cands[0].get("title", "")}
         preview = ft.TextField(value=content_holder["text"], multiline=True,
@@ -433,11 +933,17 @@ class WritingPage:
 
         def _lock(ev):
             self.page.pop_dialog()
-            self._syn_lock(content=preview.value.strip(), title=content_holder["title"])
+            self._apply_synopsis_candidate(preview.value.strip(),
+                                           content_holder["title"],
+                                           iter_base=iter_base,
+                                           iter_feedback=iter_feedback, lock=True)
 
         def _save_only(ev):
             self.page.pop_dialog()
-            self._syn_edit(preset_text=preview.value.strip())
+            self._apply_synopsis_candidate(preview.value.strip(),
+                                           content_holder["title"],
+                                           iter_base=iter_base,
+                                           iter_feedback=iter_feedback, lock=False)
 
         head_text = (f"共 {len(cands)} 个候选：选择一版查看/调整，然后锁定"
                      if len(cands) > 1 else "已生成总纲：查看/调整后锁定")
@@ -454,6 +960,9 @@ class WritingPage:
             show_drag_handle=True))
 
     def _syn_iterate(self, e):
+        if self._batch_no > 0:
+            toast(self.page, "总纲分批进行中——收尾或放弃后再迭代总纲", error=True)
+            return
         store = self.session.store
         s = store.current_synopsis()
         content = (s.get("content") or "").strip()
@@ -504,12 +1013,322 @@ class WritingPage:
             if err or not cands:
                 toast(self.page, f"修订候选解析失败：{err or '结果为空'}", error=True)
                 return
-            self._pick_candidate(cands)
+            # 传底稿+修改意见：应用候选时增量合成，未提及的卷逐字不动
+            # （对齐桌面 2026-11-09 防丢稿修复，勿改回整体保存）
+            self._pick_candidate(cands, iter_base=content, iter_feedback=fb)
 
         start_generation(self.page, self.session, role="synopsis",
                          context={"user_req": f"当前总纲：\n{current}\n\n修改意见：\n{fb}"},
                          task=task, title="迭代总纲", on_done=on_done,
                          on_started=on_started)
+
+    def _apply_synopsis_candidate(self, content: str, title: str,
+                                  iter_base: str | None = None,
+                                  iter_feedback: str | None = None,
+                                  lock: bool = False) -> bool:
+        """总纲候选落地（UI 解耦，供测试复用）：增量合成/完整性校验 → 保存或锁定。
+
+        返回 True = 已进入保存/锁定流程；False = 被拒绝或无需修订（底稿原样保留）。
+        iter_base 有值时（迭代链路，对齐桌面 _apply_synopsis 同款判据）：
+        - 候选带【迭代评估】标记 → apply_synopsis_iter_patch 增量合成：评估里未提及
+          的卷/整体层逐字不动；"noop"（AI 判断无需修订）不保存；缺段/找不到原位
+          整批拒绝并提示原因（底稿保持不变）——绝不把修订片段当全文写库
+          （2026-11-09 桌面丢稿事故形态，手机本次移植消除它）。
+        - 候选无【迭代评估】标记（模型没按两段式协议输出）→ 只有候选本身是完整
+          总纲（looks_like_full_synopsis：整体层有内容且分卷数不少于底稿）才允许
+          整份覆盖，片段一律拒绝并提示。
+        草稿保存成功后按改动卷号触发切章接力（_try_relay）；锁定链路不接力
+        （锁定内容有变化时会清空重建旧分卷，接力没有意义）。
+        """
+        from app.core.iter_review import (apply_synopsis_iter_patch,
+                                          looks_like_full_synopsis, parse_iter_review)
+        store = self.session.store
+        note = ""
+        if iter_base:
+            review = parse_iter_review(content)
+            if review is None:
+                # 模型没按两段式协议输出：只有候选本身是一份完整总纲才允许整份覆盖。
+                # 片段（只剩修订小节/少数卷）绝不能当全文写库——那正是「没修改的
+                # 部分全消失」的根因（桌面 2026-11-09 老板实测，勿放宽成静默降级）。
+                if not looks_like_full_synopsis(content, iter_base):
+                    toast(self.page, f"候选「{title}」不是完整总纲（缺整体层或多数分卷），"
+                                     "模型没按迭代协议输出；已拒绝写入以免丢失未修改内容。"
+                                     "请重试迭代，或把完整总纲手动粘贴进来。", error=True)
+                    return False
+            else:
+                new, note = apply_synopsis_iter_patch(iter_base, review)
+                if new is None:
+                    toast(self.page, f"候选「{title}」增量合成失败，整批拒绝：{note}"
+                                     "（底稿保持不变）", error=True)
+                    return False
+                if note == "noop":
+                    toast(self.page, "AI 判断无需修订：该候选没有输出任何修改，"
+                                     "当前总纲保持不变")
+                    return False
+                content = new
+                note = f"（增量合成：{note[3:]}）"
+        if lock:
+            self._syn_lock(content=content, title=title)
+            return True
+        store.save_synopsis(content, title, lock=False)
+        toast(self.page, f"已保存候选「{title}」为新版本{note}")
+        self.refresh()
+        # 切章接力（对齐桌面 2026-11-06）：迭代改动了哪些『分卷N』，就问要不要
+        # 用同一条修改意见逐卷迭代这些卷的章节切分
+        if iter_base:
+            changed = self._changed_volume_numbers(iter_base, content)
+            if changed:
+                self._try_relay(changed, iter_feedback)
+        return True
+
+    # ---------- 切章接力（总纲迭代 → 逐卷迭代章节切分，对齐桌面 2026-11-06） ----------
+
+    @staticmethod
+    def _changed_volume_numbers(base: str, new: str) -> list[int]:
+        """新旧总纲逐卷比对：标题或正文真的变过的『分卷N』序号列表。
+
+        与桌面 _changed_volume_numbers 同一对齐口径（parse_synopsis_volumes 的
+        index ↔ 库里第 N 行）。评估清单标「修改」但正文实际没变的不算——只接力
+        内容确实变了的卷，不为没变的卷白花 AI 调用。
+        """
+        from app.core.pipeline import Pipeline
+
+        def secs(text):
+            return {int(v.get("index") or 0): v for v in
+                    (Pipeline.parse_synopsis_volumes(text or "").get("volumes") or [])}
+        old_secs, new_secs = secs(base), secs(new)
+        changed = []
+        for idx, nv in sorted(new_secs.items()):
+            ov = old_secs.get(idx)
+            if ov is None:
+                changed.append(idx)
+                continue
+            if ((ov.get("title") or "").strip() != (nv.get("title") or "").strip()
+                    or (ov.get("content") or "").strip() != (nv.get("content") or "").strip()):
+                changed.append(idx)
+        return changed
+
+    def _try_relay(self, changed: list, iter_feedback: str | None) -> bool:
+        """增量合成保存后：问用户要不要用同一条修改意见逐卷接力「迭代本卷切分」。
+
+        changed=_changed_volume_numbers 的卷号；没切过章的卷自动跳过（日后切章时
+        自然用上新总纲，无需接力）。同意后逐卷排进 _relay_queue，由 _relay_pump
+        串行发起；用户拒绝或无可接力卷返回 False（全部跳过不弹框）。
+        """
+        store = self.session.store
+        if store is None or not changed:
+            return False
+        all_chs = store.list_chapters()
+        queue, skipped = [], 0
+        for i, v in enumerate(store.list_volumes(), 1):
+            if i not in changed:
+                continue
+            own = [c for c in all_chs if c.get("volume_id") == v["id"]]
+            if not own:
+                skipped += 1
+                continue
+            queue.append({"vol": v, "no": i, "own": own,
+                          "feedback": iter_feedback})
+        if not queue:
+            if skipped:
+                toast(self.page, "改动的分卷还没切章，无需接力（切章时自然用上新总纲）")
+            return False
+        names = "、".join(f"第{q['no']}卷「{(q['vol'].get('title') or '').strip()}」"
+                          for q in queue)
+        extra = f"\n（另有 {skipped} 卷还没切章，自动跳过）" if skipped else ""
+
+        def _yes():
+            self._relay_queue = queue
+            self._relay_pump()
+        confirm(self.page, "切章接力",
+                f"本次总纲改了：{names}{extra}\n\n"
+                "要用你刚才的修改意见，接力迭代这些卷的章节切分吗？\n"
+                "（每卷一次 AI 调用，逐卷弹确认框把关；章数、章序、章名不动，"
+                "只就地修订章内大纲，可随时放弃）", _yes, yes_text="开始接力")
+        return True
+
+    def _relay_advance(self):
+        """当前接力卷处理完毕（写入/放弃/失败）：弹出队首并自动开下一卷。"""
+        q = getattr(self, "_relay_queue", [])
+        self._relay_queue = q[1:]
+        if self._relay_queue:
+            self._relay_pump()
+
+    def _relay_pump(self):
+        """接力队列串行推进：队首卷发起切章迭代（volume_chapters_iter 任务）。
+
+        与桌面 _relay_pump 同语义；手机对话框非阻塞，队列推进不在结果回调里做，
+        而在各卷确认闭环（写入/放弃/解析失败）里调 _relay_advance——否则上一卷
+        确认框还开着，下一卷的生成确认就会叠上来。
+        """
+        queue = getattr(self, "_relay_queue", [])
+        if not queue:
+            return
+        job = queue[0]
+        store = self.session.store
+        if store is None:
+            self._relay_queue = []
+            toast(self.page, "项目已关闭，切章接力中断", error=True)
+            return
+        from app.core.task_templates import render as render_task
+        vol = job["vol"]
+        n = job["no"]
+        fb = job.get("feedback") or ""
+        # 发起时刻重取章节快照：接力确认到真正开跑之间章节可能被用户动过；
+        # 快照同时喂「现状」文本与落库定位，两处必须同源（防串章）
+        job["own"] = [store.get_chapter(c["id"]) or c for c in job["own"]]
+        own = job["own"]
+        current = "\n\n".join(
+            f"## 第{i}章：{(c.get('title') or '').strip() or '未命名'}\n"
+            + (str(c.get("outline_content") or c.get("outline_draft") or "").strip()
+               or "（本章无大纲）")
+            for i, c in enumerate(own, 1))
+        task = render_task("volume_chapters_iter", store, current=current,
+                           feedback=fb, volume_no=n,
+                           volume_count=len(store.list_volumes()))
+        on_relay = self._on_relay_result(store, vol, own, n)
+        start_generation(self.page, self.session, role="volume_chapters_iter",
+                         context={"volume_id": vol["id"],
+                                  "user_req": f"本卷现有章节切分：\n{current}\n\n修改意见：\n{fb}"},
+                         task=task, title=f"接力·迭代切分·第{n}卷",
+                         on_done=on_relay)
+
+    def _on_relay_result(self, store, vol: dict, own: list, n):
+        """接力切章迭代结果处理（增量优先，无评估标记降级全量；结构冻结）。
+
+        与桌面 VolumePage._on_chiter_result 同语义：章数/章序/章名不动，只就地
+        修订章内大纲（update_chapter），不删章不建章——接力卷都已有章节，走切分链
+        的 add_chapter 会整卷重复建章，所以这里不复用切分写入。
+        每条路径结束时必调 _relay_advance（含失败/放弃），保证接力不断链。
+        """
+        from app.core.pipeline import Pipeline, MIN_VOLUME_CHAPTER_CHARS
+        from app.core.iter_review import (is_noop_body, match_iter_chapters,
+                                          parse_iter_review)
+
+        def cb(result: dict):
+            if not result.get("ok"):
+                self._relay_advance()  # 失败 toast 已在 gen 里统一弹
+                return
+            text = result.get("text") or ""
+            progressed = [c for c in own
+                          if (c.get("block_count") or 0) or (c.get("done_count") or 0)]
+            warn = (f"\n提醒：本卷有 {len(progressed)} 章已写细纲/正文，更新大纲后需到"
+                    "写作台/大纲页重做对应章节。") if progressed else ""
+            parsed = parse_iter_review(text)
+            if parsed is not None:
+                # ---- 增量路径：修订内容只含 AI 判定要改的章 ----
+                body = (parsed.get("body") or "").strip()
+                if is_noop_body(body):
+                    toast(self.page, f"第{n}卷：AI 评估各章均无需修订，原大纲保持不变")
+                    self._relay_advance()
+                    return
+                rev, cerr, _diag = Pipeline.parse_volume_chapters_ex(
+                    body, min_chars=MIN_VOLUME_CHAPTER_CHARS)
+                if cerr or not rev:
+                    toast(self.page, f"第{n}卷修订内容解析失败：{cerr or '未切出章节'}，"
+                                     "该卷已跳过（可到分卷页手动迭代）", error=True)
+                    self._relay_advance()
+                    return
+                matched, unmatched = match_iter_chapters(rev, own)
+                reasons = {it.get("no"): (it.get("reason") or "")
+                           for it in parsed.get("items") or []
+                           if it.get("kind") == "chapter"}
+                matched_by_idx = {m["own_idx"]: m for m in matched}
+                rows = []
+                for i, ch in enumerate(own):
+                    m = matched_by_idx.get(i)
+                    if m:
+                        rows.append({"title": ch.get("title") or "",
+                                     "content": m.get("content") or "",
+                                     "status": "update",
+                                     "reason": reasons.get(i + 1, ""),
+                                     "own_idx": i})
+                    else:
+                        rows.append({"title": ch.get("title") or "",
+                                     "content": (str(ch.get("outline_content")
+                                                     or ch.get("outline_draft") or "").strip()
+                                                 or "（本章无大纲）"),
+                                     "status": "keep",
+                                     "reason": reasons.get(i + 1, "") or "AI 评估保留",
+                                     "own_idx": i})
+                for u in unmatched:
+                    rows.append({"title": u.get("title") or "",
+                                 "content": u.get("content") or "",
+                                 "status": "unknown", "reason": "定位不到原章",
+                                 "own_idx": None})
+                self._relay_confirm_sheet(vol, n, own, rows, warn)
+                return
+            # ---- 降级全量路径：模型没按两段式输出，走结构冻结校验 ----
+            chapters, cerr, _diag = Pipeline.parse_volume_chapters_ex(
+                text, min_chars=MIN_VOLUME_CHAPTER_CHARS)
+            if cerr or not chapters:
+                toast(self.page, f"第{n}卷切分解析失败：{cerr or '未切出章节'}，"
+                                 "该卷已跳过（可到分卷页手动迭代）", error=True)
+                self._relay_advance()
+                return
+            if len(chapters) != len(own):
+                toast(self.page, f"第{n}卷：AI 动了章节结构（原本 {len(own)} 章，"
+                                 f"输出 {len(chapters)} 章）。切章接力只修订章内内容"
+                                 "（章数/章序/章名不变），该卷已跳过", error=True)
+                self._relay_advance()
+                return
+            rows = [{"title": (own[i].get("title") or "").strip()
+                     or (chapters[i].get("title") or ""),
+                     "content": chapters[i].get("content") or "",
+                     "status": "update", "reason": "全量修订", "own_idx": i}
+                    for i in range(len(own))]
+            self._relay_confirm_sheet(vol, n, own, rows, warn)
+        return cb
+
+    def _relay_confirm_sheet(self, vol: dict, n, own: list, rows: list, warn: str = ""):
+        """接力切章结果确认 sheet：勾选的章就地修订章内大纲，处理完自动开下一卷。"""
+        pairs = []
+        rows_ui = []
+        for r in rows:
+            tag = {"update": "修订", "keep": "保留",
+                   "unknown": "⚠未匹配"}.get(r.get("status"), r.get("status"))
+            label = f"{tag}｜{(r.get('title') or '未命名')}（{r.get('reason') or '—'}）"
+            ck = ft.Checkbox(label=label, value=r.get("status") == "update")
+            pairs.append((r, ck))
+            rows_ui.append(ck)
+
+        def _write(ev):
+            self.page.pop_dialog()
+            updated = 0
+            for r, ck in pairs:
+                if not ck.value or r.get("status") != "update" \
+                        or r.get("own_idx") is None:
+                    continue
+                new_content = str(r.get("content") or "").strip()
+                ch = own[int(r["own_idx"])]
+                if not new_content or \
+                        new_content == str(ch.get("outline_content") or "").strip():
+                    continue
+                self.session.store.update_chapter(
+                    ch["id"], {"outline_content": new_content,
+                               "outline_draft": new_content})
+                updated += 1
+            toast(self.page, f"第{n}卷已就地修订 {updated} 章的大纲（章数、章名不变）"
+                  if updated else "修订内容与现行一致，未做改动")
+            self.refresh()
+            self._relay_advance()
+
+        def _cancel(ev):
+            self.page.pop_dialog()
+            toast(self.page, f"已放弃第{n}卷的接力修订")
+            self._relay_advance()
+        self.page.show_dialog(ft.BottomSheet(
+            content=ft.Container(ft.Column([
+                ft.Text(f"接力·第{n}卷 切章修订（{len(rows)} 章）", size=15,
+                        weight=ft.FontWeight.BOLD),
+                hint("勾选的章就地更新章内大纲：章数、章序、章名都不动，不删章不建章。"
+                     + warn),
+                ft.Column(rows_ui, scroll=ft.ScrollMode.AUTO, height=340),
+                ft.Row([ft.TextButton("放弃本卷", on_click=_cancel),
+                        ft.FilledButton("就地修订", on_click=_write)],
+                       alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=8, scroll=ft.ScrollMode.AUTO), padding=16, height=520),
+            show_drag_handle=True))
 
     # =====================================================
     # 页签 2：分卷
@@ -677,6 +1496,8 @@ class WritingPage:
                 ft.TextButton("换一章", icon=ft.Icons.SWAP_HORIZONTAL_CIRCLE,
                               on_click=lambda e: self._pick_chapter(self._pick_outline_ch)),
             ]),
+            ft.Row([ft.FilledTonalButton("⚡一键细化全部大纲", icon=ft.Icons.BOLT,
+                                         on_click=lambda e: self._outline_batch_start())]),
         ]
         if not ch:
             controls.append(empty("还没有章节"))
@@ -811,6 +1632,114 @@ class WritingPage:
                        alignment=ft.MainAxisAlignment.END),
             ], spacing=8), padding=16, height=480),
             show_drag_handle=True))
+
+    # ---------- 一键细化全部大纲（对齐桌面 main_window.start_outline_batch，2026-11-10） ----------
+
+    def _outline_batch_plan(self) -> dict:
+        """算这次「一键细化全部大纲」要做什么（只读，对齐桌面 outline_batch_plan）：
+        todo=还没细化也没锁定的章（本次要做的事）；refined=已细化（跳过，同时是
+        断点续跑的进度标记）；locked=大纲已锁定（跳过，视为定稿绝不覆盖）；
+        empty_volumes=还没切分章节的卷（无章可细化）。"""
+        plan = {"todo": [], "refined": [], "locked": [], "empty_volumes": [],
+                "chapters": []}
+        store = self.session.store
+        if store is None:
+            return plan
+        chapters = store.list_chapters()
+        plan["chapters"] = chapters
+        for ch in chapters:
+            if ch.get("outline_refined"):
+                plan["refined"].append(ch)
+            elif ch.get("outline_locked"):
+                plan["locked"].append(ch)
+            else:
+                plan["todo"].append(ch)
+        plan["empty_volumes"] = [v for v in store.list_volumes()
+                                 if not any(c.get("volume_id") == v["id"]
+                                            for c in chapters)]
+        return plan
+
+    def _outline_batch_start(self):
+        """大纲页「⚡一键细化全部大纲」入口（对齐桌面 start_outline_batch）：
+        只读统计 → 确认对话框（文案照搬桌面）→ 启动 scope="outline" 的 AutoPilot
+        （只细化大纲、细化完即停，不进细纲/正文/归档；进度记 chapters.outline_refined）。"""
+        store = self.session.store
+        if store is None:
+            toast(self.page, "请先打开项目", error=True)
+            return
+        if self._ap_running_any():
+            toast(self.page, "已经有一个自动任务在跑——请先在上方进度条点「退出」，"
+                             "再一键细化大纲", error=True)
+            return
+        s = store.current_synopsis()
+        if not s or not (s.get("content") or "").strip():
+            toast(self.page, "请先生成并确认总纲——细化大纲要用总纲当上下文", error=True)
+            return
+        plan = self._outline_batch_plan()
+        if not plan["chapters"]:
+            toast(self.page, "还没有章节——请先到「分卷」页切分章节，再来细化大纲",
+                  error=True)
+            return
+        if not plan["todo"]:
+            why = []
+            if plan["refined"]:
+                why.append(f"{len(plan['refined'])} 章已细化")
+            if plan["locked"]:
+                why.append(f"{len(plan['locked'])} 章大纲已锁定")
+            toast(self.page, "没有需要细化的章节" + (f"（{'、'.join(why)}）" if why else ""))
+            return
+        lines = [
+            f"按章节顺序把还没细化的 {len(plan['todo'])} 章逐一细化，细化完就停——"
+            "不会接着生成细纲 / 正文 / 归档。",
+            "",
+            "· 结果直接写入本章大纲并标记「已细化」（旧大纲自动存快照，可回滚），"
+            "不再逐章弹确认",
+            "· 失败按自动模式同一节拍重试（30 秒 → 1 分 → 5 分 … 共 9 次）；"
+            "中途断网会自动攒断点续写，不用从头重写",
+            "· 中途可随时暂停；关掉程序后再点一次，会跳过已细化的章接着做",
+            "· 细化过程逐章自动落库并刷新本页",
+        ]
+        skipped = []
+        if plan["refined"]:
+            skipped.append(f"{len(plan['refined'])} 章已细化")
+        if plan["locked"]:
+            skipped.append(f"{len(plan['locked'])} 章大纲已锁定")
+        if skipped:
+            lines.append("· 跳过：" + "、".join(skipped) + "（不覆盖已定稿的内容）")
+        if plan["empty_volumes"]:
+            names = "、".join(f"第{v.get('order_index')}卷《{v.get('title') or '未命名'}》"
+                              for v in plan["empty_volumes"][:3])
+            more = "…" if len(plan["empty_volumes"]) > 3 else ""
+            lines.append(f"· 注意：{names}{more}还没切分章节，这些卷暂时无法细化"
+                         "（请先到「分卷」页切章）")
+
+        def _yes(ev):
+            self.page.pop_dialog()
+            self._outline_batch_confirm()
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("⚡一键细化全部大纲"),
+            content=ft.Container(ft.Column([ft.Text(t, size=12) for t in lines],
+                                           tight=True, spacing=2,
+                                           scroll=ft.ScrollMode.AUTO),
+                                 width=440, height=self._dlg_h(380)),
+            actions=[ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
+                     ft.FilledButton("开始细化", on_click=_yes)],
+            actions_alignment=ft.MainAxisAlignment.END))
+
+    def _outline_batch_confirm(self):
+        """启动 outline 范围的自动引擎（独立实例，与全书流水线共用同一互斥判据）。"""
+        from autopilot import AutoPilot
+        if self._ap_running_any():
+            toast(self.page, "已经有一个自动任务在跑，不能同时开第二台", error=True)
+            return
+        if getattr(self, "_ap_outline", None) is None:
+            self._ap_outline = AutoPilot(self.page, self.session, scope="outline")
+            self._ap_outline.on_state = self._ap_state
+            self._ap_outline.on_step = self._ap_set_label
+            self._ap_outline.on_chunk = lambda n: None  # 步骤切换才刷，字数不逐帧刷
+        self._ap_retrying = ""
+        self._ap_outline.start()
+        self.refresh()
 
     # =====================================================
     # 页签 4：写作台
@@ -2076,6 +3005,8 @@ class WritingPage:
              "直接粘贴细纲文本入库（只剥不改，跳过 AI）"),
             ("prose", ft.Icons.CONTENT_PASTE_GO_OUTLINED, "粘贴正文…",
              "直接粘贴正文本入库（单章或多章，只剥不改）"),
+            ("clearprose", ft.Icons.DELETE_FOREVER_OUTLINED, "清空全书正文",
+             "结构保留，全书正文推倒重写（清前自动整库备份）"),
         ]
 
         def _go(name, e):
@@ -2090,6 +3021,8 @@ class WritingPage:
                 self._paste_dialog(ch, "detail")
             elif name == "prose":
                 self._paste_dialog(ch, "prose")
+            elif name == "clearprose":
+                self._clear_all_prose()
 
         rows = [ft.ListTile(leading=ft.Icon(i), title=ft.Text(t, size=14),
                             subtitle=ft.Text(s, size=11), dense=True,
@@ -2100,6 +3033,99 @@ class WritingPage:
                 [ft.Text("写作台 · 更多", size=16, weight=ft.FontWeight.BOLD)] + rows,
                 scroll=ft.ScrollMode.AUTO), padding=16, height=470),
             show_drag_handle=True))
+
+    # ---------- 清空全书正文（危险操作，对齐桌面 writing_desk._clear_all_prose） ----------
+
+    def _clear_all_prose(self):
+        """清空全书正文（2026-11-13 桌面老板需求，手机对齐）：结构留着，正文推倒重写。
+
+        全书级破坏性操作，护栏（桌面三道里手机适用的两道）：
+        ① 自动模式 / 生成任务在跑就不许清——清完后台任务接着落库，界面与库两头对不上；
+        ② 清理前整库备份：内核 store.clear_all_prose 内部先 backup() 再删，
+           备份失败抛异常、数据不动。
+        确认 sheet 把「删什么 / 留什么」摊开 + 明确确认，两个默认勾选项与桌面同语义。
+        """
+        store = self.session.store
+        if store is None:
+            toast(self.page, "请先打开项目再清空正文", error=True)
+            return
+        if self._ap_running_any():
+            toast(self.page, "自动模式运行中——请先停止自动模式再清空正文", error=True)
+            return
+        if self._task is not None and not self._task.stopped:
+            toast(self.page, "当前还有生成任务在跑——请先停止，再清空正文", error=True)
+            return
+        try:
+            stats = store.prose_stats()
+        except Exception as e:
+            toast(self.page, f"读取正文统计失败：{e}", error=True)
+            return
+        if not stats.get("prose_chapters"):
+            toast(self.page, "全书还没有正文，不需要清空")
+            return
+        deleted = f"· 全部正文（{stats['prose_chapters']} 章，{stats['blocks']} 块）"
+        if stats.get("snapshots"):
+            deleted += f" + {stats['snapshots']} 份历史版本快照"
+        extra = []
+        if stats.get("batches"):
+            extra.append(f"· 分批 / 改写的中间底稿（{stats['batches']} 批）")
+        if stats.get("notes"):
+            extra.append(f"· 本章动态 {stats['notes']} 条（旧正文提取的事件与场景）")
+        mem_ck = ft.Checkbox(
+            label="同时重置记忆链（旧记忆来自旧正文，留着会让新正文带着旧剧情状态）",
+            value=True)
+        cache_ck = ft.Checkbox(
+            label="同时清空正文生成缓存（不清的话「重新写」可能直接回放旧结果）",
+            value=True)
+
+        def _yes(ev):
+            self.page.pop_dialog()
+            self._do_clear_all_prose(bool(mem_ck.value), bool(cache_ck.value))
+
+        def _cancel(ev):
+            self.page.pop_dialog()
+        self.page.show_dialog(ft.BottomSheet(
+            content=ft.Container(ft.Column([
+                ft.Text("清空全书正文", size=16, weight=ft.FontWeight.BOLD),
+                hint(f"全书 {stats['chapters']} 章，其中 {stats['prose_chapters']} 章已有正文："
+                     f"约 {stats['words']:,} 字 / {stats['blocks']} 个正文块。"),
+                ft.Text("将删除", size=13, weight=ft.FontWeight.W_600),
+                ft.Text("\n".join([deleted] + extra), size=12),
+                ft.Text("将保留", size=13, weight=ft.FontWeight.W_600),
+                ft.Text("总纲 · 分卷 · 章节大纲 · 细纲块 · 设定库 · 伏笔台账 · 请求日志\n"
+                        "清完后章状态回退成「有细纲 / 有大纲」，可直接重新生成正文。",
+                        size=12),
+                mem_ck, cache_ck,
+                ft.Text("编辑器里还没点「接受」的正文也会一起丢弃。清理前会自动把整库"
+                        "备份到项目文件夹 backups/，需要时可回滚。",
+                        size=12, color=ft.Colors.RED_700),
+                ft.Row([
+                    ft.TextButton("取消", on_click=_cancel),
+                    ft.FilledButton("清空正文", on_click=_yes),
+                ], alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=6, scroll=ft.ScrollMode.AUTO),
+                padding=16, height=self._dlg_h(620)),
+            show_drag_handle=True))
+
+    def _do_clear_all_prose(self, clear_memory: bool, clear_cache: bool):
+        """确认后的执行（UI 与落库解耦，供测试复用）：内核一条链完成
+        备份→删除→状态回退，返回统计供 toast 汇报。"""
+        store = self.session.store
+        try:
+            result = store.clear_all_prose(clear_memory=clear_memory,
+                                           clear_cache=clear_cache)
+        except Exception as e:
+            toast(self.page, f"清空失败（数据未改动）：{type(e).__name__}: {e}", error=True)
+            return
+        self._diag = None
+        msg = f"已清空 {result['prose_chapters']} 章正文（约 {result['words']:,} 字）"
+        if result.get("memory_reset"):
+            msg += "，记忆链已重置"
+        if result.get("backup"):
+            name = str(result["backup"]).replace("\\", "/").rsplit("/", 1)[-1]
+            msg += f"；清理前已备份 {name}（项目文件夹 backups/）"
+        toast(self.page, msg)
+        self.refresh()
 
     # ---------- 本章备注（chapter_notes） ----------
 
@@ -2458,7 +3484,7 @@ class WritingPage:
     def _do_style_rewrite(self, ch: dict):
         """整章一次调用：AI 只回传病灶段条目（P段号：改后的段落），
         程序把条目替换进初稿，其余段落原样保留（不经模型）。
-        只改写法不改事实；结果与原版对比择一，确认后回填编辑器。"""
+        只改写法不改事实；结果与原版对比择一，点「应用并接受」直接落库。"""
         from app.core.style_rewrite import apply_diff, build_whole
         store = self.session.store
         cid = ch["id"]
@@ -2552,18 +3578,43 @@ class WritingPage:
                                           border_color=ft.Colors.TRANSPARENT),
                              height=170),
                 ft.Row([ft.TextButton("取消", on_click=_cancel),
-                        ft.FilledButton("采用所选", on_click=_ok)],
+                        ft.FilledButton("应用并接受", on_click=_ok)],
                        alignment=ft.MainAxisAlignment.END, spacing=8),
             ], spacing=6, scroll=ft.ScrollMode.AUTO), padding=16, height=600),
             show_drag_handle=True))
 
     def _apply_rewrite_result(self, ch: dict, text: str):
-        """改写结果回填编辑器（改写永远整篇一次过，两种写法同口径）。
+        """改写结果「应用即接受」（对齐桌面 2026-11-14 定调）：对比窗点「应用并接受」
+        就是确认这一稿，直接落库（旧版自动存快照）+ 章状态推进 + 归档收尾同链，
+        不再回填编辑器等二次点「接受本章」。
 
-        改写来源标记：接受后即使已有快照也要重归档（与桌面「改写例外」同口径）。
+        落库口径与 _prose_accept 相同：store.accept_chapter_prose 一条链完成
+        快照/降级分块正文/清批次工作区；分批模式下编辑器里是批次合并预览，
+        同样走这里（批次未合并时落库即代表接受当前合并稿）。
+        落库前仍过 _guard_incomplete 闸门：诊断到异常时先停下来问，闸门不拆。
+        改写来源标记：接受后即使已有快照也重归档（与桌面「改写例外」同口径）。
         """
-        self._pending_rewrite.add(ch["id"])
-        self._set_editor(text)
-        toast(self.page, f"改写完成（{len(text)} 字），检查后点「接受本章」落库")
-        self.refresh()
+        store = self.session.store
+        cid = ch["id"]
+        text = (text or "").strip()
+        if not text:
+            toast(self.page, "改写结果为空", error=True)
+            return
+
+        def _do():
+            demoted = sum(1 for t in store.list_text_blocks(cid)
+                          if t.get("scene_block_id") and t["status"] == "已接受")
+            self._pending_rewrite.add(cid)
+            store.accept_chapter_prose(cid, text)
+            self._diag = None
+            self._set_editor(text)
+            toast(self.page, f"已应用并接受（{len(text)} 字，旧版自动存快照）")
+            if demoted:
+                toast(self.page, f"本章 {demoted} 段旧的分块正文已转为草稿"
+                                 "（整章正文已覆盖）")
+            self.refresh()
+            # 章状态推进 + 自动归档统一走 _after_prose_done（对齐桌面）
+            self._after_prose_done(cid)
+        if self._guard_incomplete(_do, yes_text="仍然应用"):
+            _do()
 
