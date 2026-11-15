@@ -18,24 +18,27 @@ echo [2/3] 检查构建环境...
 set "ANDROID_SDK_ROOT=E:\engine\androidstudioSDK"
 set "ANDROID_HOME=E:\engine\androidstudioSDK"
 set "JAVA_HOME=C:\Program Files\Android\Android Studio\jbr"
-set "PATH=E:\engine\flutter\3.44.8\bin;%PATH%"
-rem Pub 缓存放全英文路径：CMake 生成构建配置时对中文用户名路径会用 GBK 写 JSON，
-rem gradle 按 UTF-8 解析报错（jni 插件 buildCMake 失败的根因）
-set "PUB_CACHE=E:\pub-cache"
+rem flet pins Flutter 3.44.8; SDK lives on ASCII path E:\flutter-3.44.8 (managed copy moved out of Chinese-username home, 2026-11-15)
+set "PATH=E:\flutter-3.44.8\bin;%PATH%"
+rem PUB_CACHE on pure-ASCII path: CMake writes GBK JSON for Chinese user-name
+rem paths and gradle fails to parse it (root cause of jni buildCMake errors)
+set "PUB_CACHE=E:\pubcache"
+rem China mirrors for pub.dev and flutter storage
+set "PUB_HOSTED_URL=https://pub.flutter-io.cn"
+set "FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn"
+rem Gradle user home relocated to E drive; wrapper auto-downloads missing dists
+set "GRADLE_USER_HOME=E:\engine\gradle-home"
 set "APK=%~dp0build\flutter\build\app\outputs\apk\release\app-release.apk"
 
 set "MISSING="
 if not exist "%ANDROID_SDK_ROOT%" set "MISSING=%MISSING% AndroidSDK"
 if not exist "%JAVA_HOME%\bin\java.exe" set "MISSING=%MISSING% JDK"
-if not exist "E:\engine\flutter\3.44.8\bin\flutter.bat" set "MISSING=%MISSING% Flutter"
+if not exist "E:\flutter-3.44.8\bin\flutter.bat" set "MISSING=%MISSING% Flutter"
 if not exist "%VENV%\Scripts\flet.exe" set "MISSING=%MISSING% Flet"
-if not exist "%USERPROFILE%\.gradle\wrapper\dists\gradle-8.14-all\c2qonpi39x1mddn7hk5gh9iqj\gradle-8.14\bin\gradle.bat" set "MISSING=%MISSING% Gradle8.14"
-if defined MISSING (
-  echo [失败] 缺少构建依赖：%MISSING%
-  echo        请把这一行截图给 AI。
-  pause
-  exit /b 1
-)
+rem gradle dist version depends on flet template; only hint when nothing cached
+set "GRADLE_DISTS=%GRADLE_USER_HOME%\wrapper\dists"
+if not exist "%GRADLE_DISTS%" set "GRADLE_DISTS=%USERPROFILE%\.gradle\wrapper\dists"
+if not exist "%GRADLE_DISTS%" echo [提示] 尚无 Gradle 缓存，首次构建将自动下载（需网络）。
 
 echo [3/3] 开始构建 APK（10~25 分钟，不要关闭这个窗口）...
 "%VENV%\Scripts\flet.exe" build apk --yes %*
