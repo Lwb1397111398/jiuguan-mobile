@@ -47,7 +47,8 @@ jobs:
           FLET_ANDROID_SIGNING_KEY_ALIAS: androiddebugkey
           FLET_ANDROID_SIGNING_KEY_PASSWORD: android
         run: |
-          flet build apk --yes             --build-number ${{ steps.ver.outputs.num }}             --build-version 0.1.${{ steps.ver.outputs.num }}             --target-arch arm64-v8a
+          # arm64-v8a 架构在 pyproject [tool.flet.android] target_arch 里配置（0.86.5 无 --target-arch 参数）
+          flet build apk --yes             --build-number ${{ steps.ver.outputs.num }}             --build-version 0.1.${{ steps.ver.outputs.num }}
 
       - name: Stage APK
         run: |
