@@ -128,8 +128,10 @@ class MinePage:
         except Exception as e:
             return False, f"备份失败：{e}"
 
-    def _import_full(self, e):
-        files = self._picker.pick_files(
+    async def _import_full(self, e):
+        # flet 0.86：pick_files 是 async，必须 await（2026-11-16 修复
+        # 「'coroutine' object is not subscriptable」真机闪退）
+        files = await self._picker.pick_files(
             dialog_title="选择全量备份 zip", allow_multiple=False)
         self._import_picked(files)
 
@@ -265,8 +267,10 @@ class MinePage:
         from export_ui import export_project_flow
         export_project_flow(self.page, self.session)
 
-    def _import_project(self, e):
-        files = self._picker.pick_files(
+    async def _import_project(self, e):
+        # flet 0.86：pick_files 是 async，必须 await（2026-11-16 修复
+        # 「'coroutine' object is not subscriptable」真机闪退）
+        files = await self._picker.pick_files(
             dialog_title="选择项目 zip", allow_multiple=False)
         if not files:
             return
