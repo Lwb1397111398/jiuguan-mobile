@@ -22,14 +22,37 @@ def is_android() -> bool:
             and ("ANDROID_DATA" in os.environ or os.path.isdir("/data/data")))
 
 
+def _android_app_dir(method: str) -> str:
+    """经 pyjnius 拿安卓应用私有目录（getFilesDir / getCacheDir），拿不到返回空串。
+
+    安卓应用进程没有 HOME 环境变量（flet 的 dart-bridge 运行时也不设），
+    expanduser("~") 会问 bionic 伪 passwd 表，应用 uid 的 pw_dir 被合成成
+    "/data"——应用无权写 /data 根目录，makedirs 直接 PermissionError
+    （2026-11-15 真机首启即崩的根因）。所以安卓分支绝不许用 expanduser，
+    权威来源是应用 Context。pyjnius 用法与手机工程 src/update.py 同源。
+    """
+    try:
+        from jnius import autoclass  # 仅安卓包内置；桌面/测试不会走到这里
+        act = autoclass("com.flet.serious_python_android.PythonActivity")
+        ctx = act.mActivity.getApplicationContext()
+        f = getattr(ctx, method)()
+        return str(f.getAbsolutePath()) if f else ""
+    except Exception:
+        return ""
+
+
 def app_data_dir() -> str:
     """应用数据目录：Windows=%APPDATA%/酒馆小说生成器，安卓=应用私有目录同名子目录。"""
     override = os.environ.get("JIUGUAN_DATA_DIR")
     if override:
         path = override
     elif is_android():
-        # flet 安卓运行时 HOME 指向应用私有 files 目录；无 HOME 时退缓存目录
-        base = os.environ.get("HOME") or os.path.expanduser("~") or "/data/local/tmp"
+        # 顺序：Context.filesDir（权威、永不清）→ HOME（旧运行时设过）→
+        # TMPDIR（部分系统给到应用 cache）→ /data/local/tmp（最终兜底）
+        base = (_android_app_dir("getFilesDir")
+                or os.environ.get("HOME")
+                or os.environ.get("TMPDIR")
+                or "/data/local/tmp")
         path = os.path.join(base, APP_DIR_NAME)
     else:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
