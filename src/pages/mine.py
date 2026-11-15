@@ -295,8 +295,6 @@ class MinePage:
                 return sub.build()
             self._sub = None        # 实例丢了就退回本页，避免白屏
         s = self.session
-        info = (f"数据目录：{s.app.data_dir}\n"
-                f"当前项目：{'《' + s.store.title + '》' if s.has_project else '未打开'}")
         banner = health.banner(self.page, s, self.on_refresh)
 
         # 检查更新置顶（老板 2026-11-16：更新按钮不该藏在设置页二十张卡片后面）
