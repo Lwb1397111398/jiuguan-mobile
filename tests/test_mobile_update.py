@@ -191,6 +191,43 @@ def test_is_android_env_detection(monkeypatch):
     _reset_android_cache()
 
 
+def test_is_android_accepts_pep738_platform_name(monkeypatch):
+    """CPython 3.13+ 安卓平台名是 "android"（PEP 738），flet 打包用 3.14。
+
+    2026-11-16 老板平板：软件能用（内核 paths.py 认 "android"），但更新页显示
+    「电脑预览」——update.is_android 当时只认 "linux"。
+    """
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'android')
+    assert update.is_android() is True
+    _reset_android_cache()
+
+
+def test_is_android_tmpdir_under_data(monkeypatch):
+    """环境标记缺失时 TMPDIR 落在 /data/ 下也判安卓（不依赖 ANDROID_DATA）。"""
+    _reset_android_cache()
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(update.os.path, 'isdir', lambda p: False)
+    monkeypatch.delenv('ANDROID_DATA', raising=False)
+    monkeypatch.delenv('ANDROID_ROOT', raising=False)
+    monkeypatch.setenv('TMPDIR', '/data/user/0/com.jiuguan.app/cache')
+    assert update.is_android() is True
+    _reset_android_cache()
+    monkeypatch.setenv('TMPDIR', '/tmp')
+    assert update.is_android() is False
+    _reset_android_cache()
+
+
+def test_platform_diag_reports_reason(monkeypatch):
+    """非安卓时卡片摊开判定依据：真机再被误判成「电脑预览」可截图定位。"""
+    monkeypatch.setattr(sys, 'platform', 'win32')
+    monkeypatch.setenv('TMPDIR', '/tmp/x')
+    monkeypatch.delenv('ANDROID_DATA', raising=False)
+    monkeypatch.delenv('ANDROID_ROOT', raising=False)
+    s = update.platform_diag()
+    assert 'platform=win32' in s and '/tmp/x' in s
+
+
 def test_get_local_version_falls_back_to_generated_version(monkeypatch):
     """pyjnius 读包 manifest 失败 → 退读构建生成的 _version.py，不再显示 dev。"""
     import types

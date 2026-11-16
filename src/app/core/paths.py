@@ -15,12 +15,28 @@ APP_DIR_NAME = "酒馆小说生成器"
 
 
 def is_android() -> bool:
-    """是否运行在安卓（Flet APK 的 CPython 运行时）。"""
+    """是否运行在安卓（Flet APK 的 CPython 运行时）。
+
+    这是双端唯一的安卓判定源，必须宽、且绝不依赖 pyjnius（2026-11-16
+    平板真机实测：pyjnius 桥接整链失败，凡是用它判平台的地方都误判）。
+
+    - CPython 3.13+ 在 Android 上 sys.platform 报 "android"（PEP 738），
+      更早版本报 "linux"——两种都要认。手机版 flet 打包用 3.14，只认
+      "linux" 会把真机判成电脑（表现为更新页显示「电脑预览」并锁死）。
+    - linux 时再查系统标记：ANDROID_DATA / ANDROID_ROOT（Android 进程必设）、
+      /data/data 存在（Android 11+ 是 /data/user/0 的软链，stat 可用）。
+    - 最后看 TMPDIR 是否落在 /data/ 下：安卓应用私有目录特征
+      （/data/user/0/<pkg>/cache），桌面 Linux 是 /tmp 或 /var/...，不会误判。
+    """
     if sys.platform == "android":
         return True
-    # flet 安卓运行时是 Linux 内核 + ANDROID 环境标记
-    return (sys.platform == "linux"
-            and ("ANDROID_DATA" in os.environ or os.path.isdir("/data/data")))
+    if sys.platform != "linux":
+        return False
+    if "ANDROID_DATA" in os.environ or "ANDROID_ROOT" in os.environ:
+        return True
+    if os.path.isdir("/data/data"):
+        return True
+    return str(os.environ.get("TMPDIR") or "").startswith("/data/")
 
 
 def _android_app_dir(method: str) -> str:

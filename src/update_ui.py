@@ -32,10 +32,11 @@ def update_card(page, session) -> ft.Control:
     2026-11-16 从设置页最底部提升为「我的」页顶部第一张卡（老板：更新按钮
     不该藏在二十张设置卡片后面）；设置页保留同款卡片（引用同一实现）。
     桌面预览模式显示「仅手机版可用」。"""
-    from update import get_local_version, is_android, jnius_diag
+    from update import get_local_version, is_android, jnius_diag, platform_diag
     code, name = get_local_version()
+    android = is_android()
     status = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
-    ver_text = (f"{name}（build {code}）" if is_android()
+    ver_text = (f"{name}（build {code}）" if android
                 else "电脑预览（更新仅手机版可用）")
 
     def _check(e=None):
@@ -62,12 +63,17 @@ def update_card(page, session) -> ft.Control:
             ft.FilledTonalButton("检查", on_click=_check),
         ]),
     ]
-    diag = jnius_diag() if is_android() else ""
+    diag = jnius_diag() if android else ""
     if diag:
         # pyjnius 桥接异常时显示一行可复制的诊断（老板截图即可定位真因，
         # 2026-11-16 平板真机 pyjnius 整链失败就是靠这个抓回来的）
         rows.append(ft.Text(f"桥接诊断：{diag}", size=11,
                             color=ft.Colors.ERROR, selectable=True))
+    elif not android:
+        # 非安卓也把判定依据摊开：真机若被误判成「电脑预览」，截图即可定位，
+        # 不用再猜「为什么我是平板却显示电脑」（2026-11-16 第二轮）
+        rows.append(ft.Text(f"平台判定：{platform_diag()}", size=11,
+                            color=ft.Colors.ON_SURFACE_VARIANT, selectable=True))
     rows.append(status)
     return ft.Card(ft.Container(ft.Column(rows, spacing=6), padding=12))
 

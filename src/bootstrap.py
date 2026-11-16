@@ -19,9 +19,26 @@ if os.path.isdir(os.path.join(_REPO, "app", "core")) and _REPO not in sys.path:
 # flet 的 dart-bridge 运行时不设 HOME，安卓进程 expanduser("~") 会经 bionic
 # 伪 passwd 表落到 /data（应用无权写，2026-11-15 真机首启即崩的根因）。
 # 标准库里任何读 ~ 的代码（tempfile、Path.home() 等）都受益。
-# pyjnius 失败时退读 TMPDIR 推导（app.core.paths.android_files_dir_from_env，
-# 与内核 paths.py 安卓分支共用一份推导），两头都失败才静默跳过。
-if os.path.isdir("/data/data") and not os.environ.get("HOME"):
+# 平台判定统一走内核 is_android（唯一源：认 "android" 平台名 + TMPDIR 特征，
+# 2026-11-16 平板真机：CPython 3.14 在安卓上 sys.platform 是 "android"）；
+# 引导阶段 import 失败也不能让 App 起不来，故留一份等价兜底。
+def _android_like() -> bool:
+    try:
+        from app.core.paths import is_android
+        return bool(is_android())
+    except Exception:
+        pass
+    if sys.platform == "android":
+        return True
+    if sys.platform != "linux":
+        return False
+    return (os.path.isdir("/data/data")
+            or "ANDROID_DATA" in os.environ
+            or "ANDROID_ROOT" in os.environ
+            or str(os.environ.get("TMPDIR") or "").startswith("/data/"))
+
+
+if _android_like() and not os.environ.get("HOME"):
     _files = ""
     try:
         from jnius import autoclass

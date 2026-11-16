@@ -67,22 +67,45 @@ def _headers(extra=None):
     return h
 
 
-def is_android() -> bool:
-    """跑在 Android 运行时？纯环境判定（与 app.core.paths.is_android 同源），
-    桌面预览为 False。
+def _detect_android() -> bool:
+    """安卓判定：唯一源是内核 app.core.paths.is_android（同一条规则），
+    import 失败时才用本文件的等价兜底（桌面预览/单测环境可能没有 app 包）。"""
+    try:
+        from app.core.paths import is_android as _core_is_android
+        return bool(_core_is_android())
+    except Exception:
+        pass
+    import sys
+    if sys.platform == "android":       # PEP 738：CPython 3.13+ 的安卓平台名
+        return True
+    if sys.platform != "linux":
+        return False
+    if "ANDROID_DATA" in os.environ or "ANDROID_ROOT" in os.environ:
+        return True
+    if os.path.isdir("/data/data"):
+        return True
+    return str(os.environ.get("TMPDIR") or "").startswith("/data/")
 
-    2026-11-16 平板真机：pyjnius 桥接整链失败，旧实现用它判定会把安卓机
-    误判成「电脑预览」→ 更新功能整页锁死。检查/下载/版本显示都不需要
-    pyjnius；pyjnius 是否可用只影响「唤起安装器」一步，另查 jnius_diag()。
+
+def is_android() -> bool:
+    """跑在 Android 运行时？纯环境判定（委托 app.core.paths.is_android）。
+
+    2026-11-16 平板真机两连坑：
+    ① pyjnius 桥接整链失败，旧实现用它判定会把安卓机误判成「电脑预览」
+       → 更新功能整页锁死。检查/下载/版本显示都不需要 pyjnius。
+    ② 判定漏了 sys.platform == "android"：flet 打包用 CPython 3.14，
+       Android 上平台名自 3.13 起是 "android"（PEP 738），不再报 "linux"，
+       于是改成纯环境判定后真机仍判 False、更新页继续显示「电脑预览」。
+    现在与内核共用同一条规则（含 "android" 平台名 + TMPDIR 在 /data 下等
+    兜底），任何安卓运行时都不会再被当成电脑。pyjnius 是否可用只影响
+    「唤起安装器」一步，另查 jnius_diag()。
     """
     global _ANDROID
     try:
         return _ANDROID
     except NameError:
         pass
-    import sys
-    _ANDROID = (sys.platform == "linux"
-                and ("ANDROID_DATA" in os.environ or os.path.isdir("/data/data")))
+    _ANDROID = _detect_android()
     return _ANDROID
 
 
@@ -100,6 +123,19 @@ def jnius_diag() -> str:
         return "桥接对象为空（mActivity 不可用）"
     except Exception as e:
         return f"{type(e).__name__}: {e}"
+
+
+def platform_diag() -> str:
+    """平台判定依据（单行），非安卓时显示在更新卡片上。
+
+    2026-11-16 老板平板两轮误判：「电脑预览」一出现就等于更新功能全锁死，
+    但旧卡片不给任何线索，只能靠猜。把 sys.platform / TMPDIR / 安卓环境标记
+    摊开——真机再被误判，老板截一张图就能定位，不用连 adb。
+    """
+    import sys
+    tmp = str(os.environ.get("TMPDIR") or "")
+    marks = ",".join(k for k in ("ANDROID_DATA", "ANDROID_ROOT") if k in os.environ)
+    return f"platform={sys.platform} TMPDIR={tmp or '-'} 标记={marks or '-'}"
 
 
 def get_local_version():
