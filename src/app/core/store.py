@@ -31,6 +31,124 @@ TEXT_STATUSES = ["草稿", "已接受", "已锁定"]
 LORE_CATEGORIES = ["角色", "地点", "物品", "术语"]
 
 
+def _sql_name(name: str) -> str:
+    """把表名/列名包成 SQL 标识符（双引号转义）。
+
+    同步合并要把表名拼进 SQL，虽然全是内部常量，也绝不裸拼字符串。
+    """
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _attached_meta(conn, key: str, schema: str = "sync_src") -> str:
+    """读已 ATTACH 的库的 meta 值；表不存在或读不到返回空串。"""
+    try:
+        row = conn.execute(
+            "SELECT value FROM %s.meta WHERE key=?" % _sql_name(schema), (key,)).fetchone()
+        return str(row[0]) if row else ""
+    except sqlite3.Error:
+        return ""
+
+
+def merge_table_copy(conn, src_path: str, skip_tables=(), schema_version: int = 0) -> dict:
+    """把快照文件按「表级替换」合并进 conn（项目库与全局库共用）。
+
+    为什么不是换文件：换文件要关连接、删 -wal/-shm、还可能撞上 AppState
+    停靠区里别的连接；表级合并只用一个事务，且天然保留 skip_tables
+    （请求日志、生成缓存这些「本机自有」的数据）。
+
+    schema_version>0 时做版本校验：远端更新则拒绝合并——老代码读新库的
+    字段会直接炸，宁可让用户先升级。
+
+    返回 {ok, reason, tables, schema}
+    """
+    if not os.path.isfile(src_path):
+        return {"ok": False, "reason": "快照文件不存在", "tables": 0, "schema": 0}
+    skip = set(skip_tables or ())
+    try:
+        conn.execute("ATTACH DATABASE ? AS sync_src", (src_path,))
+    except sqlite3.Error as e:
+        return {"ok": False, "reason": "挂载快照失败：" + str(e), "tables": 0, "schema": 0}
+    try:
+        src_ver = 0
+        if schema_version:
+            try:
+                src_ver = int(_attached_meta(conn, "schema_version") or 0)
+            except ValueError:
+                src_ver = 0
+            if src_ver <= 0:
+                return {"ok": False, "reason": "快照缺少 schema 版本，拒绝合并",
+                        "tables": 0, "schema": 0}
+            if src_ver > int(schema_version):
+                return {"ok": False,
+                        "reason": "另一台设备的软件版本更新（库版本 %d > 本机 %d），"
+                                  "请先升级本机再同步" % (src_ver, int(schema_version)),
+                        "tables": 0, "schema": src_ver}
+        src_tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sync_src.sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%'")]
+        plan = []
+        for tbl in src_tables:
+            if tbl in skip:
+                continue
+            dst_cols = [c[1] for c in conn.execute(
+                "PRAGMA main.table_info(%s)" % _sql_name(tbl))]
+            src_cols = [c[1] for c in conn.execute(
+                "PRAGMA sync_src.table_info(%s)" % _sql_name(tbl))]
+            if not dst_cols:
+                continue  # 本机没这张表（远端较新），跳过而不是报错
+            if dst_cols != src_cols:
+                return {"ok": False,
+                        "reason": "表 %s 的字段对不上（本机 %d 列 / 快照 %d 列），"
+                                  "两端版本不一致，已放弃合并"
+                                  % (tbl, len(dst_cols), len(src_cols)),
+                        "tables": 0, "schema": src_ver}
+            plan.append((tbl, dst_cols))
+        if not plan:
+            return {"ok": False, "reason": "快照里没有可合并的表",
+                    "tables": 0, "schema": src_ver}
+
+        dst_uuid = _attached_meta(conn, "project_uuid", "main")
+        src_uuid = _attached_meta(conn, "project_uuid")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for tbl, cols in plan:
+                    name = _sql_name(tbl)
+                    collist = ", ".join(_sql_name(c) for c in cols)
+                    conn.execute("DELETE FROM main." + name)
+                    conn.execute("INSERT INTO main.%s (%s) SELECT %s FROM sync_src.%s"
+                                 % (name, collist, collist, name))
+                if schema_version:
+                    # 版本号绝不让远端带回来：老端拉新库会触发重复 ALTER
+                    conn.execute(
+                        "INSERT INTO main.meta(key,value) VALUES('schema_version',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(int(schema_version)),))
+                if dst_uuid and not src_uuid:
+                    conn.execute(
+                        "INSERT INTO main.meta(key,value) VALUES('project_uuid',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (dst_uuid,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            try:
+                conn.execute("PRAGMA foreign_keys=ON")
+            except sqlite3.Error:
+                pass
+        return {"ok": True, "reason": "", "tables": len(plan), "schema": src_ver}
+    except sqlite3.Error as e:
+        return {"ok": False, "reason": "合并失败：" + str(e), "tables": 0, "schema": 0}
+    finally:
+        try:
+            conn.execute("DETACH DATABASE sync_src")
+        except sqlite3.Error:
+            pass
+
+
 def lore_context_hit(name: str, tags: list | None, hay: str) -> bool:
     """设定条目是否被上下文点名：名字归一化子串 / 标签命中 / 名字前 4 字命中。
 
@@ -319,6 +437,12 @@ class ProjectStore(QObject):
         self.conn = db.connect(self.db_path)
         self._lock = threading.RLock()  # 连接锁：UI 线程 + AI 工作线程共用
         self._closed = False  # close() 后置位：后台线程（建向量等）据此放弃，不撞已关连接
+        # 写入计数（云同步用）：任何提交都 +1，engine 靠它判断「本机有没有未推送的改动」。
+        # 故意不用哈希：大库算 sha 要几百毫秒，而这个计数是零成本。
+        # ⚠ 每次 open 都从 0 重新数，所以重启后会比游标里记的值小 → 判成「脏」多推一次，
+        # 这是安全侧的偏差（宁可多推一次，不可漏推）。
+        self._write_seq = 0
+        self._last_write_at = ""
         # 补齐新库缺失的分卷索引（旧库迁移已有、幂等安全）
         self._exec("CREATE INDEX IF NOT EXISTS idx_chapters_volume ON chapters(volume_id)")
         # 全局配置（模型/路由/偏好/预设）统一放在 GlobalStore，跨项目共享
@@ -344,6 +468,8 @@ class ProjectStore(QObject):
         with self._lock:
             cur = self.conn.execute(sql, params)
             self.conn.commit()
+            self._write_seq += 1
+            self._last_write_at = db.now()
             return cur
 
     @contextmanager
@@ -361,6 +487,8 @@ class ProjectStore(QObject):
                 self.conn.rollback()
                 raise
             self.conn.commit()
+            self._write_seq += 1
+            self._last_write_at = db.now()
 
     def _ensure_seed(self):
         """首次建库时写入种子数据（元信息/内置卡片/默认路由/v0 快照）。"""
@@ -3285,11 +3413,14 @@ class ProjectStore(QObject):
         return {"chapters": ch["n"] if ch else 0, "archived": arch["n"] if arch else 0,
                 "words": words["n"] if words else 0}
 
-    def backup(self, backup_dir: str | None = None) -> str:
+    def backup(self, backup_dir: str | None = None, prefix: str = "project") -> str:
         """复制 db 到 backups/（时间戳命名），返回备份文件路径。
 
         破甲/生成偏好等工具配置已全局共享（2026-08-08），不在项目文件夹内，
         项目备份只带走内容数据（db），全局配置随全局库另行备份。
+
+        prefix 供云同步用：被云端版本覆盖前先留一份 `sync_overwrite_*`，
+        与常规自动备份区分开，免得按 backup_keep 剪枝时被误删。
         """
         backup_dir = backup_dir or os.path.join(self.folder, "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -3297,7 +3428,7 @@ class ProjectStore(QObject):
         # 否则 FULL checkpoint 与 copy2 之间的并发写会落入 WAL 而漏进备份
         # （备份文件仍是有效 db，只是缺最近几笔写入）。
         stamp = db.now().replace(":", "").replace("-", "")
-        dest = os.path.join(backup_dir, f"project_{stamp}.db")
+        dest = os.path.join(backup_dir, f"{prefix}_{stamp}.db")
         with self._lock:
             self.conn.execute("PRAGMA wal_checkpoint(FULL)")
             shutil.copy2(self.db_path, dest)
@@ -3307,6 +3438,79 @@ class ProjectStore(QObject):
     @property
     def is_closed(self) -> bool:
         return self._closed
+
+    # ---------- 云同步：快照与合并（2026-11-16） ----------
+    #
+    # 同步单位是「一本一个 project.db」，但**绝不直接复制库文件**：
+    #   - 直接 copy 会漏 WAL 里的最近写入；
+    #   - checkpoint+copy 在并发写时仍可能落后。
+    # 用 VACUUM INTO 拿一致性快照（读事务里生成），顺带压实碎片。
+    #
+    # 实测（老板四本真实小说，27/20/19/14 MB）：
+    #   剥掉 request_logs + generation_cache 再压实后：0.9 / 2.1 / 9.1 / 0.8 MB
+    #   gzip 后：0.3 / 0.7 / 2.7 / 0.2 MB
+    # 胶囊下行只有 0.3 MB/s，不剥日志单本要下将近一分半，剥完平均 3 秒。
+
+    # 永远不进同步快照的表：
+    #   request_logs     —— 逐条完整 prompt + 不截断思考，单本十几 MB；两端各留各的
+    #   generation_cache —— 纯本机生成缓存，搬过去也无意义
+    #   sqlite_sequence  —— 自增游标，由 SQLite 自己维护
+    SYNC_SKIP_TABLES = ("request_logs", "generation_cache", "sqlite_sequence")
+
+    @property
+    def write_seq(self) -> int:
+        """本库累计提交次数（进程内）。同步引擎靠它判断「有没有未推送的改动」。"""
+        return self._write_seq
+
+    @property
+    def last_write_at(self) -> str:
+        return self._last_write_at
+
+    def snapshot_to(self, path: str, exclude_tables=None) -> dict:
+        """导出一致性快照到 path，供上传。返回 {path, size, tables}。
+
+        ⚠ 中间那次 `VACUUM` 必须用 isolation_level=None 打开：
+        sqlite3 默认会在 DELETE 前自动 BEGIN，事务里执行 VACUUM 直接
+        报 "cannot VACUUM from within a transaction"（2026-11-16 踩过）。
+        """
+        exclude = list(exclude_tables if exclude_tables is not None
+                       else self.SYNC_SKIP_TABLES)
+        folder = os.path.dirname(os.path.abspath(path))
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        if os.path.isfile(path):
+            os.remove(path)
+        with self._lock:
+            self.conn.execute("VACUUM INTO ?", (path,))
+        dropped = []
+        con = sqlite3.connect(path, isolation_level=None)
+        try:
+            for tbl in exclude:
+                if tbl == "sqlite_sequence":
+                    continue
+                try:
+                    con.execute("DELETE FROM " + _sql_name(tbl))
+                    dropped.append(tbl)
+                except sqlite3.Error:
+                    pass
+            con.execute("VACUUM")
+        finally:
+            con.close()
+        return {"path": path, "size": os.path.getsize(path), "dropped": dropped}
+
+    def merge_from(self, src_path: str) -> dict:
+        """把另一台设备的快照合并进本库（表级替换，保留本机请求日志）。
+
+        实现在模块级 `merge_table_copy`，因为全局库 app.db 要走同一条路。
+        返回 {ok, reason, tables, schema}
+        """
+        with self._lock:
+            res = merge_table_copy(self.conn, src_path, self.SYNC_SKIP_TABLES,
+                                   int(db.SCHEMA_VERSION))
+        if res.get("ok"):
+            self._write_seq += 1
+            self._last_write_at = db.now()
+        return res
 
     def close(self):
         self._closed = True  # 先立旗再关连接：并发线程看到旗标即放弃，不报「库已关闭」

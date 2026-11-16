@@ -15,7 +15,7 @@ class MinePage:
         self.page = page
         self.session = session
         self.on_refresh = None  # main() 注入：重建本页
-        self._sub = None        # 子页面（None=本页；"jailbreak"/"cards"/"templates"/"presets"）
+        self._sub = None        # 子页面（None=本页；"jailbreak"/"cards"/"templates"/"presets"/"settings"/"sync"）
         self._subs = {}         # 子页面实例缓存（惰性创建，保留页内状态）
         self._picker = ft.FilePicker()
         # flet 0.86：FilePicker 是服务控件（不渲染），必须挂 page.services；
@@ -54,6 +54,9 @@ class MinePage:
             from pages.settings import SettingsPage
             obj = SettingsPage(self.page, self.session, on_back=self._close_sub,
                                on_open_templates=lambda: self._open_templates(""))
+        elif name == "sync":
+            from pages.sync import SyncPage
+            obj = SyncPage(self.page, self.session, on_back=self._close_sub)
         else:
             return None
         obj.on_refresh = self._sub_refresh
@@ -71,6 +74,9 @@ class MinePage:
 
     def _open_settings(self, e):
         self._open_sub("settings")
+
+    def _open_sync(self, e):
+        self._open_sub("sync")
 
     def _open_templates(self, stage: str = ""):
         """打开任务模板页；stage 非空时把可选范围限定到该阶段的模板。"""
@@ -284,6 +290,46 @@ class MinePage:
         from logs_ui import logs_view
         logs_view(self.page, self.session, on_refresh=self.on_refresh)
 
+    # ---------- 云同步 ----------
+
+    def _sync_summary(self) -> str:
+        """首页/我的页显示的一行同步状态（不联网，只读本地配置）。"""
+        try:
+            from app.core import sync_config
+            cfg = sync_config.load_config()
+            state = sync_config.load_state()
+        except Exception as e:
+            return "读取同步配置失败：%s" % e
+        if not sync_config.is_configured(cfg):
+            return ("未配置。填好存储桶 + AccessKey 后，手机与电脑就共用同一份资料"
+                    "（大纲、正文、记忆、模型密钥、偏好卡、破甲库）。")
+        enabled = True
+        try:
+            enabled = str(self.session.app.gstore.get_global_setting(
+                "sync_enabled", "0")) == "1"
+        except Exception:
+            pass
+        parts = []
+        if not enabled:
+            parts.append("已暂停")
+        parts.append("桶 " + (cfg.get("bucket") or "-"))
+        try:
+            parts.append("密码" + ("已绑定" if sync_config.get_crypto(cfg) else "未设置"))
+        except Exception:
+            parts.append("密码未知")
+        parts.append("上次同步 " + (state.get("last_sync_at") or "从未"))
+        usage = (state.get("usage") or {}).get("human")
+        if usage:
+            parts.append("云端 " + usage)
+        return " · ".join(parts)
+
+    def _sync_now_quick(self, e):
+        """「我的」页的立即同步：直接借用云同步页的动作（不需要先打开那个页）。"""
+        obj = self._ensure_sub("sync")
+        if obj is None:
+            return
+        obj._sync_now(None)
+
     # ---------- 构建 ----------
 
     def build(self) -> ft.Control:
@@ -327,6 +373,22 @@ class MinePage:
                 ft.Row([
                     ft.FilledButton("导出全量备份", on_click=self._export_full),
                     ft.OutlinedButton("导入全量备份", on_click=self._import_full),
+                ], spacing=8, wrap=True),
+            ], spacing=6), padding=12)),
+            ft.Card(ft.Container(ft.Column([
+                ft.Row([ft.Icon(ft.Icons.CLOUD_SYNC, color=ft.Colors.PRIMARY),
+                        ft.Text("云同步（数据胶囊）", size=14,
+                                weight=ft.FontWeight.W_600, expand=True),
+                        ft.IconButton(
+                            ft.Icons.SETTINGS, icon_size=18,
+                            tooltip="同步设置",
+                            on_click=self._open_sync)]),
+                ft.Text(self._sync_summary(), size=11,
+                        color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Row([
+                    ft.FilledButton("立即同步", icon=ft.Icons.SYNC,
+                                    on_click=self._sync_now_quick),
+                    ft.OutlinedButton("同步设置", on_click=self._open_sync),
                 ], spacing=8, wrap=True),
             ], spacing=6), padding=12)),
             menu_group("项目 zip（搬单本书）", [

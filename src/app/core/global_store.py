@@ -124,6 +124,14 @@ GLOBAL_SETTING_DEFAULTS = {
     # get_setting_int —— int("0.65") 会抛错）；0 = 关闭护栏。批量/自动模式低于
     # 阈值不落库、原稿保留；写作台有人工预览，只给强警示、仍可确认落库。
     "rewrite_min_keep_ratio": "0.65",
+    # ---------- 云同步（2026-11-16，数据胶囊 S3）----------
+    # 连接凭据（AK/SK/桶名）不在这里：它们只存本机 sync.json，否则会被同步到
+    # 另一端，DPAPI 密文解不开反而变成坏 key。这里只放能跨设备共用的行为开关。
+    "sync_enabled": "0",                 # 总开关：0=完全不联网 / 1=按下面两项自动同步
+    "sync_auto_pull": "1",               # 打开项目时自动拉取云端最新
+    "sync_auto_push": "1",               # 内容改动静默 60 秒后自动上传
+    "sync_include_logs": "0",            # 连请求日志一起同步（体积大，默认只同步内容）
+    "sync_history_keep": "5",            # 云端每个项目保留几份历史版本（0=不留）
 }
 GLOBAL_SETTING_KEYS = frozenset(GLOBAL_SETTING_DEFAULTS)
 

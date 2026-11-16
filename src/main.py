@@ -72,6 +72,33 @@ def main(page: ft.Page):
     from update_ui import schedule_silent_check
     schedule_silent_check(page, session)
 
+    # 云同步守护线程：改动静默 60 秒后自动上传当前项目（打开项目时的拉取在
+    # pages/home.py 里，因为要知道开的是哪本书）。没配置时线程只是每 8 秒
+    # 读一次全局设置就返回，开销可以忽略。
+    import threading
+    import sync_ui
+    watcher = sync_ui.Watcher(page, session)
+    watcher.start()
+
+    def _flush_async():
+        threading.Thread(target=watcher.flush, daemon=True).start()
+
+    # 退到后台 / 断开时尽力推一次（安卓可能直接杀进程，所以只是尽力）。
+    # flush 内部再开线程并在自己线程里 join，这里绝不能让事件线程等网络。
+    def _on_lifecycle(e):
+        try:
+            st = str(getattr(e, "state", "")).upper()
+        except Exception:
+            return
+        if any(k in st for k in ("HIDE", "PAUSE", "DETACH")):
+            _flush_async()
+
+    try:
+        page.on_app_lifecycle_state_change = _on_lifecycle
+        page.on_disconnect = lambda e: _flush_async()
+    except Exception:
+        pass        # 某些平台没有这些钩子，靠 60 秒 debounce 兜底
+
 
 if __name__ == "__main__":
     ft.run(main)

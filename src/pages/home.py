@@ -26,8 +26,15 @@ class HomePage:
             self.on_open_project()
         except FileNotFoundError:
             toast(self.page, "项目文件夹不存在", error=True)
+            return
         except Exception as e:
             toast(self.page, f"打开失败：{e}", error=True)
+            return
+        # 云同步：云端有更新的版本就合并下来（只拉不推，异步）。
+        # 放在切页之后：先让用户看到本地内容，合并完再重建一次页面。
+        import sync_ui
+        sync_ui.pull_on_open(self.page, self.session,
+                             on_pulled=self.on_refresh)
 
     def _new_project(self, e):
         name_field = ft.TextField(label="作品名", autofocus=True)
