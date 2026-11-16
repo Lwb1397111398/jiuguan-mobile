@@ -190,8 +190,8 @@ class Watcher:
         if store is None or getattr(store, "is_closed", False):
             return
         key = getattr(store, "folder", "") or ""
-        if key in self._tombstoned:
-            return                          # 已在别的设备删除，等手动同步清理
+        # 不按文件夹永久拉黑：从 .sync_trash 移回来的书还要能重新自动推。
+        # 靠 _pushed 记录 write_seq 抑制重复请求，_tombstoned 只用来去重提示。
         seq = getattr(store, "write_seq", 0)
         if self._pushed.get(key) == seq:
             return                          # 上次推完之后没再写过
@@ -221,11 +221,13 @@ class Watcher:
                 self._retry_at = time.monotonic() + RETRY_SECONDS
                 return False
             if act == "tombstoned":
-                self._tombstoned.add(key_of(store))
-                self._pushed[key_of(store)] = getattr(store, "write_seq", 0)
-                toast(self.page, "《%s》已在其它设备删除，点「立即同步」清理本机"
-                      % store.title, error=True)
-                _safe_update(self.page)
+                k = key_of(store)
+                self._pushed[k] = getattr(store, "write_seq", 0)
+                if k not in self._tombstoned:
+                    self._tombstoned.add(k)
+                    toast(self.page, "《%s》已在其它设备删除，点「立即同步」清理本机"
+                          % store.title, error=True)
+                    _safe_update(self.page)
                 return True
             if act == "deferred":
                 k = key_of(store)
