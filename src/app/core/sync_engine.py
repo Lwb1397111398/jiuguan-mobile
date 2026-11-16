@@ -23,11 +23,19 @@ jiuguan-sync/v1/
 └── history/projects/<uuid>/<ts>.db.enc
 ```
 
-## 两个关键决定（都踩过坑）
+## 项目删除 = 墓碑（tombstone），不是删对象
+删一本书时只把它的 manifest 标成 `deleted=true`，**数据对象和历史版本都留着**。
+另一端同步看到墓碑，把本地文件夹「移动」到 `.sync_trash/`（绝不 rmtree）并
+从最近项目移除。云端对象不删，才能随时反悔；push/pull 遇到墓碑一律拒绝，
+否则本地旧版会把已删除的书「复活」。
+
+## 三个关键决定（都踩过坑）
 1. **不用 ETag 判版本**：网关的 ETag 可能是 multipart 格式，也可能压根不给，
    一律用 manifest 里的 sha256。
 2. **写顺序**：先 PUT 数据对象，成功后再 PUT manifest。反过来会在断网时留下
    「清单指着一个不存在的对象」，另一端每次同步都报错。
+3. **同步是整库覆盖，不是逐条合并**：拉取按表 `DELETE` + 整表 `INSERT`，
+   所以「删除行」能传播；但两台同时改时按 LWW 整本赢，不会合并两边改动。
 """
 import gzip
 import hashlib
@@ -46,6 +54,8 @@ from .sync_crypto import CryptoError
 
 HISTORY_DEFAULT = 5
 _PROJECT_SKIP = ProjectStore.SYNC_SKIP_TABLES
+TOMBSTONE_KEY = "deleted"        # manifest 上的「这本书已删」标记
+TRASH_DIR = ".sync_trash"        # 另一端收到墓碑后把文件夹挪到这里，绝不真删
 
 
 def db_content_fingerprint(conn, skip=()) -> str:
@@ -165,6 +175,45 @@ def list_local_projects(app_state) -> list:
         uid = meta.get("project_uuid") or project_uuid_of(title, meta.get("created_at", ""))
         out.append({"path": path, "title": title, "uuid": uid})
     return out
+
+
+def sync_uid_for_path(path: str) -> str:
+    """只读 project.db 拿项目身份。必须在删文件夹**之前**调用。"""
+    meta = read_meta_ro(os.path.join(path, "project.db"))
+    return meta.get("project_uuid") or project_uuid_of(
+        meta.get("project_title") or os.path.basename(path.rstrip("/\\")),
+        meta.get("created_at", ""))
+
+
+def mark_deleted_bg(app_state, path: str, uid: str = "", title: str = "") -> None:
+    """UI 删除项目后调：后台写墓碑。任何失败都只记日志，绝不影响删除动作。
+
+    云同步没开 / 没配好 / 断网时直接返回——本地删除照样生效，只是不传播。
+    uid 在这里**同步**算好再交给线程：桌面的「删除文件夹」会立刻 rmtree，
+    后台线程再去读 project.db 就已经读不到了。
+    """
+    import threading
+    uid = uid or sync_uid_for_path(path)
+
+    def run():
+        try:
+            cfg = sync_config.load_config()
+            if not sync_config.is_configured(cfg):
+                return
+            g = getattr(app_state, "gstore", None)
+            if g is not None and g.get_global_setting("sync_enabled", "0") != "1":
+                return
+            eng = SyncEngine(cfg=cfg)
+            eng.bind("")
+            eng.mark_project_deleted(app_state, path, uid=uid, title=title)
+        except Exception as e:      # 网络/密钥/密码任何问题都不能弹到用户面前
+            try:
+                sync_config.SyncLog()("[sync] 写删除标记失败：%s %s"
+                                      % (type(e).__name__, str(e)[:160]))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="sync-tombstone").start()
 
 
 class SyncEngine:
@@ -373,6 +422,12 @@ class SyncEngine:
     def push_project(self, store: ProjectStore, uid: str = "") -> dict:
         uid = uid or self.ensure_uuid(store)
         title = store.title
+        remote = self.get_manifest(uid)
+        if remote.get(TOMBSTONE_KEY):
+            # 这本书已在别的设备删除。绝不能让本地旧版推回去把它「复活」——
+            # 这是无条件 push 最危险的口子，必须在这里堵死。
+            self.log("[sync] 《%s》云端已标记删除，拒绝上传" % title)
+            return {"action": "tombstoned", "uuid": uid, "title": title}
         self._touch("上传《" + title + "》…")
         tmp = tempfile.mkdtemp(prefix="jgsync_push_")
         try:
@@ -386,7 +441,6 @@ class SyncEngine:
             digest = sha256_file(enc)
             size = os.path.getsize(enc)
 
-            remote = self.get_manifest(uid)
             if remote and remote.get("sha256") and remote["sha256"] != digest:
                 # 覆盖前先把云端旧版收进 history：这是「覆盖」唯一的后悔药
                 self.archive_remote(uid, remote)
@@ -414,6 +468,9 @@ class SyncEngine:
         manifest = self.get_manifest(uid)
         if not manifest:
             return {"action": "none", "reason": "云端没有这本书"}
+        if manifest.get(TOMBSTONE_KEY):
+            return {"action": "tombstoned", "uuid": uid,
+                    "title": manifest.get("title", store.title)}
         if backup is None:
             # 本机没改动就不必留快照（内容与云端一致，留了也是垃圾文件）
             backup = self.is_dirty(store, self._cursor(uid))
@@ -455,12 +512,31 @@ class SyncEngine:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def sync_project(self, store: ProjectStore, direction: str = "auto",
-                     uid: str = "") -> dict:
-        """按决策表处理一本书。direction: auto / push / pull。"""
+                     uid: str = "", remote: dict = None) -> dict:
+        """按决策表处理一本书。direction: auto / push / pull / safe_push。
+
+        remote 由 sync_all 传入（它已经查过一次），避免每本书多一次网络往返。
+        safe_push 只给后台自动同步用：云端有更新时让位，绝不静默覆盖。
+        """
         uid = uid or self.ensure_uuid(store)
         cur = self._cursor(uid)
-        remote = self.get_manifest(uid)
+        remote = self.get_manifest(uid) if remote is None else remote
         dirty = self.is_dirty(store, cur)
+
+        if remote.get(TOMBSTONE_KEY):
+            return {"action": "tombstoned", "uuid": uid,
+                    "title": remote.get("title", store.title)}
+
+        if direction == "safe_push":
+            # 自动同步专用：绝不静默覆盖任何一边。
+            # 云端被另一台设备动过就一律 defer —— 不推（否则本机旧版会把对方
+            # 刚写的整本盖掉，即「删除复活」），也不拉（用户可能正在写作台打字，
+            # 后台整表替换会吞掉未存内容）。冲突留给手动同步按 LWW 裁决。
+            if remote and remote.get("sha256") != cur.get("remote_sha"):
+                self.log("[sync] 《%s》云端有更新，自动同步让位给手动同步" % store.title)
+                return {"action": "deferred", "uuid": uid,
+                        "reason": "云端有更新，请点「立即同步」"}
+            return self.push_project(store, uid)
 
         if direction == "push":
             return self.push_project(store, uid)
@@ -718,18 +794,42 @@ class SyncEngine:
 
     def sync_all(self, app_state, include_global: bool = True,
                  direction: str = "auto") -> dict:
-        """同步全部项目（+全局配置）。返回统计。"""
-        stats = {"push": 0, "pull": 0, "skip": 0, "failed": 0, "errors": []}
+        """同步全部项目（+全局配置）。返回统计。
+
+        一轮做三件事：① 云端标了删除的书 → 本地移进回收站；② 本地每本书按
+        LWW 推/拉；③ 云端有、本机没有的书 → 自动落到本机（另一端新建的书
+        不用再手动点「从云端恢复」）。
+        """
+        stats = {"push": 0, "pull": 0, "skip": 0, "deleted": 0,
+                 "adopted": 0, "failed": 0, "errors": []}
         projects = list_local_projects(app_state)
-        if not projects:
-            self._touch("本机还没有项目，跳过")
         total = len(projects)
         for i, item in enumerate(projects, 1):
-            tag = "(" + str(i) + "/" + str(total) + ") "
+            tag = "(%d/%d) " % (i, total)
+            try:
+                remote = self.get_manifest(item["uuid"])
+            except S3Error as e:
+                stats["failed"] += 1
+                stats["errors"].append(item["title"] + "：读清单失败 " + str(e)[:100])
+                self.log("[sync] " + tag + item["title"] + " 读清单失败：" + str(e)[:150])
+                continue
+            if remote.get(TOMBSTONE_KEY):
+                r = self.quarantine_project(app_state, item)
+                stats["deleted"] += 1
+                self.log("[sync] " + tag + "《%s》云端已删除 → %s"
+                         % (item["title"], "移进回收站" if r.get("ok")
+                            else r.get("reason", "仅移除记录")))
+                if not r.get("ok"):
+                    stats["errors"].append(item["title"] + "：" + r.get("reason", ""))
+                continue
             store, temp = self._open_for_sync(app_state, item["path"])
             try:
-                r = self.sync_project(store, direction=direction, uid=item["uuid"])
+                r = self.sync_project(store, direction=direction,
+                                      uid=item["uuid"], remote=remote)
                 act = r.get("action", "skip")
+                if act == "tombstoned":
+                    stats["deleted"] += 1
+                    continue
                 if act == "failed":
                     stats["failed"] += 1
                     stats["errors"].append(item["title"] + "：" + r.get("reason", ""))
@@ -748,6 +848,10 @@ class SyncEngine:
                 if temp:
                     store.close()
 
+        # ③ 另一端新建的书自动落地（只往本机拿，push 方向不拉新书）
+        if direction in ("auto", "pull"):
+            self._adopt_remote_projects(app_state, projects, stats)
+
         if include_global:
             try:
                 g = self.sync_global(app_state, direction=direction)
@@ -764,26 +868,162 @@ class SyncEngine:
         self.state["last_error"] = "；".join(stats["errors"])[:400]
         self.save_state()
         self.heartbeat()
-        self._touch("同步完成：上传 %d、下载 %d、跳过 %d、失败 %d"
-                    % (stats["push"], stats["pull"], stats["skip"], stats["failed"]))
+        self._touch("同步完成：上传 %d、下载 %d、新书 %d、删除 %d、跳过 %d、失败 %d"
+                    % (stats["push"], stats["pull"], stats["adopted"],
+                       stats["deleted"], stats["skip"], stats["failed"]))
         return stats
 
     # ---------- 从云端恢复 / 用量 ----------
 
+    # ---------- 项目删除：墓碑 / 回收站 / 云端新书落地 ----------
+
+    def mark_project_deleted(self, app_state, path: str,
+                             uid: str = "", title: str = "") -> dict:
+        """把一本书的云端 manifest 标成墓碑。数据对象与历史版本一律保留。
+
+        uid 必须在删文件夹**之前**算好：文件夹没了就读不到 meta.project_uuid，
+        再用 title|created_at 重算会算出另一个身份，墓碑就贴到别的书上了。
+        """
+        if not uid:
+            meta = read_meta_ro(os.path.join(path, "project.db"))
+            uid = meta.get("project_uuid") or project_uuid_of(
+                title or meta.get("project_title", ""), meta.get("created_at", ""))
+        if not uid:
+            return {"ok": False, "reason": "算不出项目身份，未写墓碑"}
+        remote = self.get_manifest(uid)
+        if remote.get(TOMBSTONE_KEY):
+            return {"ok": True, "already": True, "uuid": uid}
+        if remote.get("sha256"):
+            self.archive_remote(uid, remote)   # 删之前再留一份，方便反悔
+        manifest = dict(remote)
+        manifest.update({
+            "uuid": uid,
+            "title": remote.get("title") or title
+                     or os.path.basename(path.rstrip("/\\")),
+            TOMBSTONE_KEY: True,
+            "deleted_at": db.now(),
+            "deleted_by": self.cfg.get("device_id", ""),
+            "updated_at": db.now(),
+            "device": self.cfg.get("device_id", ""),
+            "device_name": self.cfg.get("device_name", ""),
+            "schema_version": db.SCHEMA_VERSION,
+        })
+        # 只写清单，数据对象 project.db.enc 原样留着：反悔时把 deleted 去掉即可
+        self.put_manifest(uid, manifest)
+        sync_config.drop_cursor(self.state, uid)
+        self.save_state()
+        self.log("[sync] 《%s》已标记删除（数据仍留在云端）" % manifest["title"])
+        return {"ok": True, "uuid": uid, "title": manifest["title"]}
+
+    def quarantine_project(self, app_state, item: dict) -> dict:
+        """收到墓碑：把本地文件夹**移动**进 .sync_trash，绝不 rmtree。
+
+        移完从最近项目移除；若正打开这本书，先关连接再移，否则 Windows 上
+        文件句柄会挡住移动。移动失败也至少把记录摘掉，别让它一直挂在列表里。
+        """
+        path = item.get("path", "")
+        uid = item.get("uuid", "")
+        title = item.get("title", "")
+        cur = getattr(app_state, "store", None)
+        if cur is not None and not getattr(cur, "is_closed", False):
+            try:
+                if os.path.normcase(os.path.abspath(cur.folder)) == \
+                        os.path.normcase(os.path.abspath(path)):
+                    app_state.close_project()
+            except Exception:
+                pass
+        ok, reason = False, ""
+        if path and os.path.isdir(path):
+            stamp = db.now().replace(":", "").replace("-", "").replace(" ", "T")
+            trash = os.path.join(app_state.data_dir, TRASH_DIR)
+            dest = os.path.join(trash, (uid or "unknown") + "-" + stamp)
+            n = 1
+            while os.path.exists(dest):
+                dest = os.path.join(trash, (uid or "unknown")
+                                   + "-" + stamp + "-%d" % n)
+                n += 1
+            try:
+                os.makedirs(trash, exist_ok=True)
+                shutil.move(path, dest)
+                ok, reason = True, dest
+            except OSError as e:
+                reason = "移动回收站失败：" + str(e)[:120]
+        else:
+            reason = "文件夹已不存在"
+        try:
+            app_state.remove_recent(path)
+        except Exception as e:
+            reason += "；移除记录失败：" + str(e)[:80]
+        self.log("[sync] 《%s》云端已删 → %s" % (title, reason))
+        return {"ok": ok, "reason": reason}
+
+    def _materialize_remote(self, app_state, m: dict) -> dict:
+        """云端有、本机没有：建目录 + 空库 → 拉整表 → 挂进最近项目。"""
+        uid = m.get("uuid", "")
+        if not uid:
+            return {"ok": False, "reason": "清单缺 uuid"}
+        title = m.get("title") or uid
+        dest = os.path.join(app_state.data_dir, "projects", uid)
+        os.makedirs(dest, exist_ok=True)
+        store = ProjectStore(dest, getattr(app_state, "gstore", None))
+        try:
+            r = self.pull_project(store, uid, backup=False)
+            if r.get("action") == "failed":
+                return {"ok": False, "reason": r.get("reason", "合并失败")}
+            if r.get("action") == "tombstoned":
+                return {"ok": False, "reason": "云端已删除"}
+            if r.get("action") == "none":
+                return {"ok": False, "reason": "云端没有这本书的数据"}
+            app_state.add_recent(dest, store.title or title)
+            return {"ok": True, "path": dest, "tables": r.get("tables", 0)}
+        finally:
+            store.close()
+
+    def _adopt_remote_projects(self, app_state, local_projects, stats) -> None:
+        """A：把另一端新建的书自动落到本机，不用再手动点「从云端恢复」。"""
+        try:
+            remotes = self.list_remote_projects()
+        except S3Error as e:
+            stats["errors"].append("列举云端项目失败：" + str(e)[:120])
+            self.log("[sync] 列举云端项目失败：" + str(e)[:150])
+            return
+        known = {p["uuid"] for p in local_projects}
+        for m in remotes:
+            uid = m.get("uuid", "")
+            if not uid or uid in known or m.get(TOMBSTONE_KEY):
+                continue
+            title = m.get("title") or uid
+            try:
+                r = self._materialize_remote(app_state, m)
+            except (S3Error, CryptoError, NeedPassword, OSError) as e:
+                r = {"ok": False, "reason": str(e)[:140]}
+            except Exception as e:
+                r = {"ok": False, "reason": type(e).__name__ + str(e)[:140]}
+            if r.get("ok"):
+                stats["adopted"] += 1
+                known.add(uid)
+                self.log("[sync] 新书《%s》已从云端落地（%s 张表）"
+                         % (title, r.get("tables", 0)))
+            else:
+                stats["failed"] += 1
+                stats["errors"].append(title + "：" + r.get("reason", ""))
+                self.log("[sync] 新书《%s》落地失败：%s"
+                         % (title, r.get("reason", "")))
+
     def restore_all(self, app_state) -> dict:
-        """新设备/重装：把云端全部项目落到本机并挂进最近项目列表。"""
-        remotes = self.list_remote_projects()
+        """新设备/重装：把云端全部项目落到本机并挂进最近项目列表（跳过墓碑）。"""
+        remotes = [m for m in self.list_remote_projects()
+                   if not m.get(TOMBSTONE_KEY)]
         if not remotes:
             return {"ok": False, "reason": "云端还没有任何项目"}
         local = {p["uuid"]: p for p in list_local_projects(app_state)}
-        root = os.path.join(app_state.data_dir, "projects")
         done, errors = 0, []
         for i, m in enumerate(remotes, 1):
             uid = m.get("uuid", "")
             title = m.get("title") or uid
-            self._touch("恢复 (" + str(i) + "/" + str(len(remotes)) + ")《" + title + "》")
-            target = local.get(uid)
+            self._touch("恢复 (%d/%d)《%s》" % (i, len(remotes), title))
             try:
+                target = local.get(uid)
                 if target:
                     store, temp = self._open_for_sync(app_state, target["path"])
                     try:
@@ -792,16 +1032,10 @@ class SyncEngine:
                         if temp:
                             store.close()
                 else:
-                    dest = os.path.join(root, uid)
-                    os.makedirs(dest, exist_ok=True)
-                    store = ProjectStore(dest, getattr(app_state, "gstore", None))
-                    try:
-                        r = self.pull_project(store, uid, backup=False)
-                        if r.get("action") == "failed":
-                            raise S3Error(r.get("reason", "合并失败"))
-                        app_state.add_recent(dest, store.title or title)
-                    finally:
-                        store.close()
+                    r = self._materialize_remote(app_state, m)
+                    if not r.get("ok"):
+                        errors.append(title + "：" + r.get("reason", ""))
+                        continue
                 done += 1
             except (S3Error, CryptoError, OSError) as e:
                 errors.append(title + "：" + str(e)[:120])

@@ -79,6 +79,11 @@ def _safe_update(page):
         pass
 
 
+def key_of(store) -> str:
+    """守护线程里给项目去重用：文件夹路径（与 _tick 的 key 同一个值）。"""
+    return getattr(store, "folder", "") or ""
+
+
 # ---------------- 打开项目时拉取 ----------------
 
 def pull_on_open(page, session, on_pulled=None) -> bool:
@@ -92,12 +97,17 @@ def pull_on_open(page, session, on_pulled=None) -> bool:
         return False
 
     def work():
+        from app.core.sync_engine import TOMBSTONE_KEY
         eng = _engine()
         uid = eng.ensure_uuid(store)
         cur = eng._cursor(uid)               # noqa: SLF001 — 与桌面同一判断
         remote = eng.get_manifest(uid)
         if not remote:
             return {"action": "none"}
+        # 墓碑保留原 sha256，必须先判，否则「sha 没变就跳过」会把它漏掉
+        if remote.get(TOMBSTONE_KEY):
+            return {"action": "tombstoned",
+                    "title": remote.get("title", store.title)}
         if remote.get("sha256") == cur.get("remote_sha"):
             return {"action": "skip"}        # 云端没变，别白下载
         return eng.pull_project(store, backup=True)
@@ -116,6 +126,10 @@ def pull_on_open(page, session, on_pulled=None) -> bool:
                         on_pulled()
                     except Exception:
                         pass
+                _safe_update(page)
+            elif res.get("action") == "tombstoned":
+                toast(page, "《%s》已在其它设备删除，点「我的 → 云同步 → 立即同步」清理本机"
+                      % (res.get("title") or store.title), error=True)
                 _safe_update(page)
             elif res.get("error"):
                 toast(page, "云端同步失败：%s" % str(res["error"])[:120], error=True)
@@ -137,6 +151,8 @@ class Watcher:
         self.session = session
         self._stop = threading.Event()
         self._pushed = {}       # 项目文件夹 -> 已推送的 write_seq
+        self._tombstoned = set()   # 云端已删的书：不再推，等手动同步清理本机
+        self._deferred = set()     # 云端有更新：只提示一次，别每 8 秒弹一次
         self._retry_at = 0.0
         self._thread = None
 
@@ -174,6 +190,8 @@ class Watcher:
         if store is None or getattr(store, "is_closed", False):
             return
         key = getattr(store, "folder", "") or ""
+        if key in self._tombstoned:
+            return                          # 已在别的设备删除，等手动同步清理
         seq = getattr(store, "write_seq", 0)
         if self._pushed.get(key) == seq:
             return                          # 上次推完之后没再写过
@@ -195,11 +213,30 @@ class Watcher:
         if not _LOCK.acquire(blocking=False):
             return False                    # 有别的同步在跑，下轮再说
         try:
-            r = _engine().sync_project(store, direction="push")
-            if r.get("action") == "failed":
+            # safe_push：云端被另一台设备动过就让位，绝不静默互相覆盖。
+            # 冲突交给「立即同步」按 LWW 裁决，那里才会留覆盖前快照。
+            r = _engine().sync_project(store, direction="safe_push")
+            act = r.get("action")
+            if act == "failed":
                 self._retry_at = time.monotonic() + RETRY_SECONDS
                 return False
-            if r.get("action") == "push":
+            if act == "tombstoned":
+                self._tombstoned.add(key_of(store))
+                self._pushed[key_of(store)] = getattr(store, "write_seq", 0)
+                toast(self.page, "《%s》已在其它设备删除，点「立即同步」清理本机"
+                      % store.title, error=True)
+                _safe_update(self.page)
+                return True
+            if act == "deferred":
+                k = key_of(store)
+                self._pushed[k] = getattr(store, "write_seq", 0)
+                if k not in self._deferred:
+                    self._deferred.add(k)
+                    toast(self.page, "《%s》云端有另一台设备的更新，点「立即同步」合并"
+                          % store.title)
+                    _safe_update(self.page)
+                return True
+            if act == "push":
                 toast(self.page, "已上传《%s》到云端" % store.title)
                 _safe_update(self.page)
             return True

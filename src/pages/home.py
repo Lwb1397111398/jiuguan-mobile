@@ -67,10 +67,16 @@ class HomePage:
 
     def _remove(self, path: str):
         def _yes():
+            # 写云端墓碑：电脑上的这本书会在下次同步时移进回收站。
+            # 必须在 remove_recent 之前调，文件夹还在才能读出 project_uuid。
+            from app.core.sync_engine import mark_deleted_bg
+            mark_deleted_bg(self.session.app, path)
             self.session.app.remove_recent(path)
             self.page.update()
         confirm(self.page, "移除记录",
-                "只移除这条最近项目记录，不删除项目文件夹里的任何数据。", _yes)
+                "本机只移除这条记录（文件夹保留），但会同步删除到其它设备："
+                "它们会把这本书移进 .sync_trash 回收站，不真删；"
+                "云端数据仍保留，可反悔。", _yes)
 
     # ---------- 构建 ----------
 

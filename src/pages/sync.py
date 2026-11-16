@@ -199,8 +199,12 @@ class SyncPage:
                     r.get("error") or r.get("reason") or "未知错误")[:180], error=True)
                 self.refresh()
                 return
-            msg = "同步完成：上传 %d、下载 %d、失败 %d" % (
-                r.get("push", 0), r.get("pull", 0), r.get("failed", 0))
+            msg = "同步完成：上传 %d、下载 %d、新书 %d、删除 %d、跳过 %d、失败 %d" % (
+                r.get("push", 0), r.get("pull", 0), r.get("adopted", 0),
+                r.get("deleted", 0), r.get("skip", 0), r.get("failed", 0))
+            if r.get("deleted") or r.get("adopted"):
+                msg += ("\n项目列表有变化；被删的书已移到 .sync_trash 回收站，"
+                        "请回到「项目」页刷新。")
             if r.get("failed"):
                 toast(self.page, msg + "\n" + "；".join((r.get("errors") or [])[:2]),
                       error=True)
