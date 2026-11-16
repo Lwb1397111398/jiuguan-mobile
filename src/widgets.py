@@ -1,15 +1,28 @@
 # -*- coding: utf-8 -*-
-"""通用控件与提示：toast、确认对话框、预览 bottom sheet、小部件。"""
+"""通用控件与提示：toast、确认对话框、预览 bottom sheet、小部件。
+
+**视觉组件全部转发 `theme`**（2026-11-16 全站美化第二轮）：这里只保留
+历史函数名做兼容，样式一律由 `theme.py` 单点决定——否则「同一个分组标题
+在写作台和设置页长得不一样」，改一次要改十处。
+"""
 import threading
 
 import flet as ft
+
+import theme as T
 
 
 def toast(page, msg: str, error: bool = False):
     try:
         page.show_dialog(ft.SnackBar(
-            content=ft.Text(msg, color=ft.Colors.WHITE),
-            bgcolor=ft.Colors.RED_700 if error else None,
+            content=ft.Text(msg, size=13,
+                            color=ft.Colors.ON_ERROR_CONTAINER if error
+                            else ft.Colors.ON_INVERSE_SURFACE),
+            bgcolor=T.danger() if error else None,
+            behavior=ft.SnackBarBehavior.FLOATING,
+            shape=ft.RoundedRectangleBorder(radius=T.R_MD),
+            margin=ft.Margin(left=T.GAP_M, right=T.GAP_M,
+                             top=0, bottom=T.GAP_M),
             duration=4000,
         ))
     except Exception:
@@ -27,8 +40,9 @@ def confirm(page, title: str, msg: str, on_yes, yes_text="确定"):
 
     page.show_dialog(ft.AlertDialog(
         modal=True,
-        title=ft.Text(title),
-        content=ft.Text(msg),
+        shape=ft.RoundedRectangleBorder(radius=T.R_XL),
+        title=ft.Text(title, size=17, weight=ft.FontWeight.W_600),
+        content=ft.Text(msg, size=13),
         actions=[
             ft.TextButton("取消", on_click=_close),
             ft.FilledButton(yes_text, on_click=_yes),
@@ -38,84 +52,57 @@ def confirm(page, title: str, msg: str, on_yes, yes_text="确定"):
 
 
 def section(text: str) -> ft.Container:
-    """分组小标题：左侧主题色竖条 + 粗体（比纯文字更有层级感）。"""
-    return ft.Container(
-        ft.Row([
-            ft.Container(width=3, height=14, bgcolor=ft.Colors.PRIMARY,
-                         border_radius=2),
-            ft.Text(text, size=14, weight=ft.FontWeight.W_700),
-        ], spacing=6),
-        margin=ft.Margin(left=2, right=0, top=14, bottom=6),
-    )
+    """分组小标题（转发 theme：竖条 + 粗体，全站同一套间距）。"""
+    return T.section(text)
 
 
 def pill(text: str, color, *, opacity=0.14, size=10) -> ft.Container:
-    """状态徽章（统一圆角、透明底色、小字号）。"""
-    return ft.Container(
-        ft.Text(text, size=size, color=color),
-        bgcolor=ft.Colors.with_opacity(opacity, color),
-        border_radius=999,
-        padding=ft.Padding(left=8, right=8, top=2, bottom=2),
-    )
+    """状态徽章（转发 theme）。"""
+    return T.pill(text, color, size=size, opacity=opacity)
 
 
-def page_header(title: str, subtitle: str = "", trailing=None) -> ft.Row:
-    """统一页头：大标题 + 可选副标题 + 右侧动作区。"""
-    col = ft.Column(
-        [ft.Text(title, size=22, weight=ft.FontWeight.BOLD)] +
-        ([ft.Text(subtitle, size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
-         if subtitle else []),
-        spacing=2, expand=True)
-    return ft.Row([col] + ([trailing] if trailing else []))
+def page_header(title: str, subtitle: str = "", trailing=None) -> ft.Control:
+    """统一页头（转发 theme）：大标题 + 可选副标题 + 右侧动作区。"""
+    return T.page_head(title, subtitle, trailing)
 
 
 def menu_group(title: str, tiles: list) -> ft.Control:
-    """分组菜单卡：Card 内嵌入一列 ListTile（条目间细分隔线），比一长串
-    ListTile 平铺更清爽、可分组扫读。"""
+    """分组菜单卡：圆角卡片内嵌一列条目（条目间细分隔线）。
+
+    `title` 为空时不画分组标题行——否则卡片顶部会空出一段（旧实现留了这个
+    bug：`menu_group("", [...])` 渲染成一条空白）。
+    """
     rows = []
     for i, t in enumerate(tiles):
         rows.append(t)
         if i < len(tiles) - 1:
-            rows.append(ft.Divider(
-                height=1,
-                color=ft.Colors.with_opacity(0.07, ft.Colors.ON_SURFACE)))
-    return ft.Card(ft.Container(
-        ft.Column([
-            ft.Container(ft.Text(title, size=12, weight=ft.FontWeight.W_700,
-                                 color=ft.Colors.PRIMARY),
-                         padding=ft.Padding(left=14, right=14, top=10, bottom=0)),
-            *rows,
-        ], spacing=0),
-        padding=ft.Padding(left=0, right=0, top=0, bottom=6)))
+            rows.append(T.divider(top=0, bottom=0))
+    inner = []
+    if title:
+        inner.append(ft.Container(
+            ft.Text(title, size=12, weight=ft.FontWeight.W_700, color=T.brand()),
+            padding=ft.Padding(left=T.GAP_M, right=T.GAP_M,
+                               top=T.GAP_S + 2, bottom=T.GAP_XS)))
+    inner.extend(rows)
+    return T.card(ft.Column(inner, spacing=0), padding=0)
 
 
 def hint(text: str) -> ft.Container:
-    return ft.Container(
-        ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-        margin=ft.Margin(left=0, right=0, top=0, bottom=4),
-    )
+    return T.hint_text(text, size=12)
 
 
 def empty(text: str) -> ft.Container:
-    return ft.Container(
-        content=ft.Column([
-            ft.Icon(ft.Icons.AUTO_STORIES, size=42,
-                    color=ft.Colors.with_opacity(0.35, ft.Colors.ON_SURFACE)),
-            ft.Text(text, color=ft.Colors.ON_SURFACE_VARIANT, size=13,
-                    text_align=ft.TextAlign.CENTER),
-        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
-        alignment=ft.Alignment.CENTER,
-        padding=36,
-    )
+    return T.empty(text)
 
 
 def error_card(msg: str) -> ft.Container:
     return ft.Container(
-        ft.Text(msg, color=ft.Colors.RED_300, size=13),
-        bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.RED_700),
-        border_radius=8,
-        padding=10,
-        margin=ft.Margin(left=0, right=0, top=6, bottom=6),
+        ft.Text(msg, color=T.danger(), size=13),
+        bgcolor=T.soft(T.danger(), 0.10),
+        border=ft.Border.all(1, T.soft(T.danger(), 0.25)),
+        border_radius=T.R_MD,
+        padding=T.GAP_M,
+        margin=ft.Margin(left=0, right=0, top=T.GAP_XS, bottom=T.GAP_XS),
     )
 
 

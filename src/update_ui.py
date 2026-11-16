@@ -16,6 +16,7 @@ import time
 
 import flet as ft
 
+import theme as T
 from update import (
     NetworkError,
     NoReleaseError,
@@ -44,7 +45,7 @@ def update_card(page, session) -> ft.Control:
                         jnius_diag, platform_diag)
     code, name = get_local_version()
     android = is_android()
-    status = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+    status = ft.Text("", size=12, color=T.muted())
     ver_text = (f"{name}（build {code}）" if android
                 else "电脑预览（更新仅手机版可用）")
 
@@ -85,34 +86,43 @@ def update_card(page, session) -> ft.Control:
 
     rows = [
         ft.Row([
-            ft.Icon(ft.Icons.SYSTEM_UPDATE_ALT, color=ft.Colors.PRIMARY, size=22),
+            ft.Container(ft.Icon(ft.Icons.SYSTEM_UPDATE_ALT, color=T.brand(),
+                                 size=19),
+                         width=34, height=34, border_radius=T.R_MD,
+                         bgcolor=T.soft(T.brand(), 0.10),
+                         alignment=ft.Alignment.CENTER),
             ft.Column([
                 ft.Text("检查更新", size=15, weight=ft.FontWeight.W_600),
-                ft.Text(f"当前版本 {ver_text}", size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Text(f"当前版本 {ver_text}", size=11, color=T.muted()),
             ], spacing=2, expand=True),
-            ft.FilledTonalButton("检查", on_click=_check),
-        ]),
+            T.tonal("检查", on_click=_check),
+        ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER),
     ]
     diag = jnius_diag() if android else ""
     if diag:
         # pyjnius 桥接异常时显示一行可复制的诊断（老板截图即可定位真因，
         # 2026-11-16 平板真机 pyjnius 整链失败就是靠这个抓回来的）
         rows.append(ft.Text(f"桥接诊断：{diag}（不影响下面的浏览器安装）",
-                            size=11, color=ft.Colors.ON_SURFACE_VARIANT,
-                            selectable=True))
+                            size=10, color=T.muted(), selectable=True))
     elif not android:
-        # 非安卓也把判定依据摊开：真机若被误判成「电脑预览」，截图即可定位，
-        # 不用再猜「为什么我是平板却显示电脑」（2026-11-16 第二轮）
-        rows.append(ft.Text(f"平台判定：{platform_diag()}", size=11,
-                            color=ft.Colors.ON_SURFACE_VARIANT, selectable=True))
+        # 排障信息只在「疑似被误判」时才摊开：真机被认成电脑预览时，
+        # platform_diag 里会出现 android / /data/ 这类痕迹，截图即可定位，
+        # 不用再猜「为什么我是平板却显示电脑」。正常电脑预览下不再展示
+        # 「platform=win32 TMPDIR= 标记=」这种纯调试串（用户看不懂，白占版面）。
+        d = platform_diag()
+        suspicious = ("android" in str(d).lower()) or ("/data/" in str(d))
+        if suspicious:
+            rows.append(ft.Text(f"平台判定：{d}", size=10, color=T.warn(),
+                                selectable=True))
+        # 正常电脑预览下不再补一行说明：卡片副标题已经写了「更新仅手机版可用」，
+        # 再加一句同样意思的灰字只是重复占版面。
     if android:
         rows.append(ft.TextButton(
             content=ft.Text("直接下载最新安装包（平板浏览器打开，不用电脑）",
                             size=11),
             on_click=_open_latest))
     rows.append(status)
-    return ft.Card(ft.Container(ft.Column(rows, spacing=6), padding=12))
+    return T.card(ft.Column(rows, spacing=T.GAP_S))
 
 
 # ---------- 启动静默检查 ----------

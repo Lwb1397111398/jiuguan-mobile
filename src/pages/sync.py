@@ -10,6 +10,7 @@
 """
 import flet as ft
 
+import theme as T
 from widgets import hint, toast, confirm
 from bridge import run_bg
 
@@ -272,16 +273,24 @@ class SyncPage:
     # ---------------- 构建 ----------------
 
     def _head(self) -> ft.Control:
-        return ft.Row([
-            ft.IconButton(ft.Icons.ARROW_BACK,
-                          on_click=lambda e: (self.on_back() if self.on_back else None)),
-            ft.Text("云同步", size=20, weight=ft.FontWeight.BOLD, expand=True),
-        ])
+        return T.back_head(
+            "云同步", lambda: (self.on_back() if self.on_back else None))
 
-    def _tf(self, key, label, value, **kw) -> ft.TextField:
-        tf = ft.TextField(label=label, value=str(value or ""), dense=True, **kw)
+    def _tf(self, key, label, value, **kw) -> ft.Control:
+        """带标签的输入框，返回「标签 + 框 + 说明」整块（控件引用存进 self._f）。
+
+        标签不用 TextField 的 floating label：压在描边上糊成一团，而且本页
+        字段密（8 个连着排），浮标签会让每格看着比实际更高更乱。
+        """
+        pwd = kw.pop("password", False)
+        reveal = kw.pop("can_reveal_password", False)
+        helper = kw.pop("helper", "")
+        tf = T.field("", str(value or ""), **kw)
+        if pwd:
+            tf.password = True
+            tf.can_reveal_password = reveal or pwd
         self._f[key] = tf
-        return tf
+        return T.field_group(tf, label, helper)
 
     def _status_card(self) -> ft.Control:
         sc = self._sc()
@@ -298,18 +307,23 @@ class SyncPage:
             ("云端占用", (state.get("usage") or {}).get("human") or "未统计"),
         ]
         rows = [ft.Row([
-            ft.Text(k, size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=72),
+            ft.Text(k, size=11, color=T.muted(), width=72),
             ft.Text(v, size=12, expand=True),
-        ], spacing=6) for k, v in lines]
+        ], spacing=T.GAP_S) for k, v in lines]
         if state.get("last_error"):
-            rows.append(ft.Text("上次错误：" + str(state["last_error"])[:160], size=11,
-                                color=ft.Colors.RED_300))
-        return ft.Card(ft.Container(ft.Column([
-            ft.Row([ft.Icon(ft.Icons.CLOUD_SYNC, color=ft.Colors.PRIMARY),
+            rows.append(ft.Text("上次错误：" + str(state["last_error"])[:160],
+                                size=11, color=T.danger()))
+        return T.card(ft.Column([
+            ft.Row([ft.Container(
+                        ft.Icon(ft.Icons.CLOUD_SYNC_OUTLINED, color=T.brand(),
+                                size=19),
+                        width=34, height=34, border_radius=T.R_MD,
+                        bgcolor=T.soft(T.brand(), 0.10),
+                        alignment=ft.Alignment.CENTER),
                     ft.Text("同步状态", size=14, weight=ft.FontWeight.W_600,
                             expand=True)]),
             *rows,
-        ], spacing=5), padding=12))
+        ], spacing=T.GAP_S - 2))
 
     def build(self) -> ft.Control:
         self._f = {}
@@ -322,7 +336,7 @@ class SyncPage:
         g = self._g
 
         # ---- 连接 ----
-        conn = ft.Card(ft.Container(ft.Column([
+        conn = T.card(ft.Column([
             ft.Text("连接（数据胶囊 · S3）", size=14, weight=ft.FontWeight.W_600),
             self._tf("endpoint", "接入点", cfg.get("endpoint")
                      or "https://s3.cstcloud.cn"),
@@ -332,33 +346,35 @@ class SyncPage:
             self._tf("ua", "User-Agent", cfg.get("user_agent") or "S3Drive/1.0.0"),
             self._tf("ak", "AccessKey ID", cfg.get("access_key")),
             self._tf("sk", "AccessKey Secret", "",
-                     password=True, can_reveal_password=True,
+                     password=True,
                      helper="已保存（留空表示不修改）" if secret_saved
                      else "粘贴 Secret Access Key"),
             self._tf("device", "本机名称（云端显示）", cfg.get("device_name")),
             hint("User-Agent 必须与 AccessKey 绑定的「应用」一致：胶囊按应用类型校验 UA，"
                  "不匹配一律返回 401 空响应（看着像网关故障）。胶囊后台「客户端访问」里"
                  "能看到该 AK 的应用名：建在 S3Drive 下就填 S3Drive/1.0.0。"),
-        ], spacing=8), padding=12))
+        ], spacing=T.GAP_S,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
         # ---- 同步密码 ----
-        pw = ft.Card(ft.Container(ft.Column([
+        pw = T.card(ft.Column([
             ft.Text("同步密码", size=14, weight=ft.FontWeight.W_600),
             hint("云端数据（含模型 API Key）都用它加密。第一台设备设置密码；"
                  "第二台设备输入同一个密码即完成绑定。密码不上传，"
                  "丢了云端数据和历史版本都解不开，只能重置后整体重传。"),
-            self._tf("pw", "同步密码", "", password=True, can_reveal_password=True),
-            ft.Row([ft.FilledButton("设置 / 校验", icon=ft.Icons.KEY,
-                                    on_click=self._apply_password)], wrap=True),
-        ], spacing=8), padding=12))
+            self._tf("pw", "同步密码", "", password=True),
+            T.tonal("设置 / 校验", icon=ft.Icons.KEY,
+                    on_click=self._apply_password, expand=True),
+        ], spacing=T.GAP_S,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
         # ---- 行为 ----
         def _sw(key, label, on, desc=""):
-            c = ft.Switch(label=label, value=bool(on))
-            self._f[key] = c
-            return ft.Column([c, hint(desc)], spacing=0) if desc else c
+            widget, sw = T.switch_row(label, bool(on), desc=desc)
+            self._f[key] = sw
+            return widget
 
-        beh = ft.Card(ft.Container(ft.Column([
+        beh = T.card(ft.Column([
             ft.Text("同步行为", size=14, weight=ft.FontWeight.W_600),
             _sw("ck_enabled", "启用云同步（关掉完全不联网）",
                 g("sync_enabled", "0") == "1"),
@@ -377,18 +393,22 @@ class SyncPage:
                      helper="0 = 不留，误覆盖就找不回来了"),
             hint("冲突规则：谁最后改动谁覆盖（LWW）。覆盖前一定先存快照——"
                  "本机旧版进项目 backups/sync_overwrite_*.db，云端旧版进 history。"),
-        ], spacing=8), padding=12))
+        ], spacing=T.GAP_S,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
         # ---- 动作 ----
         acts = ft.Row([
-            ft.FilledButton("立即同步", icon=ft.Icons.SYNC, on_click=self._sync_now),
-            ft.OutlinedButton("测试连接", icon=ft.Icons.WIFI_TETHERING,
-                              on_click=self._test),
-            ft.OutlinedButton("刷新用量", icon=ft.Icons.DATA_USAGE,
-                              on_click=self._refresh_usage),
-            ft.OutlinedButton("从云端恢复全部项目", icon=ft.Icons.CLOUD_DOWNLOAD,
-                              on_click=self._restore),
-        ], spacing=8, wrap=True)
+            T.primary("立即同步", icon=ft.Icons.SYNC, on_click=self._sync_now,
+                      expand=True),
+        ], spacing=T.GAP_S)
+        acts2 = ft.Row([
+            T.tonal("测试连接", icon=ft.Icons.WIFI_TETHERING,
+                    on_click=self._test, expand=True),
+            T.tonal("刷新用量", icon=ft.Icons.DATA_USAGE,
+                    on_click=self._refresh_usage, expand=True),
+        ], spacing=T.GAP_S)
+        acts3 = T.ghost("从云端恢复全部项目", icon=ft.Icons.CLOUD_DOWNLOAD,
+                        on_click=self._restore)
 
         # ---- 日志 ----
         tail = ""
@@ -396,26 +416,21 @@ class SyncPage:
             tail = sc.SyncLog().tail(30)
         except Exception:
             pass
-        log_card = ft.Card(ft.Container(ft.Column([
+        log_card = T.card(ft.Column([
             ft.Row([
                 ft.Text("同步日志（最近 30 行）", size=13,
                         weight=ft.FontWeight.W_600, expand=True),
-                ft.TextButton("隐藏" if self._show_log else "展开",
-                              on_click=self._toggle_log),
+                T.ghost("隐藏" if self._show_log else "展开",
+                        on_click=self._toggle_log),
             ]),
-            *([ft.Container(
-                ft.Text(tail or "（还没有日志）", size=10, selectable=True,
-                        font_family="monospace"),
-                bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.ON_SURFACE),
-                border_radius=6, padding=8)] if self._show_log else []),
-        ], spacing=6), padding=12))
+            *([T.inset(ft.Text(tail or "（还没有日志）", size=10, selectable=True,
+                               font_family="monospace"))] if self._show_log else []),
+        ], spacing=T.GAP_S))
 
         body = [
             self._head(),
             self._status_card(),
-            acts,
-            ft.Row([ft.FilledButton("保存设置", icon=ft.Icons.SAVE,
-                                    on_click=self._save)], wrap=True),
+            acts, acts2, acts3,
             conn,
             pw,
             beh,
@@ -423,7 +438,27 @@ class SyncPage:
             hint("同步范围：所有项目的 project.db（大纲/正文/记忆/设定）+ 全局配置"
                  "（模型与 API Key、偏好卡、预设、任务模板、破甲库）。"
                  "连接凭据只留在本机，每台设备各配一次。"),
+            # 尾部留白：不留的话滚到底时最后一段紧贴固定保存栏，像被裁掉了。
+            ft.Container(height=T.GAP_L),
         ]
-        return ft.Container(ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True,
-                                      spacing=8),
-                            padding=12, expand=True)
+        save_bar = ft.Container(
+            T.primary("保存设置", icon=ft.Icons.SAVE, on_click=self._save,
+                      expand=True),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L,
+                               top=T.GAP_S, bottom=T.GAP_S),
+            bgcolor=T.bg(),
+            border=ft.Border.only(top=ft.BorderSide(1, T.line())),
+        )
+        # ⚠ 左右内边距不能写在 Column 上：Flet 0.86 的 Column 没有 padding 参数
+        # （会直接抛 TypeError，整页白屏只剩 Error running app）。
+        scroll = ft.Container(
+            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True,
+                      spacing=T.GAP_S,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L, top=0, bottom=0),
+            expand=True)
+        return ft.Container(
+            ft.Column([scroll, save_bar], expand=True, spacing=0,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=ft.Padding(left=0, right=0, top=T.GAP_S + 2, bottom=0),
+            expand=True)

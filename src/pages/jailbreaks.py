@@ -10,6 +10,7 @@
 """
 import flet as ft
 
+import theme as T
 from widgets import section, hint, empty, toast, confirm
 
 
@@ -83,8 +84,8 @@ class JailbreakLibrary:
             return ft.Container(
                 ft.Column([self._head(),
                            ft.Text(f"读取破甲库失败：{e}", size=13,
-                                   color=ft.Colors.RED_300)]),
-                padding=12, expand=True)
+                                   color=T.danger())]),
+                padding=T.GAP_L, expand=True)
 
         rows = []
         for p in profiles:
@@ -93,12 +94,14 @@ class JailbreakLibrary:
         body = [
             self._head(),
             self._status_card(enabled, strength, active, len(profiles)),
-            ft.Row([
-                ft.FilledButton("＋ 新建破甲", icon=ft.Icons.ADD,
-                                on_click=lambda e: self._edit_new()),
-                ft.OutlinedButton("恢复内置破限", icon=ft.Icons.RESTORE,
-                                  on_click=self._restore_builtin),
-            ], spacing=8, wrap=True),
+            # 两个按钮平分整行（原来各按字宽排、右边空掉三分之一）。
+            ft.Container(
+                T.button_row(
+                    T.primary("新建破甲", icon=ft.Icons.ADD,
+                              on_click=lambda e: self._edit_new()),
+                    T.tonal("恢复内置破限", icon=ft.Icons.RESTORE,
+                            on_click=self._restore_builtin)),
+                margin=ft.Margin(left=0, right=0, top=T.GAP_M, bottom=T.GAP_XS)),
             section(f"破甲库（{len(profiles)}）"),
             hint("破甲按五段注入：锚定（system 末）＋预确认（伪造对话对）＋推杆（任务末）"
                  "＋条款（任务后正向条款）＋预填充（最后一条 assistant，可选）。"
@@ -107,58 +110,60 @@ class JailbreakLibrary:
                                        "或从酒馆预设导入（电脑版），或恢复内置破限")]),
         ]
         return ft.Container(
-            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True, spacing=6),
-            padding=14, expand=True)
+            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=T.GAP_L, expand=True)
 
     def _head(self) -> ft.Control:
-        return ft.Row([
-            ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: (
-                self.on_back() if self.on_back else None)),
-            ft.Text("破甲库", size=20, weight=ft.FontWeight.BOLD, expand=True),
-        ])
+        return T.back_head(
+            "破甲库", lambda: (self.on_back() if self.on_back else None))
 
     def _status_card(self, enabled: bool, strength: str, active: str,
                      count: int) -> ft.Control:
-        strength_dd = ft.Dropdown(
-            label="强度档位",
-            value=strength,
-            dense=True,
-            options=[
-                ft.dropdown.Option(key="standard",
-                                   text="标准（锚定＋推杆全套）"),
-                ft.dropdown.Option(key="light",
-                                   text="轻量（只保留推杆发令枪）"),
-            ],
-            on_select=self._on_strength,
-        )
+        strength_dd = T.select("强度档位", strength,
+                               [("standard", "标准（锚定＋推杆全套）"),
+                                ("light", "轻量（只保留推杆发令枪）")],
+                               on_select=self._on_strength)
         try:
             guard = self.gstore.get_jailbreak_completion_guard()
         except Exception:
             guard = True
-        return ft.Card(ft.Container(ft.Column([
+        return T.card(ft.Column([
             ft.Row([
-                ft.Icon(ft.Icons.SHIELD, color=ft.Colors.PRIMARY, size=20),
+                ft.Container(ft.Icon(ft.Icons.SHIELD_OUTLINED, size=19,
+                                     color=T.brand()),
+                             width=34, height=34, border_radius=T.R_MD,
+                             bgcolor=T.soft(T.brand(), 0.10),
+                             alignment=ft.Alignment.CENTER),
                 ft.Text("启用破甲注入", size=14, weight=ft.FontWeight.W_600,
                         expand=True),
-                ft.Switch(value=bool(enabled), on_change=self._on_enabled),
-            ]),
-            ft.Text(f"当前生效：{active or '（无）'}",
-                    size=13, weight=ft.FontWeight.W_600,
-                    color=ft.Colors.PRIMARY if active else ft.Colors.ON_SURFACE_VARIANT),
+                ft.Switch(value=bool(enabled), active_color=T.brand(),
+                          on_change=self._on_enabled),
+            ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Text("当前生效", size=11, color=T.muted()),
+                ft.Text(active or "（无）", size=13,
+                        weight=ft.FontWeight.W_600,
+                        color=T.brand() if active else T.muted(),
+                        expand=True),
+            ], spacing=T.GAP_XS + 2),
             ft.Text("创作系任务注入全套；检查/文风审校只注入「引用许可」；"
                     "记忆提取不注入（纯机械 JSON，避免干扰纪律）。",
-                    size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                    size=11, color=T.muted()),
+            ft.Divider(height=1, color=T.line()),
             strength_dd,
             ft.Row([
                 ft.Text("收尾护栏", size=13, expand=True),
-                ft.Switch(value=bool(guard), on_change=self._on_guard),
+                ft.Switch(value=bool(guard), active_color=T.brand(),
+                          on_change=self._on_guard),
             ]),
             ft.Text("Gemini 系报文末尾自动补「assistant 起手＋user 收尾」"
                     "（与酒馆成功报文同形态）。拒收 assistant 结尾的渠道可关。",
-                    size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                    size=11, color=T.muted()),
             hint(f"破甲库存放于应用数据目录 jailbreaks/，随全量备份与电脑版互通。"
                  f"共 {count} 套。"),
-        ], spacing=8), padding=14))
+        ], spacing=T.GAP_S,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
     def _row(self, prof: dict, active_name: str) -> ft.Control:
         name = prof.get("name") or ""
@@ -167,20 +172,15 @@ class JailbreakLibrary:
         title_row = [ft.Text(name, size=14, weight=ft.FontWeight.W_600,
                              expand=True)]
         if is_active:
-            title_row.append(ft.Container(
-                ft.Text("当前生效", size=10, color=ft.Colors.WHITE),
-                bgcolor=ft.Colors.PRIMARY, border_radius=6,
-                padding=ft.Padding(left=6, right=6, top=2, bottom=2)))
-        return ft.Card(ft.Container(
-            ft.Column([
-                ft.Row(title_row, spacing=6),
-                ft.Text(self._summary(content), size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
-            ], spacing=3),
-            padding=12,
-            on_click=lambda e, p=prof: self._actions(p),
-            ink=True,
-        ), margin=ft.Margin(left=0, right=0, top=0, bottom=6))
+            title_row.append(T.pill("当前生效"))
+        # 右箭头：整行可点会打开操作弹层，不给箭头就没有可点的暗示。
+        title_row.append(ft.Icon(ft.Icons.CHEVRON_RIGHT, size=16,
+                                 color=T.muted()))
+        return T.card(ft.Column([
+            ft.Row(title_row, spacing=T.GAP_XS + 2),
+            ft.Text(self._summary(content), size=11, color=T.muted()),
+        ], spacing=T.GAP_XS - 1),
+            on_click=lambda e, p=prof: self._actions(p))
 
     # =====================================================
     # 开关 / 档位 / 切换
@@ -239,50 +239,36 @@ class JailbreakLibrary:
     def _actions(self, prof: dict):
         name = prof.get("name") or ""
         content = prof.get("content") or ""
-        open_cfg = (self.gstore.get_jailbreak_prompt() or "").strip()
         rows = [
-            ft.ListTile(leading=ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE),
-                        title=ft.Text("设为当前生效"),
-                        subtitle=ft.Text("对「跟随全局」的模型档案立即生效", size=11),
-                        on_click=lambda e: (self.page.pop_dialog(),
-                                            self._set_active(name))),
-            ft.ListTile(leading=ft.Icon(ft.Icons.EDIT),
-                        title=ft.Text("编辑（名称 / 投放模式 / 四段内容）"),
-                        on_click=lambda e: (self.page.pop_dialog(),
-                                            self._edit_existing(name, content))),
-            ft.ListTile(leading=ft.Icon(ft.Icons.VISIBILITY),
-                        title=ft.Text("查看组装后的破甲全文"),
-                        on_click=lambda e: (self.page.pop_dialog(),
-                                            self._view(name, content))),
-            ft.ListTile(
-                leading=ft.Icon(ft.Icons.DELETE_OUTLINE, color=ft.Colors.RED_400),
-                title=ft.Text("删除这套破甲", color=ft.Colors.RED_400),
-                on_click=lambda e: (self.page.pop_dialog(),
-                                    self._delete(name))),
+            T.menu_row(ft.Icons.CHECK_CIRCLE_OUTLINE, "设为当前生效",
+                       "对「跟随全局」的模型档案立即生效",
+                       on_click=lambda e: (self.page.pop_dialog(),
+                                           self._set_active(name))),
+            T.menu_row(ft.Icons.EDIT_OUTLINED, "编辑",
+                       "名称 / 投放模式 / 四段内容",
+                       on_click=lambda e: (self.page.pop_dialog(),
+                                           self._edit_existing(name, content))),
+            T.menu_row(ft.Icons.VISIBILITY_OUTLINED, "查看组装后的破甲全文",
+                       on_click=lambda e: (self.page.pop_dialog(),
+                                           self._view(name, content))),
+            T.menu_row(ft.Icons.DELETE_OUTLINE, "删除这套破甲", "",
+                       color=T.danger(),
+                       on_click=lambda e: (self.page.pop_dialog(),
+                                           self._delete(name))),
         ]
-        self.page.show_dialog(ft.BottomSheet(
-            content=ft.Container(ft.Column(
-                [ft.Text(f"破甲：{name}", size=15, weight=ft.FontWeight.BOLD),
-                 ft.Text(self._summary(content), size=11,
-                         color=ft.Colors.ON_SURFACE_VARIANT),
-                 *rows], scroll=ft.ScrollMode.AUTO, spacing=0),
-                padding=16, height=min(460, self._height(0.72))),
-            show_drag_handle=True))
+        T.sheet(self.page, f"破甲：{name}", rows,
+                subtitle_text=self._summary(content),
+                height=min(460, self._height(0.72)))
 
     def _view(self, name: str, content: str):
-        self.page.show_dialog(ft.BottomSheet(
-            content=ft.Container(ft.Column([
-                ft.Text(f"破甲全文：{name}", size=15, weight=ft.FontWeight.BOLD),
-                hint("含 ---PRELUDE--- / ---TAIL--- / ---PREFILL--- 分段标记与模式声明行。"),
-                ft.Container(ft.TextField(
-                    value=content, multiline=True, read_only=True,
-                    border_color=ft.Colors.TRANSPARENT, text_size=11),
-                    height=self._height(0.66)),
-                ft.Row([ft.TextButton("关闭",
-                                      on_click=lambda e: self.page.pop_dialog())],
-                       alignment=ft.MainAxisAlignment.END),
-            ], spacing=6), padding=16, height=self._height(0.88)),
-            show_drag_handle=True))
+        field = T.editor(content, hint="（空）")
+        field.text_size = 11
+        field.read_only = True
+        T.sheet(self.page, f"破甲全文：{name}", [
+            hint("含 ---PRELUDE--- / ---TAIL--- / ---PREFILL--- 分段标记与模式声明行。"),
+            ft.Container(field, height=self._height(0.62)),
+        ], height=self._height(0.86),
+            actions=T.action_row(self.page, cancel_text="关闭"))
 
     def _delete(self, name: str):
         def _yes():
@@ -341,25 +327,19 @@ class JailbreakLibrary:
         mode, head, prelude, tail, prefill, order = jb.parse_jailbreak_full(text or "")
         head_ex, prelude_ex, order_ex, tail_ex, prefill_ex = self._examples()
 
-        name_f = ft.TextField(label="破甲名称", value=name, dense=True)
-        mode_dd = ft.Dropdown(
-            label="投放模式", value=mode, dense=True,
-            options=[
-                ft.dropdown.Option(key=jb.JB_MODE_LAYERED,
-                                   text=jb.JB_MODE_LABELS[jb.JB_MODE_LAYERED]),
-                ft.dropdown.Option(key=jb.JB_MODE_RUNTIME,
-                                   text=jb.JB_MODE_LABELS[jb.JB_MODE_RUNTIME]),
-            ])
-        head_f = ft.TextField(label="锚定层 / 运行时协议层（可留空）",
-                              value=head, multiline=True, min_lines=3, max_lines=7)
-        prelude_f = ft.TextField(label="预确认层（user: / assistant: 对话对，可留空）",
-                                 value=prelude, multiline=True, min_lines=3, max_lines=7)
-        tail_f = ft.TextField(label="推杆层（发令枪，可留空）",
-                              value=tail, multiline=True, min_lines=2, max_lines=5)
-        order_f = ft.TextField(label="条款层（创作执行条款，可留空）",
-                               value=order, multiline=True, min_lines=2, max_lines=7)
-        prefill_f = ft.TextField(label="预填充层（最后一条 assistant，可留空）",
-                                 value=prefill, multiline=True, min_lines=2, max_lines=5)
+        name_f = T.field("", name, dense=True)
+        # 裸下拉（后面要读 mode_dd.value 交给 build_jailbreak_text）
+        mode_dd = T.select("", mode, [
+            (jb.JB_MODE_LAYERED, jb.JB_MODE_LABELS[jb.JB_MODE_LAYERED]),
+            (jb.JB_MODE_RUNTIME, jb.JB_MODE_LABELS[jb.JB_MODE_RUNTIME]),
+        ])
+        # 五段文本框不再带 label：_seg() 已经在框上方排了「① 锚定层」标题 + 说明，
+        # 再叠一个浮标签等于同一句话写两遍。
+        head_f = T.field("", head, multiline=True, min_lines=3, max_lines=7)
+        prelude_f = T.field("", prelude, multiline=True, min_lines=3, max_lines=7)
+        tail_f = T.field("", tail, multiline=True, min_lines=2, max_lines=5)
+        order_f = T.field("", order, multiline=True, min_lines=2, max_lines=7)
+        prefill_f = T.field("", prefill, multiline=True, min_lines=2, max_lines=5)
 
         def _seg(title: str, tip: str, field: ft.TextField, example: str,
                  warning: str = "") -> ft.Control:
@@ -370,19 +350,21 @@ class JailbreakLibrary:
             return ft.Container(ft.Column([
                 ft.Row([
                     ft.Text(title, size=13, weight=ft.FontWeight.W_600, expand=True),
-                    ft.TextButton("填示例", icon=ft.Icons.AUTO_FIX_HIGH,
-                                  on_click=_fill),
-                ], spacing=4),
-                ft.Text(tip, size=11, color=ft.Colors.ON_SURFACE_VARIANT),
-                *( [ft.Text(warning, size=11, color=ft.Colors.ORANGE_700)] if warning else [] ),
+                    T.ghost("填示例", icon=ft.Icons.AUTO_FIX_HIGH,
+                            on_click=_fill),
+                ], spacing=T.GAP_XS),
+                ft.Text(tip, size=11, color=T.muted()),
+                *([ft.Text(warning, size=11, color=T.warn())] if warning else []),
                 field,
-            ], spacing=4), margin=ft.Margin(left=0, right=0, top=4, bottom=8))
+            ], spacing=T.GAP_XS,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                margin=ft.Margin(left=0, right=0, top=T.GAP_XS, bottom=T.GAP_S))
 
         form = ft.Column([
-            name_f,
-            mode_dd,
+            T.field_group(name_f, "破甲名称"),
+            T.field_group(mode_dd, "投放模式"),
             ft.Text("破甲分五段注入，每段都可留空（全空 = 不注入）。点「填示例」填入内置参考写法。",
-                    size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                    size=11, color=T.muted()),
             _seg("① 锚定层", "注入最后一条 system 消息，负责身份定性（建议三五行）",
                  head_f, head_ex),
             _seg("② 预确认层", "user:/assistant: 一行一个对话对，让模型先「亲口确认」接受任务",
@@ -460,14 +442,16 @@ class JailbreakLibrary:
 
         self.page.show_dialog(ft.AlertDialog(
             modal=True,
-            title=ft.Text("编辑破甲" if old_name else "新建破甲"),
+            shape=ft.RoundedRectangleBorder(radius=T.R_XL),
+            title=ft.Text("编辑破甲" if old_name else "新建破甲", size=17,
+                          weight=ft.FontWeight.W_600),
             content=ft.Container(ft.Column([
                 form,
                 ft.Row([
-                    ft.TextButton("取消", on_click=_cancel),
-                    ft.FilledButton("保存", on_click=lambda e: _do_save()),
-                ], alignment=ft.MainAxisAlignment.END, spacing=8),
-            ], spacing=6, scroll=ft.ScrollMode.AUTO),
+                    T.ghost("取消", on_click=_cancel),
+                    T.primary("保存", on_click=lambda e: _do_save()),
+                ], alignment=ft.MainAxisAlignment.END, spacing=T.GAP_S),
+            ], spacing=T.GAP_S, scroll=ft.ScrollMode.AUTO),
                 width=min(560, int(getattr(self.page, "width", 560) or 560)),
                 height=self._height(0.82)),
             actions=[],

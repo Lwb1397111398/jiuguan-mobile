@@ -17,6 +17,7 @@ import os
 
 import flet as ft
 
+import theme as T
 from widgets import (section, hint, empty, toast, confirm, error_card)
 
 # 判破限类的最低分（与 app/core/presets.py 的 JB_SCORE_THRESHOLD 一致）
@@ -121,8 +122,9 @@ class PresetLibrary:
                 ft.Column([
                     self._head(),
                     empty("预设存在项目库中\n请先到「项目」页打开一个项目"),
-                ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=6),
-                padding=14, expand=True)
+                ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                padding=T.GAP_L, expand=True)
         try:
             presets = self.store.list_presets() or []
             bound = self.store.get_setting("bound_preset_id", "") or ""
@@ -130,44 +132,50 @@ class PresetLibrary:
             return ft.Container(
                 ft.Column([self._head(),
                            ft.Text(f"读取预设失败：{e}", size=13,
-                                   color=ft.Colors.RED_300)]),
-                padding=12, expand=True)
+                                   color=T.danger())]),
+                padding=T.GAP_L, expand=True)
 
         bodies = []
         if bound:
-            bodies.append(hint(f"当前绑定：{self._preset_name(presets, bound)}"
-                               f"（生成时按其参数与条目注入）"))
+            bodies.append(T.card(ft.Row([
+                ft.Icon(ft.Icons.CHECK_CIRCLE, size=18, color=T.success()),
+                ft.Text(f"当前绑定：{self._preset_name(presets, bound)}"
+                        f"（生成时按其参数与条目注入）", size=12, expand=True),
+            ], spacing=T.GAP_S), tone="brand"))
         rows = [self._row(p, str(bound)) for p in presets]
 
         body = [
             self._head(),
-            ft.Row([
-                ft.FilledButton("＋ 导入酒馆预设", icon=ft.Icons.DOWNLOAD,
-                                on_click=lambda e: self._import_tavern()),
-                ft.OutlinedButton("新建空白", icon=ft.Icons.ADD,
-                                  on_click=self._new),
-            ], spacing=8, wrap=True),
-            ft.Row([
-                ft.OutlinedButton("从偏好卡片构建", icon=ft.Icons.DASHBOARD_CUSTOMIZE,
-                                  on_click=self._build_from_cards),
-                ft.OutlinedButton("粘贴分享 JSON", icon=ft.Icons.CONTENT_PASTE,
-                                  on_click=self._import_share),
-            ], spacing=8, wrap=True),
+            # 两行都平分宽度：原来各按字宽排，右边各空一截，四个按钮右边缘参差。
+            ft.Container(
+                T.button_row(
+                    T.primary("导入酒馆预设", icon=ft.Icons.DOWNLOAD,
+                              on_click=lambda e: self._import_tavern()),
+                    T.tonal("新建空白", icon=ft.Icons.ADD, on_click=self._new)),
+                margin=ft.Margin(left=0, right=0, top=T.GAP_L, bottom=T.GAP_XS)),
+            # 次行两个是「链接式」次级操作：按内容宽左对齐即可，
+            # 平分反而让文字在各自一半里居中、和上一行左边缘错开。
+            ft.Container(
+                T.button_row(
+                    T.ghost("从偏好卡片构建", icon=ft.Icons.DASHBOARD_CUSTOMIZE,
+                            on_click=self._build_from_cards),
+                    T.ghost("粘贴分享 JSON", icon=ft.Icons.CONTENT_PASTE,
+                            on_click=self._import_share),
+                    fill=False),
+                margin=ft.Margin(left=0, right=0, top=0, bottom=T.GAP_S)),
             *bodies,
             hint("预设 = 一组提示词条目 + 采样参数。导入酒馆预设后可用 AI 识别破限并提取破甲。"),
             section(f"预设（{len(presets)}）"),
             *(rows if rows else [empty("还没有预设\n点「＋ 导入酒馆预设」或「新建空白」")]),
         ]
         return ft.Container(
-            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True, spacing=6),
-            padding=14, expand=True)
+            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=T.GAP_L, expand=True)
 
     def _head(self) -> ft.Control:
-        return ft.Row([
-            ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: (
-                self.on_back() if self.on_back else None)),
-            ft.Text("预设管理", size=20, weight=ft.FontWeight.BOLD, expand=True),
-        ])
+        return T.back_head(
+            "预设管理", lambda: (self.on_back() if self.on_back else None))
 
     @staticmethod
     def _preset_name(presets: list[dict], pid) -> str:
@@ -181,34 +189,26 @@ class PresetLibrary:
         data = self._data(p)
         n = len(data.get("entries") or [])
         is_bound = (str(pid) == str(bound))
-        tags = [ft.Container(ft.Text(f"{n} 条", size=10),
-                             bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.BLUE),
-                             border_radius=6,
-                             padding=ft.Padding(left=6, right=6, top=2, bottom=2))]
+        tags = [T.pill(f"{n} 条")]
         if is_bound:
-            tags.append(ft.Container(ft.Text("已绑定", size=10),
-                                     bgcolor=ft.Colors.with_opacity(0.16, ft.Colors.GREEN),
-                                     border_radius=6,
-                                     padding=ft.Padding(left=6, right=6, top=2, bottom=2)))
-        return ft.Card(
-            ft.Container(ft.Column([
-                ft.Row([
-                    ft.Text(p.get("name") or "（未命名）", size=14,
-                            weight=ft.FontWeight.W_600, expand=True),
-                ]),
-                ft.Row(tags, spacing=6, wrap=True),
-                ft.Row([
-                    ft.TextButton("查看", icon=ft.Icons.VISIBILITY,
-                                  on_click=lambda e, pp=p: self._detail(pp)),
-                    ft.TextButton("应用", icon=ft.Icons.CHECK_CIRCLE,
-                                  on_click=lambda e, pp=p: self._apply(pp)),
-                    ft.TextButton("导出", icon=ft.Icons.SAVE_ALT,
-                                  on_click=lambda e, pp=p: self._export(pp)),
-                    ft.TextButton("删除", icon=ft.Icons.DELETE_OUTLINE,
-                                  on_click=lambda e, pp=p: self._delete(pp)),
-                ], spacing=0, wrap=True, alignment=ft.MainAxisAlignment.END),
-            ], spacing=4), padding=10),
-            elevation=1)
+            tags.append(T.pill("已绑定", T.success(), opacity=0.16))
+        return T.card(ft.Column([
+            ft.Row([
+                ft.Text(p.get("name") or "（未命名）", size=14,
+                        weight=ft.FontWeight.W_600, expand=True),
+            ], spacing=T.GAP_XS, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row(tags, spacing=T.GAP_XS + 2, wrap=True),
+            # 四个等权按钮平铺时手机上一行放不下（带图标更放不下）→
+            # 「应用」升为主操作，其余降成纯文字小按钮。
+            ft.Row([
+                T.ghost("查看", on_click=lambda e, pp=p: self._detail(pp)),
+                T.ghost("导出", on_click=lambda e, pp=p: self._export(pp)),
+                T.ghost("删除", on_click=lambda e, pp=p: self._delete(pp)),
+                ft.Container(expand=True),
+                T.tonal("应用", icon=ft.Icons.CHECK,
+                        on_click=lambda e, pp=p: self._apply(pp)),
+            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ], spacing=T.GAP_XS + 2))
 
     @staticmethod
     def _data(p: dict) -> dict:

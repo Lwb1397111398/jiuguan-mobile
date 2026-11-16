@@ -7,3 +7,12 @@ build_log.txt
 hs_err_pid*.log
 *.log
 src/_version.py
+
+# 本机 UI 验收用（真界面截图脚本 + 隔离的预览数据，不入库）
+.preview_data/
+.preview_shots/
+src/_preview_launcher.py
+
+# UI 验收截图脚本（本机用）
+_shot.py
+_shot_app.py

@@ -9,6 +9,7 @@
 """
 import flet as ft
 
+import theme as T
 from widgets import hint, toast
 from bridge import run_bg
 
@@ -95,42 +96,39 @@ class SettingsPage:
             self._widgets[key] = ctrl
 
     def _sw(self, target, key, label, value, desc=""):
-        sw = ft.Switch(label=label, value=bool(value))
+        widget, sw = T.switch_row(label, bool(value), desc=desc)
         self._reg(target, key, lambda: "1" if sw.value else "0", sw)
-        if not desc:
-            return sw
-        return ft.Column([sw, hint(desc)], spacing=0)
+        return widget
 
     def _num(self, target, key, label, value, lo, hi, desc="", is_float=False):
-        tf = ft.TextField(label=label, value=str(value), dense=True,
-                          keyboard_type=ft.KeyboardType.NUMBER)
+        # 标签走 field_group（标签在框外）：Flet 的 floating label 会压在描边上，
+        # 而且和下方说明摞成三层字。见 theme.field_group 的注释。
+        tf = T.field("", str(value), dense=True)
+        tf.keyboard_type = ft.KeyboardType.NUMBER
         if is_float:
             self._reg(target, key,
                       lambda: str(_clamp_float(tf.value, lo, hi, value)), tf)
         else:
             self._reg(target, key,
                       lambda: str(_clamp_int(tf.value, lo, hi, value)), tf)
-        if not desc:
-            return tf
-        return ft.Column([tf, hint(desc)], spacing=2)
+        return T.field_group(tf, label, desc)
 
     def _dd(self, target, key, label, value, options, desc=""):
-        dd = ft.Dropdown(label=label, value=str(value), dense=True,
-                         options=[ft.dropdown.Option(key=str(k), text=str(t))
-                                  for k, t in options])
+        # 裸 Dropdown + 独立小灰字标签：T.select(label=...) 返回的是 Column，
+        # 而这里要把控件登记进 _writers 供保存时读 .value（Column 没有 value）。
+        dd = T.select("", str(value), options)
         self._reg(target, key, lambda: str(dd.value or value), dd)
-        if not desc:
-            return dd
-        return ft.Column([dd, hint(desc)], spacing=2)
+        return T.field_group(dd, label, desc)
 
     def _text(self, target, key, label, value, desc="", multiline=False,
               lines=3, password=False, on_clear=False, normalize_default=None):
-        tf = ft.TextField(
-            label=label, value=str(value or ""), dense=not multiline,
-            multiline=multiline, min_lines=lines if multiline else None,
-            max_lines=lines if multiline else None,
-            password=password, can_reveal_password=password,
-            text_size=12 if multiline else None)
+        tf = T.field("", str(value or ""), multiline=multiline,
+                     min_lines=lines if multiline else None,
+                     max_lines=lines if multiline else None,
+                     size=12 if multiline else 13, dense=not multiline)
+        if password:
+            tf.password = True
+            tf.can_reveal_password = True
 
         def _val():
             raw = tf.value or ""
@@ -143,16 +141,13 @@ class SettingsPage:
             return raw
 
         self._reg(target, key, _val, tf)
-        parts = [tf]
-        if desc:
-            parts.append(hint(desc))
+        body = T.field_group(tf, label, desc)
         if on_clear:
-            parts.append(ft.Row([
-                ft.Text("留空 = 使用内置默认", size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
-                ft.TextButton("清空", on_click=lambda e: self._clear(tf)),
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
-        return ft.Column(parts, spacing=2)
+            body.controls.append(ft.Row([
+                ft.Text("留空 = 使用内置默认", size=11, color=T.muted()),
+                T.ghost("清空", on_click=lambda e: self._clear(tf)),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, spacing=T.GAP_S))
+        return body
 
     def _clear(self, tf):
         tf.value = ""
@@ -164,10 +159,12 @@ class SettingsPage:
         if desc:
             body.append(hint(desc))
         body.extend(controls)
-        return ft.Card(ft.Container(
-            ft.Column([ft.Text(title, size=14, weight=ft.FontWeight.W_600)] + body,
-                      spacing=8),
-            padding=12))
+        return T.card(ft.Column(
+            [ft.Text(title, size=14, weight=ft.FontWeight.W_600)] + body,
+            spacing=T.GAP_S,
+            # 卡片内也要横向撑满：TextField/Dropdown 在 Column 里默认按内容宽度，
+            # 不拉伸会出现「同一张卡里输入框一宽一窄」（截图验证过）。
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
     # ---------- 保存 ----------
 
@@ -253,23 +250,18 @@ class SettingsPage:
             self.page.pop_dialog()
             self.page.update()
 
-        self.page.show_dialog(ft.BottomSheet(
-            content=ft.Container(ft.Column([
-                ft.Text("选择嵌入模型", size=16, weight=ft.FontWeight.BOLD),
-                ft.Column([
-                    ft.ListTile(title=ft.Text(m.get("id", ""), size=13),
-                                on_click=lambda ev, i=m.get("id", ""): _pick(i))
-                    for m in models
-                ], scroll=ft.ScrollMode.AUTO, expand=True),
-            ], spacing=8), padding=16, height=420),
-            show_drag_handle=True, use_safe_area=True))
+        rows = [T.menu_row(ft.Icons.MODEL_TRAINING, m.get("id", ""),
+                           on_click=(lambda ev, i=m.get("id", ""): _pick(i)))
+                for m in models]
+        T.sheet(self.page, "选择嵌入模型", rows, height=420,
+                subtitle_text=f"共 {len(models)} 个可用模型")
 
     def _test_embed(self, e):
         url = (self._embed_url.value or "").strip()
         model = (self._embed_model.value or "").strip()
         key = self._embed_key_value()
         self._embed_result.value = "正在测试嵌入接口…"
-        self._embed_result.color = ft.Colors.ON_SURFACE_VARIANT
+        self._embed_result.color = T.muted()
         self.page.update()
 
         def job():
@@ -279,10 +271,10 @@ class SettingsPage:
         def done(r):
             r = r if isinstance(r, dict) else {}
             if r.get("ok"):
-                self._embed_result.color = ft.Colors.GREEN_700
+                self._embed_result.color = T.success()
                 self._embed_result.value = r.get("message") or "连接成功"
             else:
-                self._embed_result.color = ft.Colors.RED_700
+                self._embed_result.color = T.danger()
                 self._embed_result.value = (r.get("error") or r.get("message")
                                             or "测试失败")
             try:
@@ -428,13 +420,11 @@ class SettingsPage:
         ])
 
         # ---- 嵌入模型 ----
-        self._embed_url = ft.TextField(label="接口地址", dense=True,
-                                       value=g("embed_base_url", ""))
-        self._embed_key = ft.TextField(
-            label="API Key", dense=True, password=True, can_reveal_password=True,
-            hint_text="已保存则留空（留空 = 不修改）")
-        self._embed_model = ft.TextField(label="模型名", dense=True,
-                                         value=g("embed_model", ""))
+        self._embed_url = T.field("", g("embed_base_url", ""), dense=True)
+        self._embed_key = T.field("", "", dense=True)
+        self._embed_key.password = True
+        self._embed_key.can_reveal_password = True
+        self._embed_model = T.field("", g("embed_model", ""), dense=True)
         self._reg("g", "embed_base_url", lambda: self._embed_url.value or "",
                   self._embed_url)
         self._reg("g", "embed_model", lambda: self._embed_model.value or "",
@@ -442,15 +432,18 @@ class SettingsPage:
         self._widgets["embed_api_key"] = self._embed_key
         embed = self._card("嵌入接口（语义检索 / 语义查重）", [
             hint("可选功能：不填则不做语义检索，其余功能不受影响。"),
-            self._embed_url, self._embed_key,
-            ft.Row([ft.Container(self._embed_model, expand=True),
-                    ft.IconButton(ft.Icons.CLOUD_DOWNLOAD, tooltip="获取模型列表",
-                                  on_click=self._fetch_embed)], spacing=4),
+            T.field_group(self._embed_url, "接口地址"),
+            T.field_group(self._embed_key, "API Key",
+                          "已保存则留空（留空 = 不修改）"),
+            T.field_group(ft.Row([
+                ft.Container(self._embed_model, expand=True),
+                ft.IconButton(ft.Icons.CLOUD_DOWNLOAD, tooltip="获取模型列表",
+                              on_click=self._fetch_embed),
+            ], spacing=4), "模型名"),
             ft.Row([
-                ft.OutlinedButton("测试连接", on_click=self._test_embed),
-                ft.Text("（三项需同时填写才生效）", size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
-            ], spacing=8, wrap=True),
+                T.tonal("测试连接", on_click=self._test_embed),
+                ft.Text("（三项需同时填写才生效）", size=11, color=T.muted()),
+            ], spacing=T.GAP_S),
             self._embed_result,
         ])
 
@@ -483,26 +476,49 @@ class SettingsPage:
         self._update_card = _update_card_widget(self.page, self.session)
         update_card = self._update_card
 
-        # ---- 任务模板入口 ----
-        tpl_row = ft.Card(ft.Container(ft.Column([
-            ft.Row([ft.Icon(ft.Icons.DESCRIPTION, color=ft.Colors.PRIMARY),
-                    ft.Text("任务模板", weight=ft.FontWeight.W_600, expand=True)]),
-            ft.Text("16 个任务提示词（总纲/分卷/大纲/细纲/正文/改写/审校…）"
-                    "已独立成页，在「我的 → 任务模板」编辑。", size=12,
-                    color=ft.Colors.ON_SURFACE_VARIANT),
-        ], spacing=6), padding=12))
+        # ---- 任务模板入口（整行可点） ----
+        tpl_row = T.card(T.nav_tile(
+            ft.Icons.DESCRIPTION, "任务模板",
+            "16 个任务提示词已独立成页，在「我的 → 任务模板」编辑",
+            on_click=(lambda e: self.on_open_templates(""))
+            if self.on_open_templates else None), padding=0)
 
-        head = ft.Row([
-            ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: (
-                self.on_back() if self.on_back else None)),
-            ft.Text("设置", size=20, weight=ft.FontWeight.BOLD, expand=True),
-            ft.FilledButton("保存", on_click=self._save),
-        ])
+        head = T.back_head(
+            "设置", lambda: (self.on_back() if self.on_back else None))
 
-        body = ft.Column(
-            [head, inject, mem, est, anti, cont, draft] + stage_cards +
-            [deai, style, embed, backup, power, update_card, tpl_row,
-             ft.Row([ft.FilledButton("保存设置", on_click=self._save)],
-                    alignment=ft.MainAxisAlignment.CENTER)],
-            scroll=ft.ScrollMode.AUTO, expand=True, spacing=8)
-        return ft.Container(body, padding=14, expand=True)
+        # 分组归堆：15 张卡平铺时找一项要滑很久，按用途分成六段。
+        groups = [
+            ("生成上下文", [inject, mem]),
+            ("稳定性", [est, anti, cont]),
+            ("草稿自检", [draft] + stage_cards),
+            ("文风", [deai, style]),
+            ("接口", [embed]),
+            ("本机与备份", [backup, power]),
+            ("关于", [update_card, tpl_row]),
+        ]
+        items = []
+        for gname, cards in groups:
+            items.append(T.section(gname))
+            items.extend(cards)
+        # 尾部留白：不留的话滚到底时最后一张卡紧贴固定保存栏，像被裁掉了。
+        items.append(ft.Container(height=T.GAP_L))
+
+        scroll_col = ft.Column(items, scroll=ft.ScrollMode.AUTO, expand=True,
+                               spacing=0,
+                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        # 保存按钮固定在底部：设置页最长的地方有二十屏，滚到底才能保存
+        # 等于逼用户记住「先改完再翻到底」。改的是全量覆盖式保存，随时点都安全。
+        save_bar = ft.Container(
+            T.primary("保存设置", on_click=self._save, icon=ft.Icons.SAVE,
+                      expand=True),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L,
+                               top=T.GAP_S, bottom=T.GAP_S),
+            bgcolor=T.bg(),
+            border=ft.Border.only(top=ft.BorderSide(1, T.line())),
+        )
+        return ft.Container(
+            ft.Column([head, scroll_col, save_bar], expand=True, spacing=0,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L,
+                               top=T.GAP_S + 2, bottom=0),
+            expand=True)

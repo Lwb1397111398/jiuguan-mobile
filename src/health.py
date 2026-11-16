@@ -13,6 +13,7 @@ import datetime
 
 import flet as ft
 
+import theme as T
 from widgets import toast
 from bridge import run_bg
 
@@ -205,23 +206,34 @@ def banner(page, session, on_refresh=None):
 
     danger = any(i.get("severity") == "danger" for i in issues)
     footer = [
-        ft.TextButton("重新检测", icon=ft.Icons.REFRESH, on_click=_recheck),
+        T.ghost("重新检测", on_click=_recheck),
     ]
     if show_import:
-        footer.append(ft.TextButton("一键导入设定库", icon=ft.Icons.DOWNLOAD,
-                                    on_click=_import_lore))
-    footer.append(ft.TextButton("关闭提醒", on_click=_dismiss))
+        footer.append(T.ghost("一键导入设定库", on_click=_import_lore))
+    footer.append(T.ghost("关闭提醒", on_click=_dismiss))
 
     title = (issues[0].get("title", "") if len(issues) == 1
              else f"发现 {len(issues)} 个问题")
-    return ft.Card(ft.Container(ft.Column([
-        ft.Row([
-            ft.Icon(ft.Icons.ERROR if danger else ft.Icons.WARNING_AMBER,
-                    size=18,
-                    color=ft.Colors.RED_700 if danger else ft.Colors.ORANGE_800),
-            ft.Text(title, size=13, weight=ft.FontWeight.BOLD, expand=True),
-        ], spacing=6),
-        *rows,
-        ft.Row(footer, wrap=True, spacing=4),
-    ], spacing=6), padding=12),
-        margin=ft.Margin(left=0, right=0, top=0, bottom=6))
+    tone = T.danger() if danger else T.warn()
+    return ft.Container(
+        ft.Column([
+            ft.Row([
+                ft.Container(
+                    ft.Icon(ft.Icons.ERROR_OUTLINE if danger
+                            else ft.Icons.WARNING_AMBER_ROUNDED,
+                            size=18, color=tone),
+                    width=30, height=30, border_radius=T.R_SM,
+                    bgcolor=T.soft(tone, 0.14),
+                    alignment=ft.Alignment.CENTER),
+                ft.Text(title, size=13, weight=ft.FontWeight.W_600, expand=True,
+                        color=tone),
+            ], spacing=T.GAP_S,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            *rows,
+            ft.Row(footer, wrap=True, spacing=0),
+        ], spacing=T.GAP_S),
+        bgcolor=T.soft(tone, 0.07),
+        border=ft.Border.all(1, T.soft(tone, 0.28)),
+        border_radius=T.R_MD,
+        padding=T.GAP_M,
+        margin=ft.Margin(left=0, right=0, top=0, bottom=T.GAP_S))

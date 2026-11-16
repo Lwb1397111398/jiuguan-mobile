@@ -6,6 +6,7 @@ import os
 import flet as ft
 
 import health
+import theme as T
 from widgets import section, menu_group, toast, confirm
 from bridge import run_bg
 
@@ -71,6 +72,67 @@ class MinePage:
 
     def _open_presets(self, e):
         self._open_sub("presets")
+
+    def _record_tiles(self, _tile):
+        """「产出与记录」分组的条目（崩溃诊断只在真有过日志时出现）。
+
+        普通用户不该看到一条空的诊断入口；但只要 crash.log 存在，就一定摆出来
+        —— 闪退过一次的人第一件事就是找「哪里能看原因」。
+        """
+        import crashguard
+        items = [
+            _tile(ft.Icons.SAVE_ALT, "导出作品正文",
+                  "TXT / Markdown / Word，可选章节范围与总纲",
+                  self._export_prose),
+            _tile(ft.Icons.RECEIPT_LONG, "请求日志",
+                  "筛选 / 成本统计 / 清空 / 查看完整提示词",
+                  self._show_logs),
+        ]
+        if crashguard.exists():
+            items.append(_tile(
+                ft.Icons.BUG_REPORT, "崩溃诊断",
+                "闪退过一次？这里最后一次跑到哪、有没有报错",
+                self._show_crash))
+        items.append(_tile(
+            ft.Icons.SETTINGS, "设置",
+            "上下文注入、防截断、草稿自检、去 AI 味、嵌入接口",
+            self._open_settings))
+        return items
+
+    def _show_crash(self, e=None):
+        """崩溃日志查看：复制全文发给 AI 定位，或清空重来。"""
+        import crashguard
+        text = crashguard.tail(150)
+        if not text:
+            toast(self.page, "没有崩溃日志")
+            return
+        field = ft.TextField(value=text, multiline=True, min_lines=14,
+                             max_lines=14, read_only=True, text_size=11)
+
+        def _copy(ev):
+            try:
+                self.page.run_task(self.page.clipboard.set, text)
+                toast(self.page, "已复制，可直接发给 AI 定位")
+            except Exception:
+                toast(self.page, "复制失败，请长按选择文本", error=True)
+
+        def _clear(ev):
+            self.page.pop_dialog()
+            crashguard.clear()
+            toast(self.page, "崩溃日志已清空")
+            if self.on_refresh:
+                self.on_refresh()
+
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("崩溃诊断（最后 150 行）"),
+            content=ft.Container(field, width=560, height=420),
+            actions=[
+                ft.TextButton("清空", on_click=_clear),
+                ft.TextButton("复制全文", on_click=_copy),
+                ft.TextButton("关闭", on_click=lambda ev: self.page.pop_dialog()),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END))
 
     def _open_settings(self, e):
         self._open_sub("settings")
@@ -348,50 +410,46 @@ class MinePage:
         ub = update_card(self.page, s)
 
         def _tile(icon, title, subtitle, handler, async_handler=False):
-            """统一菜单条目：图标 + 标题 + 一行说明 + 右箭头。"""
-            return ft.ListTile(leading=ft.Icon(icon, size=22, color=ft.Colors.PRIMARY),
-                               title=ft.Text(title, size=14),
-                               subtitle=ft.Text(subtitle, size=11,
-                                                max_lines=1,
-                                                overflow=ft.TextOverflow.ELLIPSIS),
-                               trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, size=18),
-                               on_click=handler)
+            """统一菜单条目（转发 theme.nav_tile：圆角图标底座 + 右箭头）。"""
+            return T.nav_tile(icon, title, subtitle, on_click=handler)
 
         body = ft.Column([
-            ft.Text("我的", size=22, weight=ft.FontWeight.BOLD),
+            T.page_head("我的", "资料同步、创作工具与产出记录"),
             ub,                                     # ← 检查更新：顶部第一张卡
             *([banner] if banner else []),
             section("资料同步"),
-            ft.Card(ft.Container(ft.Column([
-                ft.Row([ft.Icon(ft.Icons.SYNC, color=ft.Colors.PRIMARY),
+            T.card(ft.Column([
+                ft.Row([ft.Icon(ft.Icons.SYNC, color=T.brand(), size=20),
                         ft.Text("全量备份 / 恢复", size=14,
                                 weight=ft.FontWeight.W_600, expand=True)]),
                 ft.Text("导出一个文件带走全部资料（模型、API Key、提示词偏好、预设、"
                         "破甲库、任务模板、所有项目），电脑 ↔ 手机 导入即完全一致。"
                         "备份含 API Key 明文，请妥善保管。", size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
+                        color=T.muted()),
                 ft.Row([
-                    ft.FilledButton("导出全量备份", on_click=self._export_full),
-                    ft.OutlinedButton("导入全量备份", on_click=self._import_full),
-                ], spacing=8, wrap=True),
-            ], spacing=6), padding=12)),
-            ft.Card(ft.Container(ft.Column([
-                ft.Row([ft.Icon(ft.Icons.CLOUD_SYNC, color=ft.Colors.PRIMARY),
+                    T.primary("导出备份", icon=ft.Icons.UPLOAD_FILE,
+                              on_click=self._export_full, expand=True),
+                    T.tonal("导入备份", icon=ft.Icons.DOWNLOAD,
+                            on_click=self._import_full, expand=True),
+                ], spacing=T.GAP_S),
+            ], spacing=T.GAP_S)),
+            T.card(ft.Column([
+                ft.Row([ft.Icon(ft.Icons.CLOUD_SYNC, color=T.brand(), size=20),
                         ft.Text("云同步（数据胶囊）", size=14,
                                 weight=ft.FontWeight.W_600, expand=True),
                         ft.IconButton(
                             ft.Icons.SETTINGS, icon_size=18,
                             tooltip="同步设置",
                             on_click=self._open_sync)]),
-                ft.Text(self._sync_summary(), size=11,
-                        color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Text(self._sync_summary(), size=11, color=T.muted()),
                 ft.Row([
-                    ft.FilledButton("立即同步", icon=ft.Icons.SYNC,
-                                    on_click=self._sync_now_quick),
-                    ft.OutlinedButton("同步设置", on_click=self._open_sync),
-                ], spacing=8, wrap=True),
-            ], spacing=6), padding=12)),
-            menu_group("项目 zip（搬单本书）", [
+                    T.primary("立即同步", icon=ft.Icons.SYNC,
+                              on_click=self._sync_now_quick, expand=True),
+                    T.tonal("同步设置", on_click=self._open_sync, expand=True),
+                ], spacing=T.GAP_S),
+            ], spacing=T.GAP_S)),
+            section("项目 zip（搬单本书）"),
+            menu_group("", [
                 _tile(ft.Icons.FOLDER_ZIP, "导出项目 zip",
                       "打包当前项目（大纲/正文/记忆），跨设备搬单本",
                       self._export_project),
@@ -418,13 +476,7 @@ class MinePage:
                       self._show_prompts),
             ]),
             section("产出与记录"),
-            menu_group("", [
-                _tile(ft.Icons.SAVE_ALT, "导出作品正文",
-                      "TXT / Markdown / Word，可选章节范围与总纲",
-                      self._export_prose),
-                _tile(ft.Icons.RECEIPT_LONG, "请求日志",
-                      "筛选 / 成本统计 / 清空 / 查看完整提示词",
-                      self._show_logs),
-            ]),
-        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=4)
-        return ft.Container(body, padding=14, expand=True)
+            menu_group("", self._record_tiles(_tile)),
+        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        return ft.Container(body, padding=T.GAP_L, expand=True)

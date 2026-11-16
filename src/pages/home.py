@@ -6,6 +6,7 @@ import os
 import flet as ft
 
 import health
+import theme as T
 from state import safe_folder_name
 from widgets import section, hint, empty, toast, confirm, page_header
 
@@ -82,10 +83,14 @@ class HomePage:
 
     def build(self) -> ft.Control:
         s = self.session
-        head = page_header("我的作品", trailing=ft.FilledButton(
-            "＋ 新建项目", on_click=self._new_project))
+        recents = list(s.app.list_recent() or [])
+        sub = (f"共 {len(recents)} 本，最近打开的排在最前" if recents
+               else "还没有作品")
+        head = T.page_head("我的作品", sub,
+                           trailing=T.primary("新建项目", icon=ft.Icons.ADD,
+                                              on_click=self._new_project))
         items = []
-        for r in s.app.list_recent():
+        for r in recents:
             exists = r.get("exists")
             last = r.get("last_open", "")
             try:
@@ -94,44 +99,47 @@ class HomePage:
                 last = ""
             sub = (r.get("path") or "") + (f" ｜ {last}打开" if last else "")
             tip = "" if exists else "文件夹不在本机：可重新导入备份，或点右侧移除记录"
-            card = ft.Card(ft.Container(
-                ft.Row([
+            card = T.card(ft.Row([
+                ft.Container(
                     ft.Icon(ft.Icons.MENU_BOOK if exists else ft.Icons.FOLDER_OFF,
-                            color=ft.Colors.PRIMARY if exists
-                            else ft.Colors.ON_SURFACE_VARIANT),
-                    ft.Column([
-                        ft.Text(r.get("title") or "未命名", size=15,
-                                weight=ft.FontWeight.W_600,
-                                color=None if exists else ft.Colors.ON_SURFACE_VARIANT),
-                        ft.Text(sub, size=11, color=ft.Colors.ON_SURFACE_VARIANT,
-                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                        *([ft.Text(tip, size=10, color=ft.Colors.ERROR)] if tip else []),
-                    ], spacing=2, expand=True),
-                    *( [ft.Icon(ft.Icons.CHEVRON_RIGHT,
-                                color=ft.Colors.ON_SURFACE_VARIANT)]
-                       if exists else
-                       [ft.IconButton(ft.Icons.DELETE_OUTLINE,
-                                      on_click=lambda e, p=r["path"]: self._remove(p))] ),
-                ]),
-                padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+                            size=20, color=T.brand() if exists else T.muted()),
+                    width=38, height=38, border_radius=T.R_MD,
+                    bgcolor=T.soft(T.brand() if exists else T.muted(), 0.10),
+                    alignment=ft.Alignment.CENTER),
+                ft.Column([
+                    ft.Text(r.get("title") or "未命名", size=15,
+                            weight=ft.FontWeight.W_600,
+                            color=None if exists else T.muted()),
+                    ft.Text(sub, size=11, color=T.muted(),
+                            max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    *([ft.Text(tip, size=10, color=T.danger(),
+                               max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)]
+                      if tip else []),
+                ], spacing=2, expand=True, tight=True),
+                *( [ft.Icon(ft.Icons.CHEVRON_RIGHT, size=17,
+                            color=ft.Colors.with_opacity(0.45, ft.Colors.ON_SURFACE))]
+                   if exists else
+                   [ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_size=18,
+                                  icon_color=T.muted(),
+                                  tooltip="移除记录",
+                                  on_click=lambda e, p=r["path"]: self._remove(p))] ),
+            ], spacing=T.GAP_M,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=ft.Padding(left=T.GAP_M, right=T.GAP_S,
+                                   top=T.GAP_S + 2, bottom=T.GAP_S + 2),
                 # 整行可点：手机/平板上没人会专门去戳最右边那个小箭头
                 # （2026-11-16 老板反馈「最近项目点不动」，当时只有箭头带事件）
-                on_click=(lambda e, p=r["path"]: self._open(p)) if exists else None,
-                ink=True,
-            ), margin=ft.Margin(left=0, right=0, top=0, bottom=8))
+                on_click=(lambda e, p=r["path"]: self._open(p)) if exists else None)
             items.append(card)
 
         if s.has_project:
-            cur = ft.Container(
-                ft.Row([
-                    ft.Icon(ft.Icons.PLAY_CIRCLE, color=ft.Colors.PRIMARY),
-                    ft.Text(f"当前：《{s.store.title}》", expand=True, size=14),
-                    ft.TextButton("关闭", on_click=lambda e: (
-                        s.close_project(), self.page.update())),
-                ]),
-                bgcolor=ft.Colors.with_opacity(0.08, ft.Colors.PRIMARY),
-                border_radius=10, padding=12, margin=ft.Margin(left=0, right=0, top=0, bottom=10),
-            )
+            cur = T.card(ft.Row([
+                ft.Icon(ft.Icons.PLAY_CIRCLE, color=T.brand(), size=20),
+                ft.Text(f"当前：《{s.store.title}》", expand=True, size=14),
+                T.ghost("关闭", on_click=lambda e: (
+                    s.close_project(), self.page.update())),
+            ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                tone="brand")
         else:
             cur = ft.Container()
 
@@ -143,5 +151,6 @@ class HomePage:
             section("最近项目"),
             *(items if items else [empty("还没有项目\n点「＋ 新建项目」开始创作，"
                                          "或用「我的 → 导入全量备份」从电脑同步")]),
-        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
-        return ft.Container(body, padding=14, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        return ft.Container(body, padding=T.GAP_L, expand=True)

@@ -4,6 +4,7 @@ import bootstrap  # noqa: F401  必须最先执行：sys.path 注入
 
 import flet as ft
 
+import crashguard
 from state import Session
 from widgets import toast
 from pages.home import HomePage
@@ -12,7 +13,18 @@ from pages.writing import WritingPage
 from pages.mine import MinePage
 
 
+def _version_name() -> str:
+    try:
+        from _version import APP_VERSION_NAME
+        return str(APP_VERSION_NAME)
+    except Exception:
+        return ""
+
+
 def main(page: ft.Page):
+    # 闪退留痕（APK 无控制台）：装在 main 第一步，之后的异常都能落到
+    # 数据目录的 crash.log，入口在「我的 → 崩溃诊断」。
+    crashguard.install(_version_name())
     page.title = "酒馆小说生成器"
     page.padding = 0
     page.theme_mode = ft.ThemeMode.SYSTEM
@@ -21,6 +33,10 @@ def main(page: ft.Page):
     seed = "#2A3550"
     page.theme = ft.Theme(color_scheme_seed=seed)
     page.dark_theme = ft.Theme(color_scheme_seed=seed)
+    # 页面底色走设计系统的语义色（theme.py）：卡片浮在底色上才分层，
+    # 旧版不设 bgcolor，M3 默认 surface 与卡片同色，全靠阴影区分，手机上很糊。
+    import theme as T
+    page.bgcolor = T.bg()
     # 不指定 font_family：安卓自动用系统中文字体（旧值 "Microsoft YaHei UI"
     # 在安卓上不存在，会触发不可控 fallback）
 
@@ -43,6 +59,9 @@ def main(page: ft.Page):
 
     nav = ft.NavigationBar(
         selected_index=0,
+        elevation=0,
+        height=68,
+        label_behavior=ft.NavigationBarLabelBehavior.ALWAYS_SHOW,
         destinations=[
             ft.NavigationBarDestination(icon=ft.Icons.BOOK_OUTLINED,
                                         selected_icon=ft.Icons.BOOK,

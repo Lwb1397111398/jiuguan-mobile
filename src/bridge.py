@@ -26,7 +26,9 @@ class StreamTask:
         self.buffer += text
         self.chars += len(text)
         now = time.monotonic()
-        if self.on_text and (now - self._last >= 0.24 or self.chars < 60):
+        # 240ms → 400ms：这条节流决定「每秒往客户端推几次整篇正文」。手机上
+        # 240ms 时生成 1 万字要推上百万字符，是写作台生成期卡顿/闪退的放大器。
+        if self.on_text and (now - self._last >= 0.4 or self.chars < 60):
             self._last = now
             try:
                 self.on_text(self.buffer)

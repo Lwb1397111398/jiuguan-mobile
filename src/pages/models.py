@@ -6,6 +6,7 @@
 """
 import flet as ft
 
+import theme as T
 from widgets import section, hint, toast, empty, confirm, page_header
 from bridge import run_bg
 
@@ -126,55 +127,41 @@ class ModelsPage:
             except Exception:
                 key_plain = ""
 
-        tpl_dd = ft.Dropdown(
-            label="服务模板（自动填地址/模型/单价）", dense=True,
-            value="自定义",
-            options=[ft.dropdown.Option(key=k, text=k) for k in SERVICE_TEMPLATES],
-        )
-        name = ft.TextField(label="档案名称", value=p.get("name", ""), dense=True)
-        base_url = ft.TextField(label="接口地址 Base URL", value=p.get("base_url", ""),
-                                hint_text="https://api.deepseek.com/v1", dense=True)
-        api_key = ft.TextField(label="API Key（本地模型可留空）", value=key_plain,
-                               password=True, can_reveal_password=True, dense=True)
-        model = ft.TextField(label="模型名", value=p.get("model", ""),
-                             hint_text="deepseek-chat / gpt-4o / qwen2.5:14b …",
-                             dense=True)
-        ctx = ft.TextField(label="上下文长度（token）", dense=True,
-                           value=str(p.get("context_length") or 1000000))
-        reasoning = ft.Dropdown(
-            label="思考模式", dense=True,
-            value=str(p.get("reasoning_mode") or "max"),
-            options=[ft.dropdown.Option(key=k, text=t) for t, k in REASONING_OPTIONS])
-        out_mode = ft.Dropdown(
-            label="输出模式", dense=True,
-            value=str(p.get("max_output_mode") or "auto"),
-            options=[ft.dropdown.Option(key="auto", text="自动（程序按任务给足上限）"),
-                     ft.dropdown.Option(key="manual", text="手动设置上限")])
-        max_tokens = ft.TextField(label="手动最大输出 token（输出模式=手动时生效）",
-                                  dense=True, value=str(p.get("max_tokens") or 4096))
-        timeout = ft.TextField(label="超时（秒）", dense=True,
-                               value=str(p.get("timeout") or 120))
+        # 弹层里的控件一律「标签在框外」（T.field_group）：保存时要读 .value，
+        # 所以标签单独画一行，不用 Flet 的浮动 label。
+        def _lbl(text, ctrl):
+            return T.field_group(ctrl, text)
+
+        tpl_dd = T.select("", "自定义", [(k, k) for k in SERVICE_TEMPLATES])
+        name = T.field("", p.get("name", ""), dense=True)
+        base_url = T.field("", p.get("base_url", ""),
+                           hint="https://api.deepseek.com/v1", dense=True)
+        api_key = T.field("", key_plain, dense=True)
+        api_key.password = True
+        api_key.can_reveal_password = True
+        model = T.field("", p.get("model", ""),
+                        hint="deepseek-chat / gpt-4o / qwen2.5:14b …", dense=True)
+        ctx = T.field("", str(p.get("context_length") or 1000000), dense=True)
+        reasoning = T.select("", str(p.get("reasoning_mode") or "max"),
+                             [(k, t) for t, k in REASONING_OPTIONS])
+        out_mode = T.select("", str(p.get("max_output_mode") or "auto"),
+                            [("auto", "自动（程序按任务给足上限）"),
+                             ("manual", "手动设置上限")])
+        max_tokens = T.field("", str(p.get("max_tokens") or 4096), dense=True)
+        timeout = T.field("", str(p.get("timeout") or 120), dense=True)
         # 渠道限流（2026-09-19）：部分中转站「1 分钟最多 N 次」且失败也计入，
         # 自动模式失败补救的连发会把配额打光 → 填上限后发送前会排队等待；0=不限。
-        rpm = ft.TextField(label="每分钟请求上限（0=不限，防渠道限流）", dense=True,
-                           value=str(p.get("rpm") or 0))
-        jb_dd = ft.Dropdown(label="破甲", dense=True,
-                            value=self._jailbreak_label(p) if p else "跟随全局",
-                            options=[])
+        rpm = T.field("", str(p.get("rpm") or 0), dense=True)
+        jb_dd = T.select("", "", [])
         # 破甲下拉按实际取值配置（避免显示文本与存储值混用）
         jb_cur = str(p.get("jailbreak") or "").strip()
-        jb_opts = self._jailbreak_options()
-        jb_dd.options = jb_opts
+        jb_dd.options = self._jailbreak_options()
         jb_dd.value = jb_cur
 
-        price_in = ft.TextField(label="输入价格（元/百万 token）", dense=True,
-                                value=str(p.get("input_price") or 0))
-        price_out = ft.TextField(label="输出价格（元/百万 token）", dense=True,
-                                 value=str(p.get("output_price") or 0))
-        currency = ft.Dropdown(label="币种", dense=True,
-                               value=str(p.get("currency") or "元"),
-                               options=[ft.dropdown.Option(key="元", text="元"),
-                                        ft.dropdown.Option(key="美元", text="美元")])
+        price_in = T.field("", str(p.get("input_price") or 0), dense=True)
+        price_out = T.field("", str(p.get("output_price") or 0), dense=True)
+        currency = T.select("", str(p.get("currency") or "元"),
+                            [("元", "元"), ("美元", "美元")])
 
         def _apply_template(ev):
             tpl = SERVICE_TEMPLATES.get(tpl_dd.value or "", {})
@@ -292,31 +279,45 @@ class ModelsPage:
             run_bg(self.page, job, done)
 
         form = ft.Column([
-            tpl_dd, name, base_url, api_key,
-            ft.Row([ft.Container(model, expand=True),
-                    ft.IconButton(ft.Icons.CLOUD_DOWNLOAD,
-                                  tooltip="获取模型列表",
-                                  on_click=_fetch)], spacing=4),
-            ctx,
+            _lbl("服务模板（自动填地址/模型/单价）", tpl_dd),
+            _lbl("档案名称", name),
+            _lbl("接口地址 Base URL", base_url),
+            _lbl("API Key（本地模型可留空）", api_key),
+            _lbl("模型名", ft.Row([ft.Container(model, expand=True),
+                                  ft.IconButton(ft.Icons.CLOUD_DOWNLOAD,
+                                                tooltip="获取模型列表",
+                                                on_click=_fetch)],
+                                 spacing=T.GAP_XS)),
+            _lbl("上下文长度（token）", ctx),
             section("思考与输出"),
-            reasoning, out_mode, max_tokens, timeout, rpm,
+            _lbl("思考模式", reasoning),
+            _lbl("输出模式", out_mode),
+            _lbl("手动最大输出 token（输出模式=手动时生效）", max_tokens),
+            _lbl("超时（秒）", timeout),
+            _lbl("每分钟请求上限（0=不限，防渠道限流）", rpm),
             section("破甲与计费"),
-            jb_dd,
+            _lbl("破甲", jb_dd),
             hint("「跟随全局」用破甲库里当前生效那套；也可以给这个模型单独指定一套。"),
-            ft.Row([ft.Container(price_in, expand=True),
-                    ft.Container(price_out, expand=True)], spacing=8),
-            currency,
+            ft.Row([ft.Container(_lbl("输入价格（元/百万 token）", price_in),
+                                 expand=True),
+                    ft.Container(_lbl("输出价格（元/百万 token）", price_out),
+                                 expand=True)], spacing=T.GAP_S),
+            _lbl("币种", currency),
             ft.Row([
-                ft.TextButton("测试连接", icon=ft.Icons.NETWORK_CHECK, on_click=_test),
-                ft.TextButton("取消", on_click=_close),
-                ft.FilledButton("保存", on_click=_save),
-            ], alignment=ft.MainAxisAlignment.END, spacing=6, wrap=True),
-        ], scroll=ft.ScrollMode.AUTO, spacing=8)
+                T.ghost("测试连接", icon=ft.Icons.NETWORK_CHECK, on_click=_test),
+                T.ghost("取消", on_click=_close),
+                T.primary("保存", on_click=_save),
+            ], alignment=ft.MainAxisAlignment.END, spacing=T.GAP_S, wrap=True),
+        ], scroll=ft.ScrollMode.AUTO, spacing=T.GAP_S,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
 
         self.page.show_dialog(ft.AlertDialog(
             modal=True,
-            title=ft.Text("编辑模型档案" if p else "新建模型档案"),
-            content=ft.Container(form, width=min(580, int(getattr(self.page, "width", 580) or 580)),
+            shape=ft.RoundedRectangleBorder(radius=T.R_XL),
+            title=ft.Text("编辑模型档案" if p else "新建模型档案", size=17,
+                          weight=ft.FontWeight.W_600),
+            content=ft.Container(form,
+                                 width=min(580, int(getattr(self.page, "width", 580) or 580)),
                                  height=self._height(0.84)),
             actions=[],
         ))
@@ -327,24 +328,13 @@ class ModelsPage:
         for m in models[:400]:
             mid = str(m.get("id") or "")
             cl = m.get("context_length")
-            rows.append(ft.ListTile(
-                dense=True,
-                title=ft.Text(mid, size=13),
-                subtitle=(ft.Text(f"上下文 {cl}", size=11,
-                                  color=ft.Colors.ON_SURFACE_VARIANT)
-                          if cl else None),
+            rows.append(T.menu_row(
+                ft.Icons.MODEL_TRAINING, mid,
+                f"上下文 {cl}" if cl else "",
                 on_click=lambda e, i=mid, c=cl: self._model_picked(
-                    i, c, ctx_field, model_field, name_field),
-            ))
-        self.page.show_dialog(ft.BottomSheet(
-            content=ft.Container(ft.Column(
-                [ft.Text(f"选择模型（{len(rows)}）", size=15,
-                         weight=ft.FontWeight.BOLD),
-                 ft.Column(rows, scroll=ft.ScrollMode.AUTO,
-                           height=self._height(0.7))],
-                spacing=6, scroll=ft.ScrollMode.AUTO),
-                padding=16, height=self._height(0.9)),
-            show_drag_handle=True))
+                    i, c, ctx_field, model_field, name_field)))
+        T.sheet(self.page, f"选择模型（{len(rows)}）", rows,
+                height=self._height(0.86))
 
     def _model_picked(self, model_id, ctx_len, ctx_field, model_field, name_field):
         self.page.pop_dialog()
@@ -383,18 +373,15 @@ class ModelsPage:
         profiles = g.list_profiles()
         cur_pid = route.get("profile_id")
 
-        prof_dd = ft.Dropdown(
-            label="绑定模型档案", dense=True,
-            value=str(cur_pid) if cur_pid else "",
-            options=[ft.dropdown.Option(key="", text="（未绑定）")] +
-                    [ft.dropdown.Option(key=str(p["id"]), text=p["name"])
-                     for p in profiles],
-        )
+        # 裸控件 + T.field_group（保存时要读 .value），标签不再走浮动 label
+        prof_dd = T.select("", str(cur_pid) if cur_pid else "",
+                           [("", "（未绑定）")] +
+                           [(str(p["id"]), p["name"]) for p in profiles])
         temp = route.get("temperature")
-        temp_field = ft.TextField(
-            label="温度（留空 = 用档案默认）", dense=True,
-            value="" if temp in (None, -1, -1.0) else str(temp))
-        locked_sw = ft.Switch(value=bool(route.get("locked")))
+        temp_field = T.field(
+            "", "" if temp in (None, -1, -1.0) else str(temp), dense=True)
+        lock_row, locked_sw = T.switch_row(
+            "锁定（一键绑定时不变更）", bool(route.get("locked")))
 
         def _save_bind(ev):
             try:
@@ -427,10 +414,8 @@ class ModelsPage:
 
         def _edit_prompt(ev):
             self.page.pop_dialog()
-            field = ft.TextField(
-                label=f"「{name}」角色提示词（留空 = 用内置）",
-                value=route.get("system_prompt") or "",
-                multiline=True, min_lines=6, max_lines=14)
+            field = T.field("", route.get("system_prompt") or "",
+                            multiline=True, min_lines=8, max_lines=14)
 
             def _ok(e2):
                 try:
@@ -444,10 +429,15 @@ class ModelsPage:
                 self._refresh()
 
             self.page.show_dialog(ft.AlertDialog(
-                modal=True, title=ft.Text(f"角色提示词 · {name}"),
-                content=ft.Container(field, width=540, height=self._height(0.6)),
-                actions=[ft.TextButton("取消", on_click=lambda e2: self.page.pop_dialog()),
-                         ft.FilledButton("保存", on_click=_ok)],
+                modal=True, title=ft.Text(f"角色提示词 · {name}", size=17,
+                                          weight=ft.FontWeight.W_600),
+                shape=ft.RoundedRectangleBorder(radius=T.R_XL),
+                content=ft.Container(T.field_group(
+                    field, f"「{name}」角色提示词（留空 = 用内置）"),
+                    width=540, height=self._height(0.6)),
+                actions=[T.ghost("取消",
+                                 on_click=lambda e2: self.page.pop_dialog()),
+                         T.primary("保存", on_click=_ok)],
                 actions_alignment=ft.MainAxisAlignment.END))
 
         def _fallback(ev):
@@ -482,23 +472,23 @@ class ModelsPage:
             content=ft.Container(ft.Column([
                 ft.Text(f"任务角色：{name}", size=16, weight=ft.FontWeight.BOLD),
                 hint("不同任务可用不同模型：正文用最强模型，记忆/检查用便宜快模型。"),
-                prof_dd, temp_field,
-                ft.Row([ft.Text("锁定（一键绑定时不变更）", size=13, expand=True),
-                        locked_sw]),
-                ft.Text(chain_text, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                ft.Row([
-                    ft.FilledButton("保存绑定", on_click=_save_bind),
-                    ft.OutlinedButton("备用渠道链", icon=ft.Icons.ALT_ROUTE,
-                                      on_click=_fallback),
-                ], spacing=8, wrap=True),
-                ft.Row([
-                    ft.TextButton("编辑角色提示词", icon=ft.Icons.EDIT_NOTE,
-                                  on_click=_edit_prompt),
-                    ft.TextButton("删除角色", icon=ft.Icons.DELETE_OUTLINE,
-                                  on_click=_del_role),
-                ], spacing=6, wrap=True),
-            ], spacing=10, scroll=ft.ScrollMode.AUTO),
-                padding=16, height=min(560, self._height(0.8))),
+                T.field_group(prof_dd, "绑定模型档案"),
+                T.field_group(temp_field, "温度（留空 = 用档案默认）"),
+                lock_row,
+                ft.Text(chain_text, size=12, color=T.muted()),
+                T.button_row(
+                    T.primary("保存绑定", on_click=_save_bind),
+                    T.tonal("备用渠道链", icon=ft.Icons.ALT_ROUTE,
+                            on_click=_fallback),
+                    fill=False),
+                T.button_row(
+                    T.ghost("编辑角色提示词", icon=ft.Icons.EDIT_NOTE,
+                            on_click=_edit_prompt),
+                    T.ghost("删除角色", icon=ft.Icons.DELETE_OUTLINE,
+                            on_click=_del_role),
+                    fill=False),
+            ], spacing=T.GAP_M, scroll=ft.ScrollMode.AUTO),
+                padding=T.GAP_L, height=min(560, self._height(0.8))),
             show_drag_handle=True))
 
     def _fallback_sheet(self, route: dict):
@@ -677,32 +667,34 @@ class ModelsPage:
 
         cards = []
         for p in g.list_profiles():
-            cards.append(ft.Card(ft.Container(ft.Column([
+            cards.append(T.card(ft.Column([
                 ft.Row([
-                    ft.Icon(ft.Icons.SMART_TOY, color=ft.Colors.PRIMARY, size=20),
+                    ft.Container(ft.Icon(ft.Icons.SMART_TOY, color=T.brand(),
+                                         size=19),
+                                 width=34, height=34, border_radius=T.R_MD,
+                                 bgcolor=T.soft(T.brand(), 0.10),
+                                 alignment=ft.Alignment.CENTER),
                     ft.Text(p.get("name", ""), size=15,
                             weight=ft.FontWeight.W_600, expand=True),
-                    ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_size=18,
-                                  on_click=lambda e, pp=p: self._delete_profile(pp)),
-                    ft.IconButton(ft.Icons.EDIT, icon_size=18,
+                    ft.IconButton(ft.Icons.EDIT_OUTLINED, icon_size=18,
+                                  tooltip="编辑",
                                   on_click=lambda e, pp=p: self._profile_dialog(e, pp)),
-                ]),
+                    ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_size=18,
+                                  tooltip="删除",
+                                  icon_color=T.muted(),
+                                  on_click=lambda e, pp=p: self._delete_profile(pp)),
+                ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Text(f"{p.get('model', '')} ｜ {p.get('base_url', '')}",
-                        size=11, color=ft.Colors.ON_SURFACE_VARIANT,
+                        size=11, color=T.muted(),
                         max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                 ft.Row([
-                    ft.Container(ft.Text("破甲：" + self._jailbreak_label(p), size=10),
-                                 bgcolor=ft.Colors.with_opacity(
-                                     0.12, ft.Colors.DEEP_PURPLE),
-                                 border_radius=6,
-                                 padding=ft.Padding(left=6, right=6, top=2, bottom=2)),
+                    T.pill("破甲：" + self._jailbreak_label(p)),
                     ft.Text(f"上下文 {p.get('context_length') or 0} ｜ "
                             f"单价 {p.get('input_price') or 0}/"
                             f"{p.get('output_price') or 0} {p.get('currency') or '元'}",
-                            size=10, color=ft.Colors.ON_SURFACE_VARIANT),
-                ], spacing=6),
-            ], spacing=4), padding=12),
-                margin=ft.Margin(left=0, right=0, top=0, bottom=8)))
+                            size=10, color=T.muted()),
+                ], spacing=T.GAP_S, wrap=True),
+            ], spacing=T.GAP_S - 2)))
 
         route_rows = []
         for r in g.list_routes():
@@ -717,61 +709,67 @@ class ModelsPage:
             tags.append(f"备用 {chain_n}" if chain_n else "无备用")
             temp = r.get("temperature")
             temp_txt = "默认" if temp in (None, -1, -1.0) else str(temp)
-            route_rows.append(ft.ListTile(
-                dense=True,
-                title=ft.Text(r.get("name") or r["role"], size=14),
-                subtitle=ft.Text(f"{bound} · 温度 {temp_txt} · " + " · ".join(tags),
-                                 size=11, color=ft.Colors.ON_SURFACE_VARIANT),
-                trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, size=18),
-                on_click=lambda e, rr=r: self._route_sheet(rr),
-            ))
+            route_rows.append(T.menu_row(
+                ft.Icons.ACCOUNT_TREE_OUTLINED, r.get("name") or r["role"],
+                f"{bound} · 温度 {temp_txt} · " + " · ".join(tags),
+                on_click=(lambda e, rr=r: self._route_sheet(rr))))
 
         body = ft.Column([
-            page_header("模型", trailing=ft.FilledButton(
-                "＋ 新建档案", on_click=lambda e: self._profile_dialog(e))),
+            T.page_head("模型", "档案、任务角色与渠道容错",
+                        trailing=T.primary("新建档案", icon=ft.Icons.ADD,
+                                           on_click=lambda e: self._profile_dialog(e))),
             section("破甲"),
-            ft.Card(ft.Container(ft.Column([
+            T.card(ft.Column([
                 ft.Row([
-                    ft.Icon(ft.Icons.SHIELD,
-                            color=ft.Colors.PRIMARY if jb_on else None, size=20),
+                    ft.Container(
+                        ft.Icon(ft.Icons.SHIELD_OUTLINED, size=19,
+                                color=T.brand() if jb_on else T.muted()),
+                        width=34, height=34, border_radius=T.R_MD,
+                        bgcolor=T.soft(T.brand() if jb_on else T.muted(), 0.10),
+                        alignment=ft.Alignment.CENTER),
                     ft.Text(f"当前生效：{jb_name or '（无）'}", size=14,
                             weight=ft.FontWeight.W_600, expand=True),
-                    ft.Chip(ft.Text("已启用" if jb_on else "已关闭", size=10)),
-                ]),
+                    T.pill("已启用" if jb_on else "已关闭",
+                           T.success() if jb_on else T.muted()),
+                ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Text(f"共 {jb_count} 套破甲。按角色注入：创作系全套，"
                         "检查/文风审校只给引用许可，记忆提取不注入。",
-                        size=11, color=ft.Colors.ON_SURFACE_VARIANT),
-                ft.Row([ft.FilledTonalButton("打开破甲库管理",
-                                             icon=ft.Icons.SHIELD,
-                                             on_click=self._open_jailbreaks)],
-                       alignment=ft.MainAxisAlignment.END),
-            ], spacing=6), padding=12)),
+                        size=11, color=T.muted()),
+                T.tonal("打开破甲库管理", icon=ft.Icons.SHIELD,
+                        on_click=self._open_jailbreaks, expand=True),
+            ], spacing=T.GAP_S)),
             section("渠道故障自动切换"),
-            ft.Card(ft.Container(ft.Row([
-                ft.Icon(ft.Icons.ALT_ROUTE, color=ft.Colors.PRIMARY, size=20),
+            T.card(ft.Row([
+                ft.Container(ft.Icon(ft.Icons.ALT_ROUTE, color=T.brand(), size=19),
+                             width=34, height=34, border_radius=T.R_MD,
+                             bgcolor=T.soft(T.brand(), 0.10),
+                             alignment=ft.Alignment.CENTER),
                 ft.Column([
                     ft.Text("主渠道故障时自动换渠道重发", size=14,
                             weight=ft.FontWeight.W_600),
                     ft.Text("余额耗尽/限流/Key 失效/服务端 5xx/网络不通且重试仍失败时，"
                             "按角色配置的备用链顺序切换；内容类问题不切换。",
-                            size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                            size=11, color=T.muted()),
                 ], spacing=2, expand=True),
-                ft.Switch(value=bool(failover_on), on_change=self._toggle_failover),
-            ]), padding=12)),
+                ft.Switch(value=bool(failover_on),
+                          active_color=T.brand(),
+                          on_change=self._toggle_failover),
+            ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER)),
             section("模型档案"),
             *(cards if cards else [empty("还没有模型档案\n点「＋ 新建档案」接入 "
                                          "DeepSeek / OpenAI / 本地 Ollama 等")]),
             section("任务角色路由"),
-            ft.Row([
-                hint("点角色可绑定模型、设温度、锁定、编辑提示词、配备用渠道"),
-            ]),
-            ft.Row([
-                ft.FilledTonalButton("一键绑定全部角色", icon=ft.Icons.LINK,
-                                     on_click=self._bind_all),
-                ft.OutlinedButton("＋ 新增角色", icon=ft.Icons.PERSON_ADD_ALT,
-                                  on_click=self._add_role),
-            ], wrap=True, spacing=8),
-            ft.Card(ft.Container(ft.Column(route_rows, spacing=0), padding=6)
-                    if route_rows else empty("暂无任务角色")),
-        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=4)
-        return ft.Container(body, padding=14, expand=True)
+            hint("点角色可绑定模型、设温度、锁定、编辑提示词、配备用渠道"),
+            # 平分两列 + 与下方列表留出间距：原来按钮行紧贴列表首行，像长在一起。
+            ft.Container(
+                T.button_row(
+                    T.tonal("一键绑定全部角色", icon=ft.Icons.LINK,
+                            on_click=self._bind_all),
+                    T.ghost("＋ 新增角色", icon=ft.Icons.PERSON_ADD_ALT,
+                            on_click=self._add_role)),
+                margin=ft.Margin(left=0, right=0, top=T.GAP_XS, bottom=T.GAP_M)),
+            (T.card(ft.Column(route_rows, spacing=0), padding=0)
+             if route_rows else T.card(empty("暂无任务角色"), padding=0)),
+        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        return ft.Container(body, padding=T.GAP_L, expand=True)

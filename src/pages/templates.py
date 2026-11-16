@@ -8,6 +8,7 @@
 """
 import flet as ft
 
+import theme as T
 from widgets import section, hint, toast, confirm
 
 
@@ -97,67 +98,71 @@ class TaskTemplateEditor:
 
     def build(self) -> ft.Control:
         tt = _tpl_api()
-        label = tt.LABELS.get(self.key, self.key)
         cur = self._current()
-        default = self._default()
         overridden = bool(cur.strip())
 
-        self._field = ft.TextField(
-            value=cur,
-            multiline=True,
-            min_lines=12,
-            max_lines=30,
-            text_size=12,
-            hint_text="留空则使用内置默认模板",
-            border_color=ft.Colors.OUTLINE_VARIANT,
-        )
+        # 编辑器要吃掉剩余高度：模板动辄几千字，塞进十来行里改一处要来回翻。
+        # ⚠ Flet 0.86 的 TextField **不吃父级给的高度**——外层 Container(height=…)
+        # 和 expand=True 两轮都试过，只把外面那层框撑开，输入框本身仍按行数渲染
+        # （截图实测：框白高 300px 上下，容器再高也是透明的）。唯一有效的旋钮
+        # 是 min_lines，所以按视口高度换算行数：15px 字 + 1.4 行距 ≈ 21px/行。
+        page_h = 880
+        try:
+            page_h = int(getattr(self.page, "height", 0) or 880)
+        except (TypeError, ValueError):
+            pass
+        lines = max(10, (page_h - 330) // 21)
+        self._field = T.editor(cur, hint="留空则使用内置默认模板", expand=False,
+                               min_lines=lines)
 
         self._info = ft.Text(
             ("已自定义（保存于全局库，所有项目共用）" if overridden
              else "当前用内置默认；填写内容并保存即覆盖"),
             size=12,
-            color=ft.Colors.PRIMARY if overridden else ft.Colors.ON_SURFACE_VARIANT,
+            color=T.brand() if overridden else T.muted(),
         )
 
-        self._btn_save = ft.FilledButton("保存", icon=ft.Icons.SAVE, on_click=self._save)
+        keys = self.keys or list(tt.TEMPLATES.keys())
+        dd = T.select("任务模板", self.key,
+                      [(k, tt.LABELS.get(k, k)) for k in keys],
+                      on_select=self._pick)
 
-        dd = ft.Dropdown(
-            label="选择任务模板",
-            value=self.key,
-            dense=True,
-            options=self._options(),
-            on_select=self._pick,
-        )
-
-        body = [
+        items = [
             self._head(),
-            ft.Row([ft.Container(dd, expand=True)], spacing=8),
-            ft.Row([
-                ft.OutlinedButton("填入内置默认", icon=ft.Icons.RESTORE,
-                                  on_click=self._reset),
-                ft.OutlinedButton("清空（回到内置）", icon=ft.Icons.CLEAR,
-                                  on_click=self._clear),
-            ], spacing=8, wrap=True),
+            dd,
+            T.button_row(
+                T.tonal("填入内置默认", icon=ft.Icons.RESTORE,
+                        on_click=self._reset),
+                T.tonal("清空（回到内置）", icon=ft.Icons.CLEAR,
+                        on_click=self._clear)),
             self._info,
-            section(f"模板正文 · {label}"),
             hint(f"占位符：{{chapter_title}} 等；中文别名 {{章名}}/{{章节号}}/{{章数}}/"
                  f"{{卷名}}/{{卷内容}}/{{前大纲}} 可直接用。"),
-            ft.Container(
-                ft.Column([self._field], scroll=ft.ScrollMode.AUTO),
-                expand=True,
-            ),
-            ft.Row([self._btn_save], alignment=ft.MainAxisAlignment.END),
+            self._field,
         ]
+
+        save_bar = ft.Container(
+            T.primary("保存模板", icon=ft.Icons.SAVE, on_click=self._save,
+                      expand=True),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L,
+                               top=T.GAP_S, bottom=T.GAP_S),
+            bgcolor=T.bg(),
+            border=ft.Border.only(top=ft.BorderSide(1, T.line())))
+        # 固定头 + 弹性编辑器 + 固定保存栏。外层保留 scroll 兜底：小屏上行数
+        # 换算可能偏高，能滚总比把保存栏顶出屏幕好。
         return ft.Container(
-            ft.Column(body, scroll=ft.ScrollMode.AUTO, expand=True, spacing=8),
-            padding=14, expand=True)
+            ft.Column([ft.Column(items, scroll=ft.ScrollMode.AUTO, expand=True,
+                                 spacing=T.GAP_S,
+                                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                       save_bar], expand=True, spacing=0,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            padding=ft.Padding(left=T.GAP_L, right=T.GAP_L,
+                               top=T.GAP_S + 2, bottom=0),
+            expand=True)
 
     def _head(self) -> ft.Control:
-        return ft.Row([
-            ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: (
-                self.on_back() if self.on_back else None)),
-            ft.Text("任务模板", size=20, weight=ft.FontWeight.BOLD, expand=True),
-        ])
+        return T.back_head(
+            "任务模板", lambda: (self.on_back() if self.on_back else None))
 
     # ---------- 交互 ----------
 
