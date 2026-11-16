@@ -13,6 +13,7 @@ from xml.sax.saxutils import escape
 from .store import ProjectStore
 from .chapter_outline import chapter_outline_text
 from .api import encrypt_key, decrypt_key
+from .paths import is_cache_path
 
 EXPORT_FORMATS = ["TXT", "Markdown", "DOCX"]
 
@@ -536,8 +537,12 @@ def import_full_backup(zip_path: str, app_state) -> tuple[bool, str]:
             os.makedirs(projects_root, exist_ok=True)
             by_title = {}
             for r in app_state.list_recent():
-                if r.get("title") and r["title"] not in by_title:
-                    by_title[r["title"]] = r["path"]
+                p = r.get("path") or ""
+                # 落点是缓存目录的一律不复用：那是旧版把数据目录算错时留下的
+                # 死记录（安卓清缓存即丢），照它恢复等于又把书放进会被清的地方
+                if r.get("title") and p and not is_cache_path(p) \
+                        and r["title"] not in by_title:
+                    by_title[r["title"]] = p
             path_map = {}
             with zipfile.ZipFile(zip_path, "r") as zf:
                 for e in proj_keys:

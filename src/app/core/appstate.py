@@ -72,13 +72,29 @@ class AppState:
 
         不再过滤失效项：项目记录应持久保留，文件夹被移动/清理后记录不能静默消失，
         由 UI 显示灰色 + 提供「移除记录」入口。
+
+        旧版把数据目录放在 cache 时记下的路径（`.../cache/.../酒馆小说生成器/...`）
+        在这里按当前数据目录换回真实位置：缓存被清后文件已不在，但迁移到 files
+        的那份还在时，记录能自己复活，不用手动重导备份。
         """
+        from .paths import remap_legacy_cache_path
+        healed = False
         items = []
         for item in self.config.get("recent_projects", []):
             path = item.get("path", "")
             it = dict(item)
-            it["exists"] = bool(path) and os.path.isdir(path)
+            exists = bool(path) and os.path.isdir(path)
+            if not exists and path:
+                fixed = remap_legacy_cache_path(path, self.data_dir)
+                if fixed != path and os.path.isdir(fixed):
+                    item["path"] = fixed       # 落回 config，下次不用再算
+                    it["path"] = fixed
+                    exists = True
+                    healed = True
+            it["exists"] = exists
             items.append(it)
+        if healed:
+            self.save_config()
         return items
 
     def add_recent(self, path: str, title: str = ""):

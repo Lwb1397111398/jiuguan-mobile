@@ -93,6 +93,7 @@ class HomePage:
             except (ValueError, TypeError):
                 last = ""
             sub = (r.get("path") or "") + (f" ｜ {last}打开" if last else "")
+            tip = "" if exists else "文件夹不在本机：可重新导入备份，或点右侧移除记录"
             card = ft.Card(ft.Container(
                 ft.Row([
                     ft.Icon(ft.Icons.MENU_BOOK if exists else ft.Icons.FOLDER_OFF,
@@ -104,14 +105,19 @@ class HomePage:
                                 color=None if exists else ft.Colors.ON_SURFACE_VARIANT),
                         ft.Text(sub, size=11, color=ft.Colors.ON_SURFACE_VARIANT,
                                 max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        *([ft.Text(tip, size=10, color=ft.Colors.ERROR)] if tip else []),
                     ], spacing=2, expand=True),
-                    *( [ft.IconButton(ft.Icons.CHEVRON_RIGHT,
-                                      on_click=lambda e, p=r["path"]: self._open(p))]
+                    *( [ft.Icon(ft.Icons.CHEVRON_RIGHT,
+                                color=ft.Colors.ON_SURFACE_VARIANT)]
                        if exists else
                        [ft.IconButton(ft.Icons.DELETE_OUTLINE,
                                       on_click=lambda e, p=r["path"]: self._remove(p))] ),
                 ]),
                 padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+                # 整行可点：手机/平板上没人会专门去戳最右边那个小箭头
+                # （2026-11-16 老板反馈「最近项目点不动」，当时只有箭头带事件）
+                on_click=(lambda e, p=r["path"]: self._open(p)) if exists else None,
+                ink=True,
             ), margin=ft.Margin(left=0, right=0, top=0, bottom=8))
             items.append(card)
 
