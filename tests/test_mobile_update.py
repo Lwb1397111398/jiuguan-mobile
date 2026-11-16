@@ -289,3 +289,124 @@ def test_jnius_diag_reports_failure(monkeypatch):
     d = update.jnius_diag()
     assert 'RuntimeError' in d and 'bridge broken' in d
     _reset_android_cache()
+
+
+# ---------- 平板浏览器安装通路（2026-11-16：pyjnius 桥接不可用时的主通路） ----------
+
+def test_browser_urls_mirror_first_and_dedupe():
+    """主推上次成功的通道 → 镜像 → 直连垫底，且 URL 去重。"""
+    info = update.UpdateInfo(
+        52, "0.1.52", update.LATEST_APK_URL,
+        source_prefix="https://gh-proxy.com/")
+    urls = update.browser_download_urls(info)
+    assert urls[0] == "https://gh-proxy.com/" + info.apk_url
+    assert urls[-1] == info.apk_url
+    assert len(urls) == len(set(urls))
+    assert len(urls) == len(update.BROWSER_MIRRORS)
+
+
+def test_browser_urls_direct_still_puts_mirror_first():
+    """检查走直连成功时，浏览器通路仍让镜像排前（国内直连下载常被污染）。"""
+    info = update.UpdateInfo(52, "0.1.52", "https://github.com/x.apk",
+                             source_prefix="")
+    urls = update.browser_download_urls(info)
+    assert urls[0].startswith("https://gh-proxy.com/")
+    assert urls[-1] == "https://github.com/x.apk"
+
+
+def test_browser_urls_keeps_unknown_prefix():
+    """source_prefix 是镜像表之外的通道也不丢（如 gh-proxy.org）。"""
+    info = update.UpdateInfo(52, "0.1.52", "https://github.com/x.apk",
+                             source_prefix="https://gh-proxy.org/")
+    urls = update.browser_download_urls(info)
+    assert urls[0] == "https://gh-proxy.org/https://github.com/x.apk"
+    assert len(urls) == len(set(urls))
+
+
+def test_browser_url_falls_back_to_latest():
+    """Release 没给资产直链时退回固定 latest 镜像链（永远指向最新版）。"""
+    empty = update.UpdateInfo(52, "0.1.52", "")
+    assert update.browser_download_urls(empty) == []
+    assert update.browser_download_url(empty) == ""
+    assert update.browser_url_or_latest(empty) == update.LATEST_MIRROR_URL
+    assert update.LATEST_MIRROR_URL.endswith(update.ASSET_NAME)
+
+
+def test_update_sheet_has_browser_button_and_copyable_link():
+    """弹窗必须有不依赖 pyjnius 的浏览器按钮 + 可长按复制的直链。"""
+    import update_ui
+    info = update.UpdateInfo(52, "0.1.52", update.LATEST_APK_URL)
+    flow = update_ui._UpdateFlow(object(), info)
+    assert flow.build() is not None
+    assert flow._link.value == update.browser_download_url(info)
+    assert flow._link.selectable is True
+
+
+def test_open_browser_uses_flet_url_launcher(monkeypatch):
+    """浏览器通路走 Flet UrlLauncher（Flutter 插件 Java 侧），不碰 jnius。"""
+    import asyncio
+    import flet as ft
+    import update_ui
+
+    calls = {}
+
+    class FakeLauncher:
+        async def launch_url(self, url, *, mode=None, **kw):
+            calls["url"] = url
+            calls["mode"] = mode
+
+    monkeypatch.setattr(ft, "UrlLauncher", FakeLauncher)
+    info = update.UpdateInfo(52, "0.1.52", update.LATEST_APK_URL)
+    flow = update_ui._UpdateFlow(object(), info)
+    asyncio.run(flow._open_browser(None))
+    assert calls["url"] == update.browser_download_url(info)
+    assert calls["mode"] == ft.LaunchMode.EXTERNAL_APPLICATION
+
+
+def test_install_failure_falls_back_to_browser_not_pc(monkeypatch):
+    """pyjnius 安装抛异常 → 自动走平板浏览器，绝不出现「从电脑上装」。"""
+    import asyncio
+    import update_ui
+
+    info = update.UpdateInfo(52, "0.1.52", update.LATEST_APK_URL)
+    flow = update_ui._UpdateFlow(object(), info)
+    flow._path = "/tmp/update-52.apk"
+    called = {}
+
+    def boom(path):
+        raise RuntimeError("bridge broken")
+
+    async def fake_open(e=None):
+        called["browser"] = True
+
+    monkeypatch.setattr(update_ui, "install_apk", boom)
+    monkeypatch.setattr(flow, "_open_browser", fake_open)
+    asyncio.run(flow._install(None))
+    assert called.get("browser") is True
+    assert "浏览器" in flow._status.value
+    assert "从电脑" not in flow._status.value
+
+
+def test_update_card_has_direct_latest_entry_on_android(monkeypatch):
+    """卡片上永远留一条「直接下载最新安装包」，破解引导死循环。"""
+    import update_ui
+    monkeypatch.setattr(update, "is_android", lambda: True)
+    monkeypatch.setattr(update, "get_local_version", lambda: (48, "0.1.48"))
+    card = update_ui.update_card(object(), None)
+    texts = []
+
+    def walk(c):
+        try:
+            v = getattr(c, "value", None)
+            if isinstance(v, str):
+                texts.append(v)
+            inner = getattr(c, "content", None)
+            if inner is not None and inner is not c and hasattr(inner, "__dict__"):
+                walk(inner)
+            for x in (getattr(c, "controls", None) or []):
+                walk(x)
+        except Exception:
+            pass
+
+    walk(card)
+    assert any("直接下载最新安装包" in t for t in texts)

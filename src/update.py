@@ -13,11 +13,17 @@ Release 说明第一行是 HTML 注释元数据（GitHub 页面不渲染，App �
 gh-proxy.com / gh-proxy.org 能透传 API；ghfast.top / ghproxy.net 只透传下载
 （API 返 403）——所以它们只进下载候选，不进查询链。
 
-安装：flet 模板 AndroidManifest 已内置 FileProvider（authority 为
-"<包名>.provider"，res/xml/provider_paths.xml 已暴露 cacheDir 整个目录），
-APK 落 cacheDir/updates/ 后拿 content:// URI，ACTION_INSTALL_PACKAGE 唤起
-系统安装器。pyjnius 由 serious_python_android 带进运行时（release 构建的
-ProGuard keep 规则已保留其引导类）。
+安装（两条通路，2026-11-16 老板平板实测后补的第二条）：
+① pyjnius 一键装：flet 模板 AndroidManifest 已内置 FileProvider
+   （authority 为 "<包名>.provider"，res/xml/provider_paths.xml 已暴露
+   cacheDir 整个目录），APK 落 cacheDir/updates/ 后拿 content:// URI，
+   ACTION_INSTALL_PACKAGE 唤起系统安装器。pyjnius 由 serious_python_android
+   带进运行时（release 构建的 ProGuard keep 规则已保留其引导类）。
+② 平板浏览器装（不依赖 pyjnius）：老板平板上 pyjnius 桥接整链失败
+   （autoclass 就抛异常，真因未定位），「从电脑上装」这种降级对平板主力
+   设备等于没修。改走 Flet 的 UrlLauncher（Flutter 插件、Java 侧），把 APK
+   的 https 直链交给平板自带浏览器/下载管理器，下载完点通知栏即安装，
+   全程不碰电脑。UI 接线见 update_ui.py。
 
 本模块保持纯逻辑（无 page 控件依赖）：UI 接线见 update_ui.py。
 """
@@ -41,6 +47,18 @@ DOWNLOAD_PREFIXES = QUERY_PREFIXES + [
     "https://ghfast.top/",
     "https://ghproxy.net/",
 ]
+
+# latest Release 的固定直链：tag 与资产名永远不变，所以这个 URL 永远指向
+# 当前最新版。用于「用平板浏览器下载安装」以及一次性手动安装（修自更新
+# 自身 bug 时旧版拉不到修复版，必须给一条能直接打开的链接，见模块总览 §七）。
+LATEST_APK_URL = ("https://github.com/" + REPO +
+                  "/releases/download/latest/" + ASSET_NAME)
+LATEST_MIRROR_URL = "https://gh-proxy.com/" + LATEST_APK_URL
+
+# 浏览器通路候选前缀：镜像在前（国内直连 github.com 常被 DNS 污染）、直连垫底。
+# 与 DOWNLOAD_PREFIXES 分开，因为 App 内下载直连优先（最快），浏览器通路反过来。
+BROWSER_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/",
+                   "https://ghproxy.net/", "")
 
 AUTO_CHECK_INTERVAL = 24 * 3600     # 启动静默检查节流：24h
 CONNECT_TIMEOUT = 10                # 连接超时（秒）
@@ -325,6 +343,44 @@ def download_update(info, progress=None):
                 pass
             continue
     raise NetworkError(f"下载失败（直连与镜像都试过）：{last_err}")
+
+
+# ---------- 平板浏览器通路（不依赖 pyjnius） ----------
+
+def browser_download_urls(info):
+    """浏览器可打开的 APK 直链候选：镜像优先、去重、直连垫底。
+
+    2026-11-16 老板平板：pyjnius 桥接整链失败，App 内「安装更新」唤不起
+    系统安装器，旧降级文案让老板「从电脑上装」——但主力设备就是平板，
+    等于没修。现在把直链交给平板浏览器/下载管理器（走 Flet UrlLauncher，
+    Flutter 插件 Java 侧，与 pyjnius 无关），下载完点通知栏即可安装。
+
+    第一个候选优先复用本次检查成功的通道（source_prefix），其后是实测能
+    透传 GitHub 下载的镜像，最后是直连。apk_url 为空返回空列表，由 UI
+    退回固定的 LATEST_MIRROR_URL。
+    """
+    base = str(getattr(info, "apk_url", "") or "")
+    if not base:
+        return []
+    prefixes = []
+    sp = str(getattr(info, "source_prefix", "") or "")
+    if sp:                     # 空串=直连，不排第一：留给 BROWSER_MIRRORS 垫底
+        prefixes.append(sp)
+    for p in BROWSER_MIRRORS:
+        if p not in prefixes:
+            prefixes.append(p)
+    return [p + base for p in prefixes]
+
+
+def browser_download_url(info):
+    """主推直链（候选第一个）；没有 apk_url 返回空串。"""
+    urls = browser_download_urls(info)
+    return urls[0] if urls else ""
+
+
+def browser_url_or_latest(info):
+    """UI 兜底：拿不到本次 Release 的资产直链时，退回固定的 latest 镜像链。"""
+    return browser_download_url(info) or LATEST_MIRROR_URL
 
 
 def install_apk(apk_path):

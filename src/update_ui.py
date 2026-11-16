@@ -3,6 +3,13 @@
 
 纯逻辑在 update.py；本文件只管控件与页面交互，设置页与启动流程共用。
 下载进度回调来自工作线程，控件刷新走 page.update()（bridge.py 已验证跨线程安全）。
+
+2026-11-16 老板平板：pyjnius 桥接整链失败，「安装更新」唤不起系统安装器，
+旧的降级文案让用户「从电脑上装」——可主力设备就是平板，等于没修。
+现在弹窗主推「用平板浏览器下载安装」：走 Flet 的 UrlLauncher（Flutter
+插件 Java 侧，与 pyjnius 无关），把 APK 直链交给平板浏览器/下载管理器，
+下载完点通知栏安装，全程不用电脑；同时保留 App 内一键安装（桥接恢复时
+自动可用），一键安装失败也会自动切到浏览器通路。
 """
 import threading
 import time
@@ -12,6 +19,7 @@ import flet as ft
 from update import (
     NetworkError,
     NoReleaseError,
+    browser_url_or_latest,
     check_update,
     download_update,
     get_local_version,
@@ -32,12 +40,35 @@ def update_card(page, session) -> ft.Control:
     2026-11-16 从设置页最底部提升为「我的」页顶部第一张卡（老板：更新按钮
     不该藏在二十张设置卡片后面）；设置页保留同款卡片（引用同一实现）。
     桌面预览模式显示「仅手机版可用」。"""
-    from update import get_local_version, is_android, jnius_diag, platform_diag
+    from update import (LATEST_MIRROR_URL, get_local_version, is_android,
+                        jnius_diag, platform_diag)
     code, name = get_local_version()
     android = is_android()
     status = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
     ver_text = (f"{name}（build {code}）" if android
                 else "电脑预览（更新仅手机版可用）")
+
+    async def _open_latest(e=None):
+        """不经过「检查更新」，直接在平板浏览器打开最新安装包。
+
+        破解自更新的引导死循环：修自更新自身的 bug 只在新版生效，旧版
+        拉不到修复版；卡片上永远留一条能手动装最新版的路（平板内完成）。
+        """
+        if not is_android():
+            toast(page, "仅手机版可用（电脑预览模式）")
+            return
+        try:
+            await ft.UrlLauncher().launch_url(
+                LATEST_MIRROR_URL,
+                mode=ft.LaunchMode.EXTERNAL_APPLICATION)
+            status.value = "已打开平板浏览器，下载完点通知栏安装即可。"
+        except Exception:
+            status.value = ("浏览器没打开成功，请长按复制这条链接到浏览器："
+                            + LATEST_MIRROR_URL)
+        try:
+            page.update()
+        except Exception:
+            pass
 
     def _check(e=None):
         if not is_android():
@@ -67,13 +98,19 @@ def update_card(page, session) -> ft.Control:
     if diag:
         # pyjnius 桥接异常时显示一行可复制的诊断（老板截图即可定位真因，
         # 2026-11-16 平板真机 pyjnius 整链失败就是靠这个抓回来的）
-        rows.append(ft.Text(f"桥接诊断：{diag}", size=11,
-                            color=ft.Colors.ERROR, selectable=True))
+        rows.append(ft.Text(f"桥接诊断：{diag}（不影响下面的浏览器安装）",
+                            size=11, color=ft.Colors.ON_SURFACE_VARIANT,
+                            selectable=True))
     elif not android:
         # 非安卓也把判定依据摊开：真机若被误判成「电脑预览」，截图即可定位，
         # 不用再猜「为什么我是平板却显示电脑」（2026-11-16 第二轮）
         rows.append(ft.Text(f"平台判定：{platform_diag()}", size=11,
                             color=ft.Colors.ON_SURFACE_VARIANT, selectable=True))
+    if android:
+        rows.append(ft.TextButton(
+            content=ft.Text("直接下载最新安装包（平板浏览器打开，不用电脑）",
+                            size=11),
+            on_click=_open_latest))
     rows.append(status)
     return ft.Card(ft.Container(ft.Column(rows, spacing=6), padding=12))
 
@@ -150,7 +187,7 @@ def manual_check(page):
 # ---------- 更新弹窗 ----------
 
 def show_update_sheet(page, info):
-    """弹「发现新版本」BottomSheet：下载（进度条）→ 安装（系统安装器）。"""
+    """弹「发现新版本」BottomSheet：主推平板浏览器安装 + App 内一键安装备选。"""
     flow = _UpdateFlow(page, info)
     page.show_dialog(ft.BottomSheet(
         content=flow.build(), show_drag_handle=True, use_safe_area=True))
@@ -166,11 +203,18 @@ class _UpdateFlow:
         self._bar = ft.ProgressBar(value=0, visible=False)
         self._status = ft.Text("", size=12,
                                color=ft.Colors.ON_SURFACE_VARIANT)
-        self._download_btn = ft.FilledButton("下载并安装",
-                                             on_click=self._start_download)
+        # 主推通路：走 Flet UrlLauncher（Flutter 插件），完全不碰 pyjnius
+        self._browser_btn = ft.FilledButton("用平板浏览器下载安装",
+                                            on_click=self._open_browser)
+        # 次要通路：App 内下载后由 pyjnius 唤起安装器（桥接恢复时一键装）
+        self._download_btn = ft.TextButton("App 内下载并安装",
+                                           on_click=self._start_download)
         self._install_btn = ft.FilledButton("安装更新", visible=False,
                                             on_click=self._install)
         self._close_btn = ft.TextButton("稍后", on_click=self._close)
+        self._browser_url = browser_url_or_latest(info)
+        self._link = ft.Text(self._browser_url, size=10, selectable=True,
+                             color=ft.Colors.ON_SURFACE_VARIANT)
 
     def build(self):
         cur, _ = get_local_version()
@@ -189,12 +233,18 @@ class _UpdateFlow:
                 [ft.Text(self.info.notes, size=12, selectable=True)],
                 height=140, scroll=ft.ScrollMode.AUTO))
         parts += [
+            ft.Text("平板上点「用平板浏览器下载安装」即可：下载完点通知栏的"
+                    "安装提示，全程不用电脑。",
+                    size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+            ft.Text("下载链接（可长按复制，浏览器打不开时自己贴过去）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._link,
             self._bar, self._status,
             ft.Row([
-                self._close_btn,
-                ft.Container(expand=True),
-                self._download_btn, self._install_btn,
-            ]),
+                self._close_btn, self._download_btn, self._install_btn,
+                self._browser_btn,
+            ], wrap=True, spacing=6,
+                alignment=ft.MainAxisAlignment.END),
         ]
         return ft.Container(ft.Column(parts, spacing=8),
                             padding=16, width=520)
@@ -237,8 +287,8 @@ class _UpdateFlow:
         else:
             self._path = result
             self._bar.visible = False
-            self._status.value = ("下载完成。点「安装更新」唤起系统安装器；"
-                                  "若提示去开「安装未知应用」权限，开启后回来再点一次。")
+            self._status.value = ("下载完成。点「安装更新」试一键安装；"
+                                  "若不可用会自动改用平板浏览器，全程不用电脑。")
             self._install_btn.visible = True
         try:
             self.page.update()
@@ -247,17 +297,48 @@ class _UpdateFlow:
 
     # ---------- 安装 ----------
 
-    def _install(self, e=None):
+    async def _open_browser(self, e=None):
+        """平板内安装主通路：把 APK 直链交给系统浏览器 / 下载管理器。
+
+        走 Flet 的 UrlLauncher（Flutter 插件、Java 侧），与 pyjnius 完全无关。
+        EXTERNAL_APPLICATION 明确交给外部浏览器，避免 in-app WebView 下不了
+        APK。万一这步也失败，弹窗里已有可长按复制的直链兜底。
+        """
+        self._status.value = "正在打开平板浏览器…"
+        try:
+            self.page.update()
+        except Exception:
+            pass
+        try:
+            await ft.UrlLauncher().launch_url(
+                self._browser_url, mode=ft.LaunchMode.EXTERNAL_APPLICATION)
+            self._status.value = ("已交给平板浏览器下载：下载完点通知栏安装，"
+                                  "首次若提示「安装未知应用」允许一次即可，"
+                                  "全程不用电脑。")
+        except Exception as ex:
+            self._status.value = ("浏览器没打开成功，请长按复制上面的下载链接，"
+                                  "贴到浏览器里打开。" + str(ex)[:60])
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    async def _install(self, e=None):
+        """App 内一键安装（pyjnius）；桥接不可用时自动切平板浏览器通路。"""
         if not self._path:
+            await self._open_browser()
             return
         try:
             started = install_apk(self._path)
-        except Exception as ex:
-            # 2026-11-16 平板真机：pyjnius 桥接异常时安装唤不起来，说人话降级
-            # （检查/下载不受影响；从电脑重装新包是万能兜底）。
-            from update import jnius_diag
-            toast(self.page, "自动安装不可用（" + (jnius_diag() or str(ex)) +
-                  "）。请把新 APK 从电脑重新安装一次。", error=True)
+        except Exception:
+            # 2026-11-16 老板平板：pyjnius 整链失败。旧文案让用户「从电脑上装」，
+            # 但主力设备就是平板，等于没修 —— 现在自动走平板浏览器，全程不碰电脑。
+            self._status.value = "一键安装通道不可用，正在改用平板浏览器…"
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            await self._open_browser()
             return
         if started:
             try:
