@@ -58,8 +58,11 @@ class WritingPage:
         self.on_refresh = None  # 主界面注入：整页重建
         self._tab = 0
         self._task = None       # 当前 StreamTask（可停止）
-        self._outline_chapter_id = None
-        self._desk_chapter_id = None
+        # 当前章指针：**全页签共用**（2026-11-17 老板要求）。早先是两套独立指针
+        # （`_outline_chapter_id` / `_desk_chapter_id`），在大纲页换到第三章、
+        # 切到写作台还停在上次的章，来回翻要找两次。现在只有这一个。
+        self._chapter_id = None
+        self._chapter_scope = None   # 指针归属项目（store.folder），换项目自动复位
         # 改写来源的章（接受后即使已有快照也自动重归档，见 _after_prose_done）
         self._pending_rewrite: set = set()
         # 切章接力队列（总纲迭代保存后 _try_relay 填充，_relay_pump 串行推进）
@@ -357,8 +360,11 @@ class WritingPage:
         ))
 
     def _pick_chapter(self, on_pick, current_id=None):
-        """章节选择 bottom sheet。"""
+        """章节选择 bottom sheet（当前章打勾，省得再找）。"""
         store = self.session.store
+        if current_id is None:
+            cur = self._current_chapter()
+            current_id = cur["id"] if cur else None
         rows = []
         for c in store.list_chapters():
             rows.append(ft.ListTile(
@@ -370,14 +376,117 @@ class WritingPage:
                 subtitle=ft.Text(c.get("status", ""), size=11,
                                  color=STATUS_COLORS.get(c.get("status"),
                                                          ft.Colors.GREY)),
-                trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT, size=16),
+                trailing=(ft.Icon(ft.Icons.CHECK, size=18, color=T.brand())
+                          if c["id"] == current_id else
+                          ft.Icon(ft.Icons.CHEVRON_RIGHT, size=16)),
                 on_click=lambda e, ch=c: (self.page.pop_dialog(), on_pick(ch)),
+                selected=(c["id"] == current_id),
             ))
         self.page.show_dialog(ft.BottomSheet(
             content=ft.Container(ft.Column(
                 [ft.Text("选择章节", size=16, weight=ft.FontWeight.BOLD)] + rows,
                 scroll=ft.ScrollMode.AUTO), padding=16, height=460),
             show_drag_handle=True))
+
+    # ---------- 当前章：全页签共用一个指针 ----------
+
+    def _chapter_list(self) -> list[dict]:
+        return self.session.store.list_chapters()
+
+    def _current_chapter(self):
+        """当前章（大纲页 / 写作台共用）。
+
+        - **换项目必须复位**：章节 id 是每个库从 1 自增，换一本书后旧 id 会撞上
+          别的章（不回退的话直接跳到一个和用户预期无关的章）；
+        - 指针指向的章被删/被回收：回落到第一章，不抛错。
+        """
+        store = self.session.store
+        chapters = self._chapter_list()
+        if not chapters:
+            return None
+        scope = getattr(store, "folder", "") or ""
+        if self._chapter_scope is None:
+            # 首次访问只登记归属，不复位：`_chapter_id` 可能已被调用方预设
+            self._chapter_scope = scope
+        elif scope != self._chapter_scope:
+            self._chapter_scope = scope
+            self._chapter_id = None
+        for c in chapters:
+            if c["id"] == self._chapter_id:
+                return store.get_chapter(c["id"])
+        self._chapter_id = chapters[0]["id"]
+        return store.get_chapter(chapters[0]["id"])
+
+    def _chapter_neighbors(self, cid):
+        """→ (上一章, 下一章)；列表顺序即 order_index 升序，没有则为 None。"""
+        chapters = self._chapter_list()
+        ids = [c["id"] for c in chapters]
+        if cid not in ids:
+            return None, None
+        i = ids.index(cid)
+        return (chapters[i - 1] if i > 0 else None,
+                chapters[i + 1] if i + 1 < len(chapters) else None)
+
+    def _chapter_arrows(self, ch) -> ft.Control:
+        """◀ 上一章 / 下一章 ▶（到头自动禁用，点不动就是到头了）。
+
+        为什么用箭头不用「上一章」文字按钮：写作台章节卡右上角和标题抢宽度，
+        手机窄屏放两个带字按钮会把章名挤成两三个字（Flet 的 Row 不换行）。
+        箭头是固定 40dp 的通用语义，平板上也好按。
+        """
+        prev_ch, next_ch = self._chapter_neighbors(ch["id"])
+
+        def _go(target):
+            def _cb(e):
+                self._goto_chapter(target)
+            return _cb
+
+        return ft.Row([
+            ft.IconButton(ft.Icons.CHEVRON_LEFT, icon_size=22, tooltip="上一章",
+                          visual_density=ft.VisualDensity.COMPACT,
+                          disabled=prev_ch is None, on_click=_go(prev_ch)),
+            ft.IconButton(ft.Icons.CHEVRON_RIGHT, icon_size=22, tooltip="下一章",
+                          visual_density=ft.VisualDensity.COMPACT,
+                          disabled=next_ch is None, on_click=_go(next_ch)),
+        ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def _unsaved_editor_text(self, ch) -> str:
+        """编辑器里还没「接受本章」的手改稿（空串 = 没有 / 与库内一致）。
+
+        加「上一章/下一章」后切章变成高频动作，不拦一下等于把刚手写的段落
+        直接丢掉（切章会整页重建，编辑器按库内正文重新填）。
+        """
+        ed = getattr(self, "_desk_editor", None)
+        if ch is None or ed is None:
+            return ""
+        text = (ed.value or "").strip()
+        if not text:
+            return ""
+        store = self.session.store
+        if text == (self._accepted_prose(ch["id"]) or "").strip():
+            return ""
+        if text == (store.prose_batch_merged(ch["id"]) or "").strip():
+            return ""
+        return text
+
+    def _goto_chapter(self, ch):
+        """切到指定章（箭头、换一章、大纲页选章都走这里）。"""
+        if not ch or ch.get("id") == self._chapter_id:
+            return
+        if self._task is not None and not self._task.stopped:
+            toast(self.page, "正在生成，先停止再切章", error=True)
+            return
+        if self._unsaved_editor_text(self._current_chapter()):
+            confirm(self.page, "本章还有没落库的手改稿",
+                    "切到别的章会把编辑器里这段没点「接受本章」的正文丢掉。"
+                    "要切吗？",
+                    lambda: self._apply_chapter(ch["id"]), yes_text="丢掉并切章")
+            return
+        self._apply_chapter(ch["id"])
+
+    def _apply_chapter(self, cid: int):
+        self._chapter_id = cid
+        self.refresh()
 
     # =====================================================
     # 页签 1：总纲
@@ -1542,9 +1651,11 @@ class WritingPage:
         controls = [
             ft.Row([
                 ft.Text("单章大纲", size=17, weight=ft.FontWeight.BOLD, expand=True),
+                # 上一章 / 下一章：和写作台同一套指针，翻章不用再开「换一章」列表
+                self._chapter_arrows(ch) if ch else ft.Container(),
                 ft.TextButton("换一章", icon=ft.Icons.SWAP_HORIZONTAL_CIRCLE,
                               on_click=lambda e: self._pick_chapter(self._pick_outline_ch)),
-            ]),
+            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Row([ft.FilledTonalButton("⚡一键细化全部大纲", icon=ft.Icons.BOLT,
                                          on_click=lambda e: self._outline_batch_start())]),
         ]
@@ -1582,19 +1693,11 @@ class WritingPage:
         return ft.Column(controls, scroll=ft.ScrollMode.AUTO, expand=True, spacing=2)
 
     def _current_outline_chapter(self):
-        store = self.session.store
-        chapters = store.list_chapters()
-        if not chapters:
-            return None
-        for c in chapters:
-            if c["id"] == self._outline_chapter_id:
-                return store.get_chapter(c["id"])
-        self._outline_chapter_id = chapters[0]["id"]
-        return store.get_chapter(chapters[0]["id"])
+        """大纲页当前章 —— 与写作台共用 `_current_chapter()`（2026-11-17）。"""
+        return self._current_chapter()
 
     def _pick_outline_ch(self, ch: dict):
-        self._outline_chapter_id = ch["id"]
-        self.refresh()
+        self._goto_chapter(ch)
 
     def _outline_edit(self, ch: dict):
         store = self.session.store
@@ -1928,19 +2031,25 @@ class WritingPage:
             except Exception:
                 pass
 
+        # 章号旁标注全书章数：翻章时能判断「还剩多少」，不用去大纲页数
+        total = len(self._chapter_list())
         head = ft.Row([
             ft.Column([
                 ft.Row([
-                    ft.Text(f"第 {ch.get('order_index', '?')} 章", size=12,
-                            color=T.muted()),
+                    ft.Text(f"第 {ch.get('order_index', '?')} 章 · 共 {total} 章",
+                            size=11, color=T.muted()),
                     T.pill(status, color, size=9),
                 ], spacing=6),
                 ft.Text(ch.get("title") or "未命名", size=21,
                         weight=ft.FontWeight.BOLD, max_lines=1,
                         overflow=ft.TextOverflow.ELLIPSIS),
             ], spacing=2, expand=True),
+            # ◀ 上一章 / 下一章 ▶（2026-11-17 老板要求）：与「换一章」并排，
+            # 三个紧凑图标按钮占 120dp，章名仍有一半以上宽度
+            self._chapter_arrows(ch),
             ft.IconButton(ft.Icons.SWAP_HORIZONTAL_CIRCLE_OUTLINED,
                           icon_size=20, tooltip="换一章",
+                          visual_density=ft.VisualDensity.COMPACT,
                           on_click=lambda e: self._pick_chapter(self._pick_desk_ch)),
         ], spacing=T.GAP_S, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         progress = ft.Row([
@@ -3024,17 +3133,11 @@ class WritingPage:
         self._after_prose_done(cid)
 
     def _current_desk_chapter(self):
-        store = self.session.store
-        chapters = store.list_chapters()
-        for c in chapters:
-            if c["id"] == self._desk_chapter_id:
-                return store.get_chapter(c["id"])
-        self._desk_chapter_id = chapters[0]["id"]
-        return store.get_chapter(chapters[0]["id"])
+        """写作台当前章 —— 与大纲页共用 `_current_chapter()`（2026-11-17）。"""
+        return self._current_chapter()
 
     def _pick_desk_ch(self, ch: dict):
-        self._desk_chapter_id = ch["id"]
-        self.refresh()
+        self._goto_chapter(ch)
 
     def _accepted_prose(self, cid: int) -> str:
         blocks = self.session.store.list_text_blocks(cid)

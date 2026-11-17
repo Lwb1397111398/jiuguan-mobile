@@ -16,3 +16,4 @@ src/_preview_launcher.py
 # UI 验收截图脚本（本机用）
 _shot.py
 _shot_app.py
+_shots/
