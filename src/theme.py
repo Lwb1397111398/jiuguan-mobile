@@ -464,8 +464,70 @@ def editor_lines(page, reserved_px: int, *, min_lines: int = 8,
 
     reserved_px = 顶栏/章节卡/操作栏等固定占位；line_px = 16px 字号 × 1.75 行距。
     """
-    n = (view_height(page) - reserved_px) // line_px
+    n = (usable_height(page) - reserved_px) // line_px
     return max(min_lines, min(max_lines, n))
+
+
+# ---------------- 整屏骨架 / 系统栏安全区 ----------------
+# 底部导航高度：Material 3 标准 80。**别往下调** —— 68 时图标+文字正好贴到
+# 屏幕最下沿，系统导航栏一压，整排「下半截」就看不见了（老板 2026-11-17 平板反馈）。
+APP_NAV_HEIGHT = 80
+
+
+def _inset_px(value) -> int:
+    try:
+        return max(0, int(round(float(value or 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def system_insets(page) -> tuple:
+    """(上, 下) 系统栏占位：状态栏 / 系统导航栏（三键导航或手势条）。
+
+    安卓 15 起强制 edge-to-edge，页面内容会铺到状态栏和系统导航栏底下，
+    不主动内缩就是「最下面一排图标的下半部分缺失」。平板上系统栏更宽更明显。
+    `padding` 与 `view_padding` 取**两者较大的**：弹键盘 / 系统栏自动隐藏时
+    `padding` 会变小甚至变 0，而 `SafeArea(maintain_bottom_view_padding=True)`
+    常驻的是 `view_padding`；哪个上报了值就以哪个为准，纸的高度才不会跟着
+    键盘一开一合跳。
+    """
+    media = getattr(page, "media", None)
+    pads = [p for p in (getattr(media, "view_padding", None),
+                        getattr(media, "padding", None)) if p is not None]
+    top = max([_inset_px(getattr(p, "top", 0)) for p in pads] or [0])
+    bottom = max([_inset_px(getattr(p, "bottom", 0)) for p in pads] or [0])
+    return top, bottom
+
+
+def usable_height(page, default: int = 880) -> int:
+    """真正能放内容的视口高度 = 整屏高 − 系统栏占位（含底部导航上下的那两截）。
+
+    `page.height` 是**整屏**逻辑高（含系统栏），按它换算行数会多算，
+    纸就长出可用区域、末尾半截行被裁。
+    """
+    top, bottom = system_insets(page)
+    return max(240, view_height(page, default) - top - bottom)
+
+
+def app_shell(body, nav) -> ft.Control:
+    """整屏骨架：内容区（避让状态栏/侧边系统栏）+ 贴底导航。
+
+    两处 SafeArea 分工不同，别合成一个：
+    - 内容区只避让**上/左右**，底部让给导航（否则导航上面多出一条页面底色的缝）；
+    - 导航外框自己再套一层：导航的**背景色一直铺到屏幕最下沿**，只有图标和
+      文字被抬到系统栏之上（Material 导航栏的常规观感）。
+    `maintain_bottom_view_padding=True`：弹键盘时 `padding.bottom` 会被吃掉，
+    这个开关让底部那一截保持常驻，导航不会因为键盘一开一合来回跳。
+    """
+    nav_block = ft.Container(
+        ft.SafeArea(content=nav, avoid_intrusions_top=False,
+                    maintain_bottom_view_padding=True),
+        bgcolor=card_bg(),
+    )
+    return ft.Column([
+        ft.SafeArea(content=body, expand=True, avoid_intrusions_bottom=False),
+        nav_block,
+    ], expand=True, spacing=0)
 
 
 # ---------------- 空态 ----------------

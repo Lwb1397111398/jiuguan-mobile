@@ -60,7 +60,12 @@ def main(page: ft.Page):
     nav = ft.NavigationBar(
         selected_index=0,
         elevation=0,
-        height=68,
+        # 80 = Material 3 标准高。旧值 68 会让图标+文字贴到屏幕最下沿，
+        # 系统导航栏一压就「整排下半截」看不见（2026-11-17 平板反馈）。
+        height=T.APP_NAV_HEIGHT,
+        # 与导航外框（app_shell 的 Container）同色：底部系统栏那一截才连成一体，
+        # 不会在导航下面露出第二条页面底色的色带。
+        bgcolor=T.card_bg(),
         label_behavior=ft.NavigationBarLabelBehavior.ALWAYS_SHOW,
         destinations=[
             ft.NavigationBarDestination(icon=ft.Icons.BOOK_OUTLINED,
@@ -85,7 +90,9 @@ def main(page: ft.Page):
         page.update()
 
     body.content = home.build()
-    page.add(ft.Column([body, nav], expand=True, spacing=0))
+    # 整屏骨架统一走 theme.app_shell：安卓 15+ 强制 edge-to-edge，不套系统栏
+    # 安全区的话，底部导航会被系统导航栏（三键 48dp / 手势条 24dp）压住下半截。
+    page.add(T.app_shell(body, nav))
 
     # 启动后 8 秒静默检查更新（24h 节流，仅 Android；桌面预览直接跳过）
     from update_ui import schedule_silent_check

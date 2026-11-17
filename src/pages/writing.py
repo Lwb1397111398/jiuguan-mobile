@@ -46,6 +46,10 @@ STATUS_COLORS = {"未规划": ft.Colors.GREY, "有大纲": ft.Colors.BLUE,
                  "已完成": ft.Colors.GREEN, "已归档": ft.Colors.TEAL,
                  "已锁定": ft.Colors.DEEP_PURPLE}
 
+# 页签内容区的左右内边距（`_view_for_tab` 用）。按视口算宽度的控件必须把它
+# 一起减掉，否则会顶出屏幕右缘——写作台底部操作栏的「更多」就这么被裁过。
+PAGE_PAD = 12
+
 
 class WritingPage:
     def __init__(self, page, session):
@@ -263,7 +267,7 @@ class WritingPage:
     def _view_for_tab(self, i: int) -> ft.Control:
         views = [self._synopsis_view, self._volumes_view, self._outline_view,
                  self._desk_view, self._memory_view, self._lore_view]
-        return ft.Container(views[i](), padding=12, expand=True)
+        return ft.Container(views[i](), padding=PAGE_PAD, expand=True)
 
     def _on_tab_change(self, e):
         """切页签：只记索引并刷新，**不整页重建**（2026-11-16 稳定性修复）。
@@ -2065,8 +2069,10 @@ class WritingPage:
             # 左右各 4：SPACE_BETWEEN 会把首尾按钮顶到容器边缘，视觉上像被裁了
             padding=ft.Padding(left=4, right=4, top=0, bottom=0))
         # 按钮组限宽 900 居中：平板横屏下让主按钮横跨 1100dp 会像条横幅。
+        # 减掉的是「页签内边距 PAGE_PAD ×2 + 操作栏自身 GAP_M ×2」——只减后者时
+        # 这一行比可用宽度宽 24dp，右端「更多」被顶出屏幕（2026-11-17 截图实测）。
         w = T.view_width(self.page)
-        inner_w = min(900, max(300, w - 2 * T.GAP_M))
+        inner_w = min(900, max(300, w - 2 * (PAGE_PAD + T.GAP_M)))
         return ft.Container(
             ft.Row([
                 ft.Container(
