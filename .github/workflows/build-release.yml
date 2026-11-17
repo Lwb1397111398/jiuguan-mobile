@@ -23,7 +23,9 @@ jobs:
   # build 才允许启动；任何一步失败都不会产出/覆盖 latest Release。
   test:
     name: update 专项 + 手机测试
-    runs-on: ubuntu-latest
+    # 钉 24.04：ubuntu-latest 已迁到 26.04，其 toolcache 没有 Python 3.12.10
+    # （实测 setup-python 直接失败）；24.04 也是此前发版 CI 验证过的环境。
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
@@ -87,7 +89,7 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
