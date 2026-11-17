@@ -3419,8 +3419,10 @@ class ProjectStore(QObject):
         破甲/生成偏好等工具配置已全局共享（2026-08-08），不在项目文件夹内，
         项目备份只带走内容数据（db），全局配置随全局库另行备份。
 
-        prefix 供云同步用：被云端版本覆盖前先留一份 `sync_overwrite_*`，
-        与常规自动备份区分开，免得按 backup_keep 剪枝时被误删。
+        prefix 供调用方区分用途（常规自动备份 / 手动备份）。
+        ⚠ 云同步拉取前的后悔药**不走这里**，改走 `snapshot_to(exclude_tables=())`：
+        checkpoint+copy2 中间那一刻仍有写入可能落进 WAL 被漏掉（同步引擎
+        `_snapshot_before_merge`）。这里保留是为了不改变既有备份行为。
         """
         backup_dir = backup_dir or os.path.join(self.folder, "backups")
         os.makedirs(backup_dir, exist_ok=True)

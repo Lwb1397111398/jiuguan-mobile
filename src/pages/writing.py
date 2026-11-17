@@ -67,6 +67,9 @@ class WritingPage:
         self._pending_rewrite: set = set()
         # 切章接力队列（总纲迭代保存后 _try_relay 填充，_relay_pump 串行推进）
         self._relay_queue: list = []
+        # 分卷页展开态记忆（2026-11-17）：refresh() 整页重建会把 ExpansionTile
+        # 全部收起，改了第 5 卷再回来要重新找——按卷 id 记住，重建时恢复。
+        self._vol_open_ids: set = set()
         # ⚡自动模式引擎：全书流水线（build 时创建）与一键细化大纲（确认后创建，
         # scope="outline"）。同一时间只允许一台在跑（_ap_running_any 统一互斥）。
         self._ap = None
@@ -1351,21 +1354,23 @@ class WritingPage:
                          task=task, title=f"接力·迭代切分·第{n}卷",
                          on_done=on_relay)
 
-    def _on_relay_result(self, store, vol: dict, own: list, n):
-        """接力切章迭代结果处理（增量优先，无评估标记降级全量；结构冻结）。
+    def _chiter_result(self, store, vol: dict, own: list, n, on_finish=None):
+        """切章迭代结果处理器工厂（接力 / 手动共用）；返回 on_done 回调。
 
-        与桌面 VolumePage._on_chiter_result 同语义：章数/章序/章名不动，只就地
-        修订章内大纲（update_chapter），不删章不建章——接力卷都已有章节，走切分链
-        的 add_chapter 会整卷重复建章，所以这里不复用切分写入。
-        每条路径结束时必调 _relay_advance（含失败/放弃），保证接力不断链。
+        与桌面 VolumePage._on_chiter_result 同语义：增量优先，无评估标记降级全量；
+        章数/章序/章名不动，只就地修订章内大纲（update_chapter），不删章不建章——
+        走切分链的 add_chapter 会整卷重复建章，所以不复用切分写入。
+        on_finish：每条路径结束后的收尾（接力 = 推进下一卷；手动 = None），
+        失败 / 放弃 / 无需修订也必调，保证接力不断链。
         """
         from app.core.pipeline import Pipeline, MIN_VOLUME_CHAPTER_CHARS
         from app.core.iter_review import (is_noop_body, match_iter_chapters,
                                           parse_iter_review)
+        finish = on_finish if on_finish is not None else (lambda: None)
 
         def cb(result: dict):
             if not result.get("ok"):
-                self._relay_advance()  # 失败 toast 已在 gen 里统一弹
+                finish()  # 失败 toast 已在 gen 里统一弹
                 return
             text = result.get("text") or ""
             progressed = [c for c in own
@@ -1378,14 +1383,14 @@ class WritingPage:
                 body = (parsed.get("body") or "").strip()
                 if is_noop_body(body):
                     toast(self.page, f"第{n}卷：AI 评估各章均无需修订，原大纲保持不变")
-                    self._relay_advance()
+                    finish()
                     return
                 rev, cerr, _diag = Pipeline.parse_volume_chapters_ex(
                     body, min_chars=MIN_VOLUME_CHAPTER_CHARS)
                 if cerr or not rev:
                     toast(self.page, f"第{n}卷修订内容解析失败：{cerr or '未切出章节'}，"
                                      "该卷已跳过（可到分卷页手动迭代）", error=True)
-                    self._relay_advance()
+                    finish()
                     return
                 matched, unmatched = match_iter_chapters(rev, own)
                 reasons = {it.get("no"): (it.get("reason") or "")
@@ -1414,7 +1419,8 @@ class WritingPage:
                                  "content": u.get("content") or "",
                                  "status": "unknown", "reason": "定位不到原章",
                                  "own_idx": None})
-                self._relay_confirm_sheet(vol, n, own, rows, warn)
+                self._chiter_confirm(vol, n, own, rows, warn, store=store,
+                                     on_finish=on_finish)
                 return
             # ---- 降级全量路径：模型没按两段式输出，走结构冻结校验 ----
             chapters, cerr, _diag = Pipeline.parse_volume_chapters_ex(
@@ -1422,24 +1428,35 @@ class WritingPage:
             if cerr or not chapters:
                 toast(self.page, f"第{n}卷切分解析失败：{cerr or '未切出章节'}，"
                                  "该卷已跳过（可到分卷页手动迭代）", error=True)
-                self._relay_advance()
+                finish()
                 return
             if len(chapters) != len(own):
                 toast(self.page, f"第{n}卷：AI 动了章节结构（原本 {len(own)} 章，"
-                                 f"输出 {len(chapters)} 章）。切章接力只修订章内内容"
+                                 f"输出 {len(chapters)} 章）。切章迭代只修订章内内容"
                                  "（章数/章序/章名不变），该卷已跳过", error=True)
-                self._relay_advance()
+                finish()
                 return
             rows = [{"title": (own[i].get("title") or "").strip()
                      or (chapters[i].get("title") or ""),
                      "content": chapters[i].get("content") or "",
                      "status": "update", "reason": "全量修订", "own_idx": i}
                     for i in range(len(own))]
-            self._relay_confirm_sheet(vol, n, own, rows, warn)
+            self._chiter_confirm(vol, n, own, rows, warn, store=store,
+                                 on_finish=on_finish)
         return cb
 
-    def _relay_confirm_sheet(self, vol: dict, n, own: list, rows: list, warn: str = ""):
-        """接力切章结果确认 sheet：勾选的章就地修订章内大纲，处理完自动开下一卷。"""
+    def _on_relay_result(self, store, vol: dict, own: list, n):
+        """接力专用入口：结果落地后接着推进队列里的下一卷。"""
+        return self._chiter_result(store, vol, own, n,
+                                   on_finish=self._relay_advance)
+
+    def _chiter_confirm(self, vol: dict, n, own: list, rows: list, warn: str = "",
+                        store=None, on_finish=None):
+        """切章迭代结果确认 sheet：勾选的章就地修订章内大纲，处理完调 on_finish。
+
+        store：发起时的项目库（接力中途可能已切项目，写错库就是事故）。
+        """
+        store = store or self.session.store
         pairs = []
         rows_ui = []
         for r in rows:
@@ -1449,6 +1466,10 @@ class WritingPage:
             ck = ft.Checkbox(label=label, value=r.get("status") == "update")
             pairs.append((r, ck))
             rows_ui.append(ck)
+
+        def _finish():
+            if on_finish:
+                on_finish()
 
         def _write(ev):
             self.page.pop_dialog()
@@ -1462,22 +1483,22 @@ class WritingPage:
                 if not new_content or \
                         new_content == str(ch.get("outline_content") or "").strip():
                     continue
-                self.session.store.update_chapter(
+                store.update_chapter(
                     ch["id"], {"outline_content": new_content,
                                "outline_draft": new_content})
                 updated += 1
             toast(self.page, f"第{n}卷已就地修订 {updated} 章的大纲（章数、章名不变）"
                   if updated else "修订内容与现行一致，未做改动")
             self.refresh()
-            self._relay_advance()
+            _finish()
 
         def _cancel(ev):
             self.page.pop_dialog()
-            toast(self.page, f"已放弃第{n}卷的接力修订")
-            self._relay_advance()
+            toast(self.page, f"已放弃第{n}卷的切章修订")
+            _finish()
         self.page.show_dialog(ft.BottomSheet(
             content=ft.Container(ft.Column([
-                ft.Text(f"接力·第{n}卷 切章修订（{len(rows)} 章）", size=15,
+                ft.Text(f"第{n}卷 切章修订（{len(rows)} 章）", size=15,
                         weight=ft.FontWeight.BOLD),
                 hint("勾选的章就地更新章内大纲：章数、章序、章名都不动，不删章不建章。"
                      + warn),
@@ -1492,36 +1513,95 @@ class WritingPage:
     # 页签 2：分卷
     # =====================================================
 
+    # ---------- 分卷页：展开态 / 公共前置 ----------
+
+    def _vol_open(self, vid) -> bool:
+        """该卷是否展开（整页重建后按 _vol_open_ids 恢复）。"""
+        return vid in self._vol_open_ids
+
+    def _vol_toggle_open(self, vid, e=None):
+        """记录 ExpansionTile 展开/收起：refresh() 整页重建，不记就全部收起。"""
+        if e is None:
+            return
+        flag = getattr(e.control, "expanded", None)
+        if flag is None:
+            flag = str(getattr(e, "data", "")).lower() == "true"
+        if flag:
+            self._vol_open_ids.add(vid)
+        else:
+            self._vol_open_ids.discard(vid)
+
+    def _vl_guard(self) -> bool:
+        """分卷页 AI 操作公共前置：自动模式在跑就不许再发请求（双开会打架）。"""
+        if self._ap_running_any():
+            toast(self.page, "⚡ 自动模式正在跑全书流水线，等它停下再操作分卷", error=True)
+            return False
+        return True
+
+    def _ch_rows(self, chs: list) -> list:
+        """卷内章节行：整行可点 → 章名/切分初稿编辑（2026-11-17）。"""
+        return [ft.Container(
+            ft.Row([
+                ft.Container(ft.Text(f"{c.get('order_index', '')}", size=12),
+                             width=28, alignment=ft.Alignment.CENTER),
+                ft.Text(c.get("title") or "未命名", size=13, expand=True),
+                ft.Container(ft.Text(c.get("status", ""), size=10),
+                             bgcolor=ft.Colors.with_opacity(
+                                 0.14, STATUS_COLORS.get(c.get("status"), ft.Colors.GREY)),
+                             border_radius=6,
+                             padding=ft.Padding(left=6, right=6, top=2, bottom=2)),
+            ]),
+            padding=ft.Padding(left=8, right=8, top=5, bottom=5),
+            on_click=lambda e, cc=dict(c): self._chapter_sheet(cc),
+            ink=True, border_radius=T.R_SM,
+        ) for c in chs]
+
     def _volumes_view(self) -> ft.Control:
         store = self.session.store
         volumes = store.list_volumes()
         chapters = store.list_chapters()
+
+        # 卷级动作常驻页顶（空态也要有，否则新建卷没有入口）
+        actions = T.button_row(
+            T.tonal("＋ 新增卷", on_click=lambda e: self._volume_add()),
+            T.ghost("导入总纲", on_click=lambda e: self._volume_import()),
+            T.ghost("重建分段", on_click=lambda e: self._volume_rebuild()),
+        )
         if not volumes and not chapters:
             return ft.Column([
-                empty("还没有分卷\n锁定总纲后自动导入分卷，再逐卷「AI 切分章节」"),
-            ], scroll=ft.ScrollMode.AUTO, expand=True)
+                actions,
+                empty("还没有分卷\n新增一卷，或用总纲锁定自动导入（也可点「导入总纲」）"),
+            ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=T.GAP_S)
+
         tiles = []
         for v in volumes:
             vchs = sorted((c for c in chapters if c.get("volume_id") == v["id"]),
                           key=lambda c: c.get("order_index") or 0)
-            rows = []
-            for c in vchs:
-                rows.append(ft.Container(
-                    ft.Row([
-                        ft.Container(ft.Text(f"{c.get('order_index', '')}", size=12),
-                                     width=28, alignment=ft.Alignment.CENTER),
-                        ft.Text(c.get("title") or "未命名", size=13, expand=True),
-                        ft.Container(ft.Text(c.get("status", ""), size=10),
-                                     bgcolor=ft.Colors.with_opacity(
-                                         0.14, STATUS_COLORS.get(c.get("status"),
-                                                                 ft.Colors.GREY)),
-                                     border_radius=6, padding=ft.Padding(left=6, right=6, top=2, bottom=2)),
-                    ]), padding=ft.Padding(left=8, right=8, top=5, bottom=5)))
+            rows = self._ch_rows(vchs)
             if not vchs:
                 rows.append(ft.Container(
                     ft.Text("本卷还没有切分章节", size=12,
                             color=ft.Colors.ON_SURFACE_VARIANT),
                     padding=10))
+            ops = ft.Column([
+                ft.Row([T.primary("AI 切分本卷章节", icon=ft.Icons.CALL_SPLIT,
+                                  on_click=lambda e, vv=v: self._volume_split(vv),
+                                  expand=True)]),
+                T.button_row(
+                    T.tonal("迭代本卷切分",
+                            on_click=lambda e, vv=v: self._vol_iterate_chapters(vv)),
+                    T.ghost("本卷操作", icon=ft.Icons.TUNE,
+                            on_click=lambda e, vv=v: self._vol_ops_sheet(vv)),
+                ),
+            ], spacing=T.GAP_S)
+            # 宽屏（平板）下按钮拉满整行会显得空旷：限宽 560 靠左（Row 包一层才
+            # 能被推到左边，直接给 Container 宽度会被 ExpansionTile 的 Column 居中）
+            ops_pad = ft.Padding(left=4, right=4, top=T.GAP_S, bottom=T.GAP_XS)
+            if T.is_wide(self.page):
+                ops_box = ft.Row([ft.Container(ops, width=560, padding=ops_pad)],
+                                 alignment=ft.MainAxisAlignment.START)
+            else:
+                ops_box = ft.Container(ops, padding=ops_pad)
             tiles.append(ft.ExpansionTile(
                 title=ft.Text(f"第{v.get('order_index')}卷 {v.get('title') or '未命名'}"
                               f"（{len(vchs)}章）", size=14,
@@ -1530,24 +1610,552 @@ class WritingPage:
                                  overflow=ft.TextOverflow.ELLIPSIS)
                 if v.get("summary") else None,
                 maintain_state=True,
-                controls=rows + [ft.Container(
-                    ft.FilledTonalButton("AI 切分本卷章节",
-                                         on_click=lambda e, vv=v: self._volume_split(vv),
-                                         icon=ft.Icons.CALL_SPLIT),
-                    padding=8)]))
-        # 未分卷章节
+                expanded=self._vol_open(v["id"]),
+                on_change=lambda e, vv=v: self._vol_toggle_open(vv["id"], e),
+                controls=rows + [ops_box]))
+        # 未分卷章节（同样可点开编辑）
         loose = [c for c in chapters if c.get("volume_id") is None]
         if loose:
-            rows = [ft.Container(ft.Row([
-                ft.Container(ft.Text(f"{c.get('order_index', '')}", size=12), width=28,
-                             alignment=ft.Alignment.CENTER),
-                ft.Text(c.get("title") or "未命名", size=13, expand=True),
-                ft.Text(c.get("status", ""), size=10,
-                        color=STATUS_COLORS.get(c.get("status"), ft.Colors.GREY)),
-            ]), padding=ft.Padding(left=8, right=8, top=5, bottom=5)) for c in loose]
             tiles.append(ft.ExpansionTile(
-                title=ft.Text(f"未分卷（{len(loose)}章）", size=14), controls=rows))
-        return ft.Column(tiles, scroll=ft.ScrollMode.AUTO, expand=True, spacing=4)
+                title=ft.Text(f"未分卷（{len(loose)}章）", size=14),
+                maintain_state=True,
+                controls=self._ch_rows(loose)))
+        return ft.Column([actions] + tiles, scroll=ft.ScrollMode.AUTO,
+                         expand=True, spacing=T.GAP_S)
+
+    # ---------- 分卷页：卷级增删移 + 总纲回写 ----------
+
+    def _vol_after_write(self, *, pushed: dict = None, sync: dict = None):
+        """分卷写库后的统一收尾：返回 (toast 尾缀, 需要重建总纲段的原因)。
+
+        pushed = save_volume / AI 迭代后 push_volume_to_synopsis_ex 的结果；
+        sync   = insert/delete/reorder 内部自动同步的结果（store.last_section_sync）。
+        调用方顺序固定：写库 → 本函数 → refresh()/toast → _vol_ask_rebuild(reason)。
+        绝不静默失败（对齐桌面 VolumePage._push_to_synopsis）。
+        """
+        res = pushed if pushed is not None else (sync or {})
+        if not res:
+            return "", ""
+        if res.get("ok"):
+            if pushed is None:
+                return "；总纲分卷区已同步", ""
+            tail = "（本卷原有段落缺失，已补齐）" if res.get("created_section") else ""
+            return f"；已写回总纲本卷段{tail}", ""
+        if res.get("reason") == "no_synopsis":
+            return "", ""
+        if res.get("needs_rebuild"):
+            return "；总纲分卷段需重建", (res.get("reason") or "格式不识别")
+        if res.get("reason") == "empty_summary":
+            return "；描述为空，未写回总纲", ""
+        return f"；未写回总纲（{res.get('reason') or '未知原因'}）", ""
+
+    def _vol_ask_rebuild(self, reason: str):
+        """总纲分卷段写不回去时的可见降级（重建 / 保持原样）。
+
+        对齐桌面 _offer_section_rebuild：分卷库已保存，只提示总纲文本仍是旧的，
+        由用户明确点「重建」才改写总纲分卷段（整体层原文不动）。
+        """
+        if not reason:
+            return
+
+        def _yes():
+            res = self.session.store.sync_synopsis_volume_sections(op="rebuild")
+            ok = bool(res.get("ok"))
+            toast(self.page, "已按当前分卷重建总纲分卷区" if ok
+                  else f"重建失败：{res.get('reason') or '未知原因'}", error=not ok)
+            self.refresh()
+
+        confirm(self.page, "总纲分卷段需要重建",
+                f"总纲里的分卷段无法自动同步（{reason}）。\n\n"
+                "分卷库的改动已经保存，但总纲页显示的仍是旧文本。\n\n"
+                "点「重建」= 按当前分卷重写分卷段（整体层原文保留，分卷标题改成标准"
+                "「### 分卷N：卷名」）；点「取消」= 保持原样，稍后在总纲页手动调整。",
+                _yes, yes_text="重建")
+
+    def _vol_write(self, vol: dict, title: str, summary: str):
+        """保存卷名+描述并写回总纲本卷段。返回 (toast 文案, 需重建原因)。"""
+        store = self.session.store
+        saved = store.save_volume({"id": vol["id"],
+                                   "title": (title or "").strip() or "未命名分卷",
+                                   "summary": (summary or "").strip()})
+        pushed = store.push_volume_to_synopsis_ex(vol["id"])
+        suffix, reason = self._vol_after_write(pushed=pushed)
+        ver = (saved or {}).get("version")
+        note = f"第{vol.get('order_index')}卷已保存（卷名+描述）"
+        if ver:
+            note += f" · v{ver}"
+        return note + suffix, reason
+
+    def _volume_add(self):
+        store = self.session.store
+        name = T.field(hint="如 入局", autofocus=True)
+
+        def _ok(ev):
+            self.page.pop_dialog()
+            title = (name.value or "").strip() or "未命名分卷"
+            v = store.insert_volume(len(store.list_volumes()) + 1,
+                                    {"title": title, "summary": ""})
+            self._vol_open_ids.add(v["id"])
+            suffix, reason = self._vol_after_write(sync=store.last_section_sync)
+            self.refresh()
+            toast(self.page, f"已新增第{v.get('order_index')}卷「{title}」{suffix}")
+            self._vol_ask_rebuild(reason)
+
+        T.sheet(self.page, "新增分卷", [
+            T.field_group(name, "卷名", "留空记为「未命名分卷」，随后在「本卷操作」里改"),
+        ], actions=T.action_row(self.page, T.primary("新增", on_click=_ok)))
+
+    def _volume_import(self):
+        """从当前总纲幂等导入分卷（不删已有卷、不动章节归属）。"""
+        from app.core.pipeline import Pipeline
+        store = self.session.store
+        s = store.current_synopsis()
+        content = (s.get("content") if s else "") or ""
+        if not content.strip():
+            toast(self.page, "还没有总纲：先在总纲页生成并保存", error=True)
+            return
+        parsed = Pipeline.parse_synopsis_volumes(content)
+        vols = (parsed or {}).get("volumes") or []
+        if not vols:
+            toast(self.page, "总纲里没识别到「### 分卷」标记，无法导入（可用「＋ 新增卷」）",
+                  error=True)
+            return
+
+        def _yes():
+            imported = store.sync_volumes_from_synopsis(vols)
+            self.refresh()
+            toast(self.page, f"已从总纲导入 {len(imported)} 卷"
+                             "（已有卷按总纲更新，旧版进「版本历史」）")
+
+        confirm(self.page, "从总纲导入分卷",
+                f"总纲里识别到 {len(vols)} 卷。导入是幂等的：已有卷按总纲内容覆盖"
+                "（旧版自动进「版本历史」），缺少的卷追加；不删卷、不动章节归属。",
+                _yes, yes_text="导入")
+
+    def _volume_rebuild(self):
+        """手动出口：按当前分卷库重写总纲分卷段（总纲段错位时用）。"""
+        store = self.session.store
+        s = store.current_synopsis()
+        if not ((s or {}).get("content") or "").strip():
+            toast(self.page, "还没有总纲，无需重建", error=True)
+            return
+
+        def _yes():
+            res = store.sync_synopsis_volume_sections(op="rebuild")
+            ok = bool(res.get("ok"))
+            self.refresh()
+            toast(self.page, "已按当前分卷重建总纲分卷区" if ok
+                  else f"重建失败：{res.get('reason') or '未知原因'}", error=not ok)
+
+        confirm(self.page, "重建总纲分卷区",
+                "按当前分卷库重写总纲里的分卷段：整体层原文保留，分卷标题改成标准"
+                "「### 分卷N：卷名」格式，卷内容取分卷库现行。\n\n"
+                "只在总纲分卷段错位、或写入总纲失败时用；正常情况不需要。",
+                _yes, yes_text="重建")
+
+    def _volume_move(self, vol: dict, delta: int):
+        store = self.session.store
+        ids = [v["id"] for v in store.list_volumes()]
+        try:
+            i = ids.index(vol["id"])
+        except ValueError:
+            return
+        j = i + delta
+        if j < 0 or j >= len(ids):
+            return
+        ids[i], ids[j] = ids[j], ids[i]
+        store.reorder_volumes(ids)
+        suffix, reason = self._vol_after_write(sync=store.last_section_sync)
+        self.refresh()
+        toast(self.page, f"第{vol.get('order_index')}卷已"
+                         f"{'上移' if delta < 0 else '下移'}{suffix}")
+        self._vol_ask_rebuild(reason)
+
+    def _volume_delete(self, vol: dict):
+        def _yes():
+            store = self.session.store
+            store.delete_volume(vol["id"])
+            self._vol_open_ids.discard(vol["id"])
+            suffix, reason = self._vol_after_write(sync=store.last_section_sync)
+            self.refresh()
+            toast(self.page, f"第{vol.get('order_index')}卷已删除"
+                             "（章节归入未分卷）" + suffix)
+            self._vol_ask_rebuild(reason)
+
+        confirm(self.page, "删除分卷",
+                f"删除「{vol.get('title') or '未命名'}」？\n"
+                "其下章节会归入「未分卷」（不删章节数据），后续卷号自动回补。",
+                _yes, yes_text="删除")
+
+    # ---------- 分卷页：本卷操作面板（A 档） ----------
+
+    def _vol_ops_sheet(self, vol: dict):
+        """本卷操作：卷名/描述、AI 迭代、版本历史、卷序、删除、粘贴成章。
+
+        单层 BottomSheet，版本历史在同一层内切视图——叠两层 BottomSheet 在安卓
+        会留遮罩残影（见 docs/分卷页手机版补齐方案.md D5）。
+        """
+        store = self.session.store
+        vols = store.list_volumes()
+        cur_vol = store.get_volume(vol["id"]) or vol
+        n = cur_vol.get("order_index") or 1
+        idx = next((i for i, v in enumerate(vols) if v["id"] == cur_vol["id"]), 0)
+        last = len(vols) - 1
+
+        title_f = T.field(value=cur_vol.get("title") or "", hint="卷名")
+        summary_f = T.field(value=cur_vol.get("summary") or "", multiline=True,
+                            min_lines=6, max_lines=6,
+                            hint="本卷主线与情节概要：AI 切章 / 细化大纲时锚定这一卷")
+        holder = ft.Column([], spacing=T.GAP_M, tight=True)
+
+        def _save(ev):
+            self.page.pop_dialog()
+            note, reason = self._vol_write(cur_vol, title_f.value or "",
+                                           summary_f.value or "")
+            self.refresh()
+            toast(self.page, note)
+            self._vol_ask_rebuild(reason)
+
+        def _iterate(ev):
+            summary = (summary_f.value or "").strip()
+            if not summary:
+                toast(self.page, "本卷还没有分卷描述：先写一段再迭代（描述为空 AI 无从下手）",
+                      error=True)
+                return
+            self.page.pop_dialog()
+            self._vol_iterate(cur_vol,
+                              (title_f.value or "").strip() or (cur_vol.get("title") or ""),
+                              summary)
+
+        def _paste(ev):
+            self.page.pop_dialog()
+            self._vol_paste_chapters(cur_vol)
+
+        def _move(delta):
+            def _go(ev):
+                self.page.pop_dialog()
+                self._volume_move(cur_vol, delta)
+            return _go
+
+        def _delete(ev):
+            self.page.pop_dialog()
+            self._volume_delete(cur_vol)
+
+        def _main():
+            return [
+                T.field_group(title_f, "卷名"),
+                T.field_group(summary_f, "分卷描述",
+                              "AI 切章 / 细化大纲 / 写正文时锚定这一卷；改完点保存"),
+                T.button_row(
+                    T.primary("保存卷名+描述", on_click=_save),
+                    T.tonal("AI 迭代本卷", on_click=_iterate),
+                ),
+                T.divider(),
+                T.button_row(
+                    T.ghost("版本历史", on_click=lambda e: _versions()),
+                    T.ghost("粘贴章节文本", on_click=_paste),
+                ),
+                T.button_row(
+                    T.ghost("上移", on_click=_move(-1), disabled=idx == 0),
+                    T.ghost("下移", on_click=_move(1), disabled=idx >= last),
+                    T.ghost("删除本卷", on_click=_delete),
+                ),
+            ]
+
+        def _versions():
+            versions = store.list_volume_versions(cur_vol["id"])
+            if not versions:
+                toast(self.page, "本卷还没有历史版本（内容被改过或迭代后自动留档）")
+                return
+            base = versions[0]
+            preview = ft.TextField(
+                value=f"卷名：{base.get('title') or ''}\n\n"
+                      f"分卷描述：\n{base.get('summary') or ''}",
+                multiline=True, min_lines=8, max_lines=8, read_only=True,
+                text_size=12, border_color=ft.Colors.TRANSPARENT)
+            pick = {"v": base}
+            radios = ft.RadioGroup(
+                value=str(base["version"]),
+                content=ft.Column([
+                    ft.Radio(value=str(v["version"]),
+                             label=f"v{v['version']} ｜ {(v.get('created_at') or '')[:16]} ｜ "
+                                   f"{v.get('title') or '未命名'}")
+                    for v in versions
+                ], scroll=ft.ScrollMode.AUTO,
+                    height=min(176, 40 * len(versions) + 8)))
+
+            def _changed(ev):
+                try:
+                    ver = int(radios.value)
+                except (TypeError, ValueError):
+                    return
+                v = next((x for x in versions if int(x["version"]) == ver), None)
+                if not v:
+                    return
+                pick["v"] = v
+                preview.value = (f"卷名：{v.get('title') or ''}\n\n"
+                                 f"分卷描述：\n{v.get('summary') or ''}")
+                self.page.update()
+
+            radios.on_change = _changed
+
+            def _back(ev):
+                holder.controls = _main()
+                self.page.update()
+
+            def _load(ev):
+                v = pick["v"]
+                title_f.value = v.get("title") or ""
+                summary_f.value = v.get("summary") or ""
+                holder.controls = _main()
+                self.page.update()
+                toast(self.page, f"已载入 v{v['version']} 到编辑框，"
+                                 "点「保存卷名+描述」生效")
+
+            holder.controls = [
+                ft.Row([T.ghost("← 返回", on_click=_back)]),
+                T.hint_text(f"当前 v{cur_vol.get('version', 1)}"
+                            f"《{cur_vol.get('title') or '未命名'}》。载入历史版本后要点"
+                            "「保存」才生效，当前版会自动再存一份历史。", size=11),
+                radios,
+                ft.Container(preview, height=190),
+                T.button_row(T.primary("载入选中版本", on_click=_load)),
+            ]
+
+        holder.controls = _main()
+        T.sheet(self.page, f"第{n}卷 · {cur_vol.get('title') or '未命名'}", [holder],
+                height=self._dlg_h(720),
+                actions=T.action_row(self.page, None, cancel_text="关闭"))
+
+    # ---------- 分卷页：AI 迭代本卷（描述迭代） ----------
+
+    def _vol_iterate(self, vol: dict, title: str, summary: str):
+        """AI 迭代本卷：按修改意见出 1 个修订方案（与桌面单方案化同口径）。"""
+        if not self._vl_guard():
+            return
+        route = self.session.store.get_route("volume_iter")
+        if not route or not route.get("profile_id"):
+            toast(self.page, "「分卷迭代」角色还没绑定模型：到「模型」页给它选一个档案",
+                  error=True)
+            return
+        fb_f = T.field(multiline=True, min_lines=4, max_lines=4,
+                       hint="改本卷主线、增删关键情节、换冲突设计、调卷末钩子…")
+
+        def _ok(ev):
+            fb = (fb_f.value or "").strip()
+            self.page.pop_dialog()
+            self._do_vol_iterate(vol, title, summary, fb)
+
+        T.sheet(self.page, "AI 迭代本卷", [
+            T.hint_text("只改这一卷的卷名与描述，不动其他卷；结果先出预览，点采用才落库。",
+                        size=11),
+            T.field_group(fb_f, "修改意见", "不写也行——AI 会按本卷现状做一轮打磨"),
+        ], actions=T.action_row(self.page, T.primary("生成修订版", on_click=_ok)))
+
+    def _do_vol_iterate(self, vol: dict, title: str, summary: str, fb: str):
+        from app.core.pipeline import Pipeline
+        from app.core.task_templates import render as render_task, single_plan_task
+        store = self.session.store
+        current = f"卷名：{title}\n分卷描述：\n{summary}"
+        n = vol.get("order_index") or 1
+        task = render_task("volume_iter", store, n=1, current=current, feedback=fb,
+                           volume_no=n, volume_count=len(store.list_volumes()))
+        task = single_plan_task(task, heading="# 方案一：修订后卷名", noun="修订方案",
+                                detail="标题下直接写修订后的本卷描述，")
+        close_running = None
+
+        def on_started(tk):
+            nonlocal close_running
+            close_running = self._running(tk, "AI 迭代本卷…")
+
+        def on_done(result):
+            if close_running:
+                close_running()
+            if not result.get("ok"):
+                return
+            cands, err = Pipeline.parse_volume_candidates(result.get("text") or "")
+            if err or not cands:
+                toast(self.page, f"修订解析失败：{err or '结果为空'}", error=True)
+                return
+            self._vol_iter_preview(store, vol, cands, n)
+
+        start_generation(self.page, self.session, role="volume_iter",
+                         context={"volume_id": vol["id"],
+                                  "user_req": f"本卷现状：\n{current}\n\n修改意见：\n{fb}"},
+                         task=task, title=f"迭代分卷·第{n}卷", on_done=on_done,
+                         on_started=on_started)
+
+    def _vol_iter_preview(self, store, vol: dict, cands: list, n: int):
+        """修订结果预览（单方案，可微调）：点采用才落库为新版本（旧版进历史）。"""
+        c0 = cands[0] if cands else {}
+        new_title = (c0.get("title") or "").strip() or (vol.get("title") or "")
+        body = ft.TextField(value=c0.get("content") or "", multiline=True,
+                            min_lines=12, max_lines=12, text_size=12)
+
+        def _apply(ev):
+            self.page.pop_dialog()
+            saved = store.save_volume({"id": vol["id"], "title": new_title,
+                                       "summary": (body.value or "").strip()})
+            pushed = store.push_volume_to_synopsis_ex(vol["id"])
+            suffix, reason = self._vol_after_write(pushed=pushed)
+            ver = (saved or {}).get("version")
+            self.refresh()
+            toast(self.page, f"已迭代第{n}卷并保存为新版本"
+                             + (f"（v{ver}）" if ver else "")
+                             + "，旧版在「版本历史」" + suffix)
+            self._vol_ask_rebuild(reason)
+
+        T.sheet(self.page, f"本次修订结果 · 第{n}卷", [
+            T.hint_text(f"新卷名：{new_title}。确认后立即保存为新版本，旧版进「版本历史」；"
+                        "预览可直接微调。", size=11),
+            ft.Container(body, height=300),
+        ], height=self._dlg_h(560),
+            actions=T.action_row(self.page, T.primary("采用并保存", on_click=_apply)))
+
+    # ---------- 分卷页：迭代本卷切分（手动入口，B 档） ----------
+
+    def _chiter_current(self, own: list) -> str:
+        """本卷现有章节切分快照（喂给 volume_chapters_iter 的 current）。"""
+        return "\n\n".join(
+            f"## 第{i}章：{(c.get('title') or '').strip() or '未命名'}\n"
+            + (str(c.get("outline_content") or c.get("outline_draft") or "").strip()
+               or "（本章无大纲）")
+            for i, c in enumerate(own, 1))
+
+    def _vol_iterate_chapters(self, vol: dict):
+        """迭代本卷切分：本卷现有章节整体 + 修改意见 → 就地修订章内要点。
+
+        与桌面 VolumePage._iterate_chapters 同口径（结构冻结）：章数 / 章序 / 章名
+        不动，只改每章内部的 ①② 情节点；落库 = 逐章 update_chapter，不删章不建章。
+        """
+        if not self._vl_guard():
+            return
+        store = self.session.store
+        own = [c for c in store.list_chapters() if c.get("volume_id") == vol["id"]]
+        if not own:
+            toast(self.page, "本卷还没有章节：先用「AI 切分本卷章节」切出章，再迭代",
+                  error=True)
+            return
+        route = store.get_route("volume_chapters_iter")
+        if not route or not route.get("profile_id"):
+            toast(self.page, "「分卷切章迭代」角色还没绑定模型：到「模型」页给它选一个档案",
+                  error=True)
+            return
+        fb_f = T.field(multiline=True, min_lines=4, max_lines=4,
+                       hint="如：本卷节奏太赶，把第2章展开；第4章结尾钩子太弱…")
+
+        def _ok(ev):
+            fb = (fb_f.value or "").strip()
+            self.page.pop_dialog()
+            if not fb:
+                toast(self.page, "写一句修改意见再迭代（不然 AI 不知道改什么）", error=True)
+                return
+            self._do_vol_iterate_chapters(store, vol, own, fb)
+
+        T.sheet(self.page, f"迭代本卷切分 · 第{vol.get('order_index')}卷", [
+            T.hint_text("章数、章序、章名不动，只改每章内部的 ①② 要点；"
+                        "已写细纲 / 正文的章更新后需重做。", size=11),
+            T.field_group(fb_f, "修改意见",
+                          "增/减章数、合并相邻章、调情节重心、修章末钩子…"),
+        ], actions=T.action_row(self.page, T.primary("开始迭代", on_click=_ok)))
+
+    def _do_vol_iterate_chapters(self, store, vol: dict, own: list, fb: str):
+        from app.core.task_templates import render as render_task
+        n = vol.get("order_index") or 1
+        current = self._chiter_current(own)
+        task = render_task("volume_chapters_iter", store, current=current, feedback=fb,
+                           volume_no=n, volume_count=len(store.list_volumes()))
+        close_running = None
+
+        def on_started(tk):
+            nonlocal close_running
+            close_running = self._running(tk, "迭代本卷切分…")
+
+        def on_done(result):
+            if close_running:
+                close_running()
+            self._chiter_apply(store, vol, own, n, result, on_finish=None)
+
+        start_generation(self.page, self.session, role="volume_chapters_iter",
+                         context={"volume_id": vol["id"],
+                                  "user_req": f"本卷现有章节切分：\n{current}\n\n"
+                                              f"修改意见：\n{fb}"},
+                         task=task, title=f"迭代切分·第{n}卷", on_done=on_done,
+                         on_started=on_started)
+
+    # ---------- 分卷页：粘贴章节文本（不走 AI，B 档） ----------
+
+    def _vol_paste_chapters(self, vol: dict):
+        text_f = T.field(multiline=True, min_lines=12, max_lines=12,
+                         hint="## 第1章：章名\n\n① 第一个情节点…\n\n## 第2章：章名")
+
+        def _ok(ev):
+            text = text_f.value or ""
+            self.page.pop_dialog()
+            self._vol_apply_chapters(vol, text)
+
+        T.sheet(self.page, f"粘贴章节文本 · 第{vol.get('order_index')}卷", [
+            T.hint_text("每章用「## 第N章：章名」起头（「第N章：章名」独立成行也认）；"
+                        "识别后逐章勾选，确认了才写入本卷。", size=11),
+            T.field_group(text_f, "章节文本", "自己写的、别处生成的都行，不走 AI"),
+        ], height=self._dlg_h(640),
+            actions=T.action_row(self.page, T.primary("识别", on_click=_ok)))
+
+    def _vol_apply_chapters(self, vol: dict, text: str):
+        """章节文本落地：识别 → 勾选确认 → 写入本卷（与 AI 切分共用识别口径）。"""
+        from app.core.pipeline import Pipeline, MIN_VOLUME_CHAPTER_CHARS
+        if not (text or "").strip():
+            toast(self.page, "文本为空", error=True)
+            return
+        chapters, err, _diag = Pipeline.parse_volume_chapters_ex(
+            text, min_chars=MIN_VOLUME_CHAPTER_CHARS)
+        if err or not chapters:
+            toast(self.page, f"识别失败：{err or '没切出章节'}\n"
+                             "检查每章是否都有「## 第N章：章名」标题", error=True)
+            return
+        self._confirm_chapters(vol, chapters, title=f"识别结果：{len(chapters)} 章")
+
+    # ---------- 分卷页：章节编辑（章名 + 切分初稿） ----------
+
+    def _chapter_sheet(self, ch: dict):
+        """章节编辑：章名 + 切分初稿（①② 序号点）。
+
+        与桌面 _edit_card 同口径：已细化的章只改初稿（outline_content 保留细化稿），
+        未细化的章两者同写（大纲页同步看到新内容）。
+        """
+        from app.core.chapter_outline import outline_draft_text
+        store = self.session.store
+        cid = ch.get("id")
+        full = store.get_chapter(cid) if cid else None
+        if not full:
+            toast(self.page, "章节已不存在", error=True)
+            return
+        refined = bool(full.get("outline_refined"))
+        title_f = T.field(value=full.get("title") or "", hint="章名")
+        draft_f = T.field(value=outline_draft_text(full), multiline=True,
+                          min_lines=14, max_lines=14,
+                          hint="① 情节点…")
+
+        def _save(ev):
+            self.page.pop_dialog()
+            patch = {"title": (title_f.value or "").strip() or "未命名章节",
+                     "outline_draft": draft_f.value or ""}
+            if not refined:
+                patch["outline_content"] = draft_f.value or ""
+            store.update_chapter(cid, patch)
+            self.refresh()
+            toast(self.page, f"第{full['order_index']}章已保存"
+                             + ("（已细化，只更新切分初稿）" if refined
+                                else "（大纲页同步更新）"))
+
+        T.sheet(self.page, f"第{full.get('order_index')}章 · "
+                           f"{full.get('title') or '未命名'}", [
+            T.hint_text("本章已细化：保存只更新「切分初稿」，细化后的大纲不变。" if refined
+                        else "本章尚未细化：保存后大纲页同步更新。", size=11),
+            T.field_group(title_f, "章名"),
+            T.field_group(draft_f, "切分初稿（①② 序号点）"),
+        ], height=self._dlg_h(640),
+            actions=T.action_row(self.page, T.primary("保存", on_click=_save)))
 
     def _volume_split(self, vol: dict):
         store = self.session.store
@@ -1608,8 +2216,8 @@ class WritingPage:
                          context={"volume_id": vol["id"]}, task=task,
                          title="分卷切章", on_done=on_done, on_started=on_started)
 
-    def _confirm_chapters(self, vol: dict, chapters: list):
-        """切章结果确认：勾选后写入。"""
+    def _confirm_chapters(self, vol: dict, chapters: list, title: str = "切分结果"):
+        """切章/粘贴结果确认：勾选后写入（AI 切分与粘贴共用，title 只改标题行）。"""
         store = self.session.store
         checks = [ft.Checkbox(label=f"{c.get('title', '')}", value=True) for c in chapters]
 
@@ -1621,6 +2229,7 @@ class WritingPage:
                 return
             for c in picked:
                 store.add_chapter({**c, "status": "有大纲", "volume_id": vol["id"]})
+            self._vol_open_ids.add(vol["id"])
             toast(self.page, f"第{vol.get('order_index')}卷已写入 {len(picked)} 章")
             self.refresh()
 
@@ -1628,7 +2237,7 @@ class WritingPage:
             self.page.pop_dialog()
         self.page.show_dialog(ft.BottomSheet(
             content=ft.Container(ft.Column([
-                ft.Text(f"切分结果：{len(chapters)} 章（勾选要写入的）", size=15,
+                ft.Text(f"{title}（{len(chapters)} 章，勾选要写入的）", size=15,
                         weight=ft.FontWeight.BOLD),
                 ft.Column(checks, scroll=ft.ScrollMode.AUTO, height=340),
                 ft.Row([ft.TextButton("取消", on_click=_cancel),

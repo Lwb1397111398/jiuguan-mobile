@@ -1,0 +1,8 @@
+# -*- coding: utf-8 -*-
+# 运行时依赖（打进 APK 的包）—— 与开发依赖分开。
+# 版本取自 2026-11-17 已实测环境（Python 3.12.10）；与 pyproject.toml
+# 的 >= 范围配合：CI 用 -c constraints.txt + PIP_CONSTRAINT 把实际解析
+# 钉在这批版本上，避免 flet build apk 拉到未实测的新版。
+#   pip install -c constraints.txt -r requirements-dev.txt
+flet==0.86.5
+requests==2.34.2

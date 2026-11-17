@@ -11,6 +11,13 @@
   推送前把云端旧版归档进 history（保留 N 版），拉取前把本机旧库存进
   `backups/sync_overwrite_*.db`。
 
+## 覆盖前必须留后悔药（2026-11-17）
+- `history_keep > 0` 时，归档失败 = `ArchiveFailed` → **中止本次覆盖**，
+  云端数据对象与 manifest 一个字节都不动（`copy` 不上就流式下载再上传，
+  不按体积放弃）。`history_keep = 0` 是用户明确「关闭云端历史」，不算失败。
+- 拉取（整表替换）前先 VACUUM INTO 全量快照，快照失败 = `SnapshotFailed`
+  → **禁止 merge**；全局库同理，且**绝不用 copy2 复制正在写 WAL 的 app.db**。
+
 ## 云端布局
 ```
 jiuguan-sync/v1/
@@ -94,6 +101,23 @@ class NeedPassword(Exception):
     """本机没有可用的同步密钥（首次使用 / 换了机器 / DPAPI 失效）。"""
 
 
+class ArchiveFailed(Exception):
+    """覆盖云端前「留后悔药」失败。
+
+    语义（2026-11-17 老板定）：`history_keep > 0` 就意味着「覆盖必须可反悔」，
+    所以归档失败**一律抛它**，调用方必须放弃本次覆盖——云端的数据对象与
+    manifest 都不许动。宁可这一次没同步成功，也不能把旧版覆盖掉却没处找回。
+    """
+
+
+class SnapshotFailed(Exception):
+    """覆盖本机库之前留快照失败。
+
+    同一条道理：拉取是整表替换，没有快照就等于把本机旧版直接烧掉。
+    快照失败一律禁止 merge（本机与云端都不动）。
+    """
+
+
 class NotConfigured(Exception):
     """连接参数不全或云端未初始化。"""
 
@@ -130,6 +154,32 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def verify_snapshot(path: str) -> tuple:
+    """校验一个已落地的库快照「能打开、结构完整」。返回 (ok, 说明)。
+
+    后悔药也必须验：VACUUM INTO 在磁盘写满/杀毒锁文件时会留下一个 0 字节或
+    半截文件，拿它当备份等于没有备份，还让人误以为安全。
+    """
+    if not os.path.isfile(path):
+        return False, "文件不存在"
+    if os.path.getsize(path) <= 0:
+        return False, "文件为空"
+    try:
+        con = sqlite3.connect(path)
+    except sqlite3.Error as e:
+        return False, "打不开：" + str(e)[:100]
+    try:
+        rows = con.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as e:
+        return False, "完整性检查失败：" + str(e)[:100]
+    finally:
+        con.close()
+    text = " ".join(str(r[0]) for r in rows).strip()
+    if text.lower() != "ok":
+        return False, "完整性检查未通过：" + text[:140]
+    return True, "ok"
+
+
 def read_meta_ro(db_path: str) -> dict:
     """只读打开一个 project.db 只取 meta（不建库、不跑迁移、不写 WAL）。"""
     if not os.path.isfile(db_path):
@@ -144,6 +194,30 @@ def read_meta_ro(db_path: str) -> dict:
         return {str(k): str(v) for k, v in rows}
     except sqlite3.Error:
         return {}
+    finally:
+        con.close()
+
+
+def _read_global_setting(key: str):
+    """只读全局设置（app.db 的 meta 里 `global_setting_<key>`），没有返回 ""。
+
+    同步引擎会被后台线程频繁构造（心跳/自动推送），不能为了读一个开关去
+    `GlobalStore.default()`：那会跑迁移、自愈、备份，还留下按路径单例的连接。
+    """
+    path = os.path.join(app_data_dir(), "app.db")
+    if not os.path.isfile(path):
+        return ""
+    uri = "file:%s?mode=ro" % path.replace("\\", "/")
+    try:
+        con = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return ""
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key=?",
+                          ("global_setting_" + key,)).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+    except sqlite3.Error:
+        return ""
     finally:
         con.close()
 
@@ -222,10 +296,24 @@ class SyncEngine:
     def __init__(self, cfg: dict = None, state: dict = None, log=None,
                  progress=None):
         self.cfg = cfg if cfg is not None else sync_config.load_config()
+        self._fill_history_keep()
         self.state = state if state is not None else sync_config.load_state()
         self.log = log or sync_config.SyncLog()
         self.progress = progress or (lambda msg: None)
         self._cli = None
+
+    def _fill_history_keep(self) -> None:
+        """cfg 没带 history_keep 时，从全局设置补齐。
+
+        后台自动同步（桌面 `main_window` 心跳 / 手机 `sync_ui.Watcher`）都是
+        `SyncEngine()`，cfg 里没有这一项——不补的话「关闭云端历史」就只在设置页
+        那次手动同步生效，后台仍按默认 5 版归档：用户明确关了历史却还在偷偷往
+        云端写（2026-11-17 修）。
+        """
+        if self.cfg.get("history_keep") not in (None, ""):
+            return
+        raw = _read_global_setting("sync_history_keep")
+        self.cfg["history_keep"] = str(raw) if raw not in (None, "") else HISTORY_DEFAULT
 
     # ---------- 基础设施 ----------
 
@@ -355,39 +443,119 @@ class SyncEngine:
 
     # ---------- 历史版本 ----------
 
-    def archive_remote(self, uid: str, manifest: dict) -> None:
-        """把云端当前版本归档进 history，再裁剪到 N 版。失败只记日志，不阻断同步。"""
+    def history_keep(self) -> int:
+        """云端保留几份历史。`0` 是用户明确选择「关闭云端历史」，不是缺省值。
+
+        ⚠ 别写 `int(cfg.get("history_keep") or HISTORY_DEFAULT)`：界面传下来的 0
+        是 int，`0 or 5` 会变回 5，用户明明关了历史却还被当成「留 5 版」。
+        """
+        raw = self.cfg.get("history_keep")
+        if raw is None or raw == "":
+            return HISTORY_DEFAULT
         try:
-            keep = int(self.cfg.get("history_keep") or HISTORY_DEFAULT)
+            return max(0, int(raw))
         except (TypeError, ValueError):
-            keep = HISTORY_DEFAULT
-        if keep <= 0:
-            return
-        src = self.key("projects", uid, "project.db.enc")
-        stamp = (manifest.get("updated_at") or db.now()).replace(
+            return HISTORY_DEFAULT
+
+    @staticmethod
+    def _stamp_of(manifest: dict) -> str:
+        return (manifest.get("updated_at") or db.now()).replace(
             ":", "").replace("-", "").replace(" ", "T")
-        # 尾缀带上版本 sha 前 8 位：时间戳只到秒，同一秒内连推两次会撞成同一个
-        # key，后一次把前一次的历史覆盖掉（2026-11-16 单测抓到）。
-        tag = (manifest.get("sha256") or "")[:8] or "v"
-        dst = self.key("history", "projects", uid, stamp + "-" + tag + ".db.enc")
+
+    def _copy_to_history(self, src: str, dst: str) -> dict:
+        """把云端 src 复制成 dst（history 对象）。成功返回 {mode, size}。
+
+        网关不支持 `x-amz-copy-source` 时（code=CopyUnsupported）退回
+        **流式下载到临时文件 → 流式上传**：绝不把整个库读进内存，也绝不因为
+        体积超过某个阈值就放弃——真实项目库十几 MB，放弃归档等于关掉后悔药。
+        任何一步失败都抛 ArchiveFailed（连同半截目标对象一起清掉）。
+        """
         try:
-            self.client.copy(src, dst)
+            res = self.client.copy(src, dst)
+            return {"mode": "copy", "size": res.get("size", 0)}
         except S3Error as e:
             if e.code != "CopyUnsupported":
-                self.log("[sync] 归档旧版失败：" + str(e)[:120])
-                return
-            # 网关不支持服务端复制：小对象退回下载+上传，大对象就放弃归档
-            try:
-                blob = self.client.get_bytes(src, limit=8 << 20)
-                self.client.put_bytes(dst, blob)
-            except S3Error as e2:
-                self.log("[sync] 归档旧版失败（回退同样失败）：" + str(e2)[:120])
-                return
-        self.trim_history(uid, keep)
-
-    def trim_history(self, uid: str, keep: int) -> None:
+                raise ArchiveFailed("服务端复制失败：" + str(e)[:160]) from e
+        tmpdir = tempfile.mkdtemp(prefix="jgsync_arc_")
         try:
-            items = self.client.list_all(self.key("history", "projects", uid) + "/")
+            local = os.path.join(tmpdir, "obj.bin")
+            try:
+                got = self.client.download_to(src, local)
+            except (S3Error, OSError) as e:
+                raise ArchiveFailed("下载旧版失败：" + str(e)[:160]) from e
+            size = int(got.get("size") or 0)
+            if size <= 0:
+                raise ArchiveFailed("下载到的旧版是空对象")
+            try:
+                src_head = self.client.head(src)
+            except S3Error:
+                src_head = None
+            if src_head and src_head.get("size") and src_head["size"] != size:
+                raise ArchiveFailed("下载不完整（%d ≠ %d 字节）"
+                                    % (size, src_head["size"]))
+            try:
+                self.client.put_file(dst, local)
+            except (S3Error, OSError) as e:
+                raise ArchiveFailed("上传归档对象失败：" + str(e)[:160]) from e
+            try:
+                dst_head = self.client.head(dst)
+            except S3Error:
+                dst_head = None
+            if dst_head is None or dst_head.get("size") != size:
+                # 半截的「历史版本」比没有更危险：解不开还占掉 keep 名额
+                try:
+                    self.client.delete(dst)
+                except S3Error:
+                    pass
+                raise ArchiveFailed("归档对象体积不符（%s 字节，应为 %d）"
+                                    % (dst_head["size"] if dst_head else "缺失", size))
+            return {"mode": "stream", "size": size}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def archive_remote(self, uid: str, manifest: dict) -> dict:
+        """把云端当前版本归档进 history，再裁剪到 N 版。
+
+        返回值明确表态：
+          `{"ok": True, "archived": True,  "key": ...}`  —— 已归档，可以覆盖
+          `{"ok": True, "archived": False, "reason": ...}` —— keep=0，用户关了历史
+        归档失败**抛 ArchiveFailed**，调用方必须中止覆盖（云端数据对象与
+        manifest 都不许变）。以前这里是「失败只记日志继续推」——那就是覆盖掉
+        云端唯一一份旧版还假装同步成功（2026-11-17 修）。
+        """
+        keep = self.history_keep()
+        if keep <= 0:
+            return {"ok": True, "archived": False, "key": "",
+                    "reason": "history_keep=0：已关闭云端历史，本次覆盖不可从云端恢复"}
+        tag = (manifest.get("sha256") or "")[:8] or "v"
+        # 尾缀带上版本 sha 前 8 位：时间戳只到秒，同一秒内连推两次会撞成同一个
+        # key，后一次把前一次的历史覆盖掉（2026-11-16 单测抓到）。
+        dst = self.key("history", "projects", uid,
+                       self._stamp_of(manifest) + "-" + tag + ".db.enc")
+        res = self._copy_to_history(self.key("projects", uid, "project.db.enc"), dst)
+        # 裁剪只是清理，失败不能反过来判这次归档失败（刚归档的那份已经在了）
+        self.trim_history(uid, keep)
+        return {"ok": True, "archived": True, "key": dst,
+                "mode": res.get("mode"), "size": res.get("size", 0)}
+
+    def archive_global(self, manifest: dict) -> dict:
+        """全局配置覆盖前归档（与项目同一套「失败即中止」语义）。"""
+        keep = self.history_keep()
+        if keep <= 0:
+            return {"ok": True, "archived": False, "key": "",
+                    "reason": "history_keep=0：已关闭云端历史"}
+        tag = (manifest.get("sha256") or "")[:8] or "v"
+        dst = self.key("history", "global",
+                       self._stamp_of(manifest) + "-" + tag + ".db.enc")
+        res = self._copy_to_history(self.key("global", "app.db.enc"), dst)
+        self._trim_prefix(self.key("history", "global") + "/", keep)
+        return {"ok": True, "archived": True, "key": dst,
+                "mode": res.get("mode"), "size": res.get("size", 0)}
+
+    def _trim_prefix(self, prefix: str, keep: int) -> None:
+        """把 prefix 下的历史裁到最近 keep 个（按 key 升序留尾部）。"""
+        try:
+            items = self.client.list_all(prefix)
         except S3Error:
             return
         items.sort(key=lambda x: x["key"])
@@ -396,6 +564,9 @@ class SyncEngine:
                 self.client.delete(item["key"])
             except S3Error:
                 pass
+
+    def trim_history(self, uid: str, keep: int) -> None:
+        self._trim_prefix(self.key("history", "projects", uid) + "/", keep)
 
     def history_versions(self, uid: str) -> list:
         try:
@@ -418,6 +589,81 @@ class SyncEngine:
             return int(base) != int(store.write_seq)
         except (TypeError, ValueError):
             return True
+
+    def _snapshot_before_merge(self, store: ProjectStore) -> str:
+        """拉取覆盖本机库之前，留一份「本机旧版」后悔药。
+
+        一律走 `snapshot_to(exclude_tables=())`（VACUUM INTO 全量快照）：
+        - 不用 checkpoint+copy2：那两步之间的写入会落在 WAL 里被 copy 丢掉，
+          快照看着完整其实少几笔（本模块 2026-11-16 就踩过，见 store.backup）；
+        - 必须传 `exclude_tables=()`：默认值是云同步的剥日志表，后悔药不能缺日志。
+        失败（磁盘满 / 目录不可写 / 快照校验不过）抛 SnapshotFailed，调用方
+        **必须放弃 merge**。
+        """
+        folder = os.path.join(store.folder, "backups")
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            raise SnapshotFailed("建备份目录失败：" + str(e)[:120]) from e
+        stamp = db.now().replace(":", "").replace("-", "")
+        dest = os.path.join(folder, "sync_overwrite_%s.db" % stamp)
+        n = 1
+        while os.path.exists(dest):     # 同一秒连拉两次也不许盖掉上一份后悔药
+            dest = os.path.join(folder, "sync_overwrite_%s-%d.db" % (stamp, n))
+            n += 1
+        try:
+            info = store.snapshot_to(dest, exclude_tables=())
+        except Exception as e:          # noqa: BLE001 — SQLite/OS 错误一律算失败
+            raise SnapshotFailed("生成一致性快照失败：" + type(e).__name__
+                                 + str(e)[:120]) from e
+        expect = int((info or {}).get("size") or 0)
+        actual = os.path.getsize(dest) if os.path.isfile(dest) else 0
+        if expect and actual != expect:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise SnapshotFailed("快照体积不符（%d ≠ %d 字节）" % (actual, expect))
+        ok, why = verify_snapshot(dest)
+        if not ok:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise SnapshotFailed("快照校验失败：" + why)
+        return dest
+
+    def _snapshot_global_before_merge(self, app_state) -> str:
+        """全局库被云端覆盖前留后悔药。
+
+        **绝不 shutil.copy2 正在写 WAL 的 app.db**：复制那一刻还留在 WAL 里的
+        提交会丢，得到的「备份」是少了最近改动的库（2026-11-17 修）。
+        一律 VACUUM INTO，再校验能打开。
+        """
+        backup_dir = os.path.join(app_state.data_dir, "backups")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+        except OSError as e:
+            raise SnapshotFailed("建备份目录失败：" + str(e)[:120]) from e
+        stamp = db.now().replace(":", "").replace("-", "")
+        dest = os.path.join(backup_dir, "app_before_sync_%s.db" % stamp)
+        n = 1
+        while os.path.exists(dest):
+            dest = os.path.join(backup_dir, "app_before_sync_%s-%d.db" % (stamp, n))
+            n += 1
+        try:
+            self._gstore_snapshot(app_state, dest)
+        except Exception as e:          # noqa: BLE001
+            raise SnapshotFailed("生成全局库快照失败：" + type(e).__name__
+                                 + str(e)[:120]) from e
+        ok, why = verify_snapshot(dest)
+        if not ok:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise SnapshotFailed("全局库快照校验失败：" + why)
+        return dest
 
     def push_project(self, store: ProjectStore, uid: str = "") -> dict:
         uid = uid or self.ensure_uuid(store)
@@ -442,8 +688,19 @@ class SyncEngine:
             size = os.path.getsize(enc)
 
             if remote and remote.get("sha256") and remote["sha256"] != digest:
-                # 覆盖前先把云端旧版收进 history：这是「覆盖」唯一的后悔药
-                self.archive_remote(uid, remote)
+                # 覆盖前先把云端旧版收进 history：这是「覆盖」唯一的后悔药。
+                # 归档失败 → **中止本次上传**：云端对象与清单都保持原样，
+                # 用户下次点同步可以重试（2026-11-17 修，以前是记日志继续推）。
+                try:
+                    arc = self.archive_remote(uid, remote)
+                except ArchiveFailed as e:
+                    self.log("[sync] 《%s》覆盖前归档失败，已取消上传：%s"
+                             % (title, str(e)[:200]))
+                    return {"action": "failed", "uuid": uid,
+                            "reason": "覆盖前归档旧版失败，已取消上传（云端仍是原版本）："
+                                      + str(e)[:160]}
+                if not arc.get("archived"):
+                    self.log("[sync] 《%s》" % title + str(arc.get("reason") or ""))
 
             self.client.put_file(self.key("projects", uid, "project.db.enc"), enc)
             manifest = {"uuid": uid, "title": title, "sha256": digest, "size": size,
@@ -489,7 +746,15 @@ class SyncEngine:
             gunzip_file(gz, snap)
 
             if backup:
-                path = store.backup(prefix="sync_overwrite")
+                try:
+                    path = self._snapshot_before_merge(store)
+                except SnapshotFailed as e:
+                    # 没有后悔药就不许覆盖：本机库保持原样，云端也没动过
+                    self.log("[sync] 《%s》覆盖前本机快照失败，已取消拉取：%s"
+                             % (store.title, str(e)[:200]))
+                    return {"action": "failed", "uuid": uid,
+                            "reason": "覆盖前本机快照失败，已取消拉取"
+                                      "（本机与云端均未改动）：" + str(e)[:160]}
                 self.log("[sync] 覆盖前已存快照：" + os.path.basename(path))
 
             res = store.merge_from(snap)
@@ -612,14 +877,16 @@ class SyncEngine:
 
             old = self._get_json(self.key("global", "manifest.json"))
             if old and old.get("sha256") and old["sha256"] != digest:
-                stamp = (old.get("updated_at") or db.now()).replace(
-                    ":", "").replace("-", "").replace(" ", "T")
+                # 与项目同一套语义：覆盖前必须留后悔药，留不下来就不覆盖
                 try:
-                    self.client.copy(self.key("global", "app.db.enc"),
-                                     self.key("history", "global",
-                                              stamp + "-" + old["sha256"][:8] + ".db.enc"))
-                except S3Error as e:
-                    self.log("[sync] 全局旧版归档失败：" + str(e)[:120])
+                    arc = self.archive_global(old)
+                except ArchiveFailed as e:
+                    self.log("[sync] 全局配置覆盖前归档失败，已取消上传：" + str(e)[:200])
+                    return {"action": "failed",
+                            "reason": "全局配置覆盖前归档旧版失败，已取消上传"
+                                      "（云端仍是原版本）：" + str(e)[:160]}
+                if not arc.get("archived"):
+                    self.log("[sync] 全局配置" + str(arc.get("reason") or ""))
 
             self.client.put_file(self.key("global", "app.db.enc"), enc)
             manifest = {"sha256": digest, "size": os.path.getsize(enc),
@@ -682,14 +949,15 @@ class SyncEngine:
             local_db = os.path.join(tmp, "app.local.db")
             _rekey_db_copy(portable, local_db, to_portable=False)
 
-            backup_dir = os.path.join(app_state.data_dir, "backups")
-            os.makedirs(backup_dir, exist_ok=True)
-            stamp = db.now().replace(":", "").replace("-", "")
             try:
-                shutil.copy2(os.path.join(app_state.data_dir, "app.db"),
-                             os.path.join(backup_dir, "app_before_sync_%s.db" % stamp))
-            except OSError:
-                pass
+                backup_path = self._snapshot_global_before_merge(app_state)
+            except SnapshotFailed as e:
+                # 没有后悔药就不许覆盖全局库（同步密码/模型档案都在里面）
+                self.log("[sync] 全局库覆盖前快照失败，已取消合并：" + str(e)[:200])
+                return {"action": "failed",
+                        "reason": "全局配置覆盖前快照失败，已取消合并"
+                                  "（本机与云端均未改动）：" + str(e)[:160]}
+            self.log("[sync] 覆盖前已存全局库快照：" + os.path.basename(backup_path))
 
             with app_state.gstore._lock:
                 res = merge_table_copy(app_state.gstore.conn, local_db, (), 0)
@@ -894,7 +1162,13 @@ class SyncEngine:
         if remote.get(TOMBSTONE_KEY):
             return {"ok": True, "already": True, "uuid": uid}
         if remote.get("sha256"):
-            self.archive_remote(uid, remote)   # 删之前再留一份，方便反悔
+            try:
+                self.archive_remote(uid, remote)   # 删之前再留一份，方便反悔
+            except ArchiveFailed as e:
+                # 墓碑不删数据对象，所以归档失败不阻断删除传播（不像 push：
+                # 那里一覆盖旧版就真没了），只在日志里留痕
+                self.log("[sync] 《%s》删除前归档失败（云端数据对象仍在）：%s"
+                         % (remote.get("title") or title or uid, str(e)[:160]))
         manifest = dict(remote)
         manifest.update({
             "uuid": uid,

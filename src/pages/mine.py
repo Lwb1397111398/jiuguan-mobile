@@ -164,15 +164,77 @@ class MinePage:
 
     # ---------- 全量备份 ----------
 
+    def _pw_field(self, label: str, helper: str = ""):
+        """密码输入框（默认遮点、可点眼睛看明文）+ 外置标签说明。
+
+        flet 0.86：password/can_reveal_password 是控件属性，不是构造参数；
+        标签走 `T.field_group`（框外标签），不用 floating label。
+        """
+        tf = T.field("", "")
+        tf.password = True
+        tf.can_reveal_password = True
+        return tf, T.field_group(tf, label, helper)
+
     def _export_full(self, e):
+        """导出前先让用户设密码（默认必须设；明文要显式打开开关）。"""
+        from app.core.exporter import MIN_BACKUP_PASSWORD
         s = self.session
         export_dir = os.path.join(s.app.data_dir, "exports")
         os.makedirs(export_dir, exist_ok=True)
         path = os.path.join(
             export_dir, f"全量备份_{datetime.datetime.now():%Y%m%d_%H%M%S}.zip")
-        toast(self.page, "正在打包全部资料…")
+
+        pw1, f1 = self._pw_field("备份密码", f"至少 {MIN_BACKUP_PASSWORD} 位；"
+                                    "不上传、不保存，忘了就打不开这份备份")
+        pw2, f2 = self._pw_field("再输一次", "防手滑打错")
+        err = ft.Text("", size=11, color=T.danger())
+        plain_row, plain_sw = T.switch_row(
+            "不使用密码（明文 zip，不推荐）", False,
+            desc="明文包里能直接搜到 API Key，只在自己电脑上临时周转时考虑")
+        # 留引用：校验要改 err 的文字，测试也要能直接摆弄这几个控件
+        self._pw1, self._pw2, self._err, self._plain_sw = pw1, pw2, err, plain_sw
+
+        def _go(ev):
+            pwd = "" if plain_sw.value else (pw1.value or "")
+            if not plain_sw.value:
+                if not pwd.strip():
+                    err.value = "请先设置备份密码（或打开下面的明文开关）"
+                    self.page.update()
+                    return
+                if len(pwd) < MIN_BACKUP_PASSWORD:
+                    err.value = f"密码至少 {MIN_BACKUP_PASSWORD} 位"
+                    self.page.update()
+                    return
+                if pwd != (pw2.value or ""):
+                    err.value = "两次输入的密码不一致"
+                    self.page.update()
+                    return
+                self.page.pop_dialog()
+                self._start_export(path, pwd, False)
+                return
+            # 明文是兼容选项，必须再明确确认一次（与电脑端一致）
+            self.page.pop_dialog()
+            confirm(self.page, "确认使用明文备份",
+                    "你选择了不使用密码。这样的 zip 里 API Key 是明文，"
+                    "用记事本就能搜到。\n\n确定要导出明文备份吗？",
+                    lambda: self._start_export(path, "", True),
+                    yes_text="导出明文")
+
+        T.sheet(self.page, "给备份设置密码", [
+            T.hint_text("全量备份里有模型 API Key 等敏感信息，默认整个文件加密。"
+                        "密码不保存、不上传，也无法找回——请记在纸上或密码管理器。"),
+            f1, f2, err, plain_row,
+        ], actions=T.action_row(
+            self.page,
+            primary_btn=T.primary("开始备份", icon=ft.Icons.LOCK, on_click=_go)))
+
+    def _start_export(self, path: str, password: str, allow_plain: bool):
+        toast(self.page, "正在加密打包全部资料…")
 
         def done(r):
+            if isinstance(r, dict):           # run_bg 的异常兜底形态
+                toast(self.page, str(r.get("error") or "备份失败"), error=True)
+                return
             ok, msg = r
             if not ok:
                 toast(self.page, msg, error=True)
@@ -181,18 +243,20 @@ class MinePage:
                 modal=True, title=ft.Text("备份完成"),
                 content=ft.Text(
                     f"{msg}\n\n文件位置：{path}\n\n把它传到电脑（微信/网盘/数据线均可），"
-                    "在电脑版「导出页 → 导入全量备份」选择该文件即可完成同步。",
+                    "在电脑版「导出页 → 导入全量备份」选择该文件，输入同一个密码即可同步。",
                     size=13),
                 actions=[ft.FilledButton(
                     "好", on_click=lambda ev: self.page.pop_dialog())],
                 actions_alignment=ft.MainAxisAlignment.END,
             ))
-        run_bg(self.page, lambda: self._do_export(path), done)
+        run_bg(self.page,
+               lambda: self._do_export(path, password, allow_plain), done)
 
-    def _do_export(self, path):
+    def _do_export(self, path, password=None, allow_plain=False):
         try:
             from app.core.exporter import export_full_backup
-            return export_full_backup(path, self.session.app)
+            return export_full_backup(path, self.session.app, password=password,
+                                      allow_plain=allow_plain)
         except Exception as e:
             return False, f"备份失败：{e}"
 
@@ -200,7 +264,7 @@ class MinePage:
         # flet 0.86：pick_files 是 async，必须 await（2026-11-16 修复
         # 「'coroutine' object is not subscriptable」真机闪退）
         files = await self._picker.pick_files(
-            dialog_title="选择全量备份 zip", allow_multiple=False)
+            dialog_title="选择全量备份文件", allow_multiple=False)
         self._import_picked(files)
 
     def _import_picked(self, files):
@@ -210,35 +274,83 @@ class MinePage:
         if not path:
             toast(self.page, "未能读取所选文件", error=True)
             return
+        # 先认文件（只读文件头，不解密、不动本机数据）：加密包问密码，明文包先示警
+        try:
+            from app.core.exporter import describe_backup_file
+            info = describe_backup_file(path)
+        except Exception as e:
+            toast(self.page, f"读取备份文件失败：{e}", error=True)
+            return
+        kind = info.get("kind")
+        if kind == "unknown":
+            toast(self.page, f"不是有效的全量备份：{info.get('reason') or '无法识别'}",
+                  error=True)
+            return
+        if kind == "encrypted":
+            self._ask_import_password(path, info)
+        else:
+            self._confirm_import(path, None, plain=True)
 
-        def _yes():
-            toast(self.page, "正在恢复全部资料…")
+    def _ask_import_password(self, path: str, info: dict):
+        """加密备份：输入密码 → 再确认覆盖。密码错在后台解不开，本机数据不动。"""
+        tf, fg = self._pw_field("备份密码", "导出这份备份时设的密码；丢了就打不开了")
+        err = ft.Text("", size=11, color=T.danger())
+        self._pw_import = tf
+        exported = info.get("exported_at") or ""
 
-            def done(r):
-                ok, msg = r
-                if not ok:
-                    toast(self.page, msg, error=True)
-                    return
-                self.page.show_dialog(ft.AlertDialog(
-                    modal=True, title=ft.Text("导入完成"),
-                    content=ft.Text(msg + "\n\n建议重启应用后使用。", size=13),
-                    actions=[ft.FilledButton(
-                        "好", on_click=lambda ev: (
-                            self.page.pop_dialog(),
-                            self.on_refresh() if self.on_refresh else None))],
-                    actions_alignment=ft.MainAxisAlignment.END,
-                ))
-            run_bg(self.page, lambda: self._do_import(path), done)
+        def _go(ev):
+            pwd = tf.value or ""
+            if not pwd.strip():
+                err.value = "请先输入密码"
+                self.page.update()
+                return
+            self.page.pop_dialog()
+            self._confirm_import(path, pwd, plain=False)
 
-        confirm(self.page, "导入全量备份",
-                "将整体替换本机全部资料（模型/API Key、提示词偏好、预设、破甲库、"
-                "项目列表），与备份文件完全一致；导入前自动做安全备份。确定继续？",
-                _yes, yes_text="导入")
+        T.sheet(self.page, "这是加密的备份", [
+            T.hint_text("需要导出时设的密码才能打开。"
+                        + (f"导出时间：{exported}" if exported else "")
+                        + "　密码不保存，无法找回，只能从别的备份重来。"),
+            fg, err,
+        ], actions=T.action_row(
+            self.page,
+            primary_btn=T.primary("解密并导入", icon=ft.Icons.LOCK_OPEN, on_click=_go)))
 
-    def _do_import(self, path):
+    def _confirm_import(self, path: str, password, plain: bool):
+        msg = ("将整体替换本机全部资料（模型/API Key、提示词偏好、预设、破甲库、"
+               "项目列表），与备份文件完全一致；导入前自动做安全备份。确定继续？")
+        if plain:
+            msg = ("这个备份是明文 zip（旧版备份，或导出时没设密码），"
+                   "里面能直接搜到 API Key。\n\n" + msg)
+        confirm(self.page, "导入全量备份", msg,
+                lambda: self._start_import(path, password), yes_text="导入")
+
+    def _start_import(self, path: str, password):
+        toast(self.page, "正在解密并恢复全部资料…")
+
+        def done(r):
+            if isinstance(r, dict):
+                toast(self.page, str(r.get("error") or "导入失败"), error=True)
+                return
+            ok, msg = r
+            if not ok:
+                toast(self.page, msg, error=True)
+                return
+            self.page.show_dialog(ft.AlertDialog(
+                modal=True, title=ft.Text("导入完成"),
+                content=ft.Text(msg + "\n\n建议重启应用后使用。", size=13),
+                actions=[ft.FilledButton(
+                    "好", on_click=lambda ev: (
+                        self.page.pop_dialog(),
+                        self.on_refresh() if self.on_refresh else None))],
+                actions_alignment=ft.MainAxisAlignment.END,
+            ))
+        run_bg(self.page, lambda: self._do_import(path, password), done)
+
+    def _do_import(self, path, password=None):
         try:
             from app.core.exporter import import_full_backup
-            return import_full_backup(path, self.session.app)
+            return import_full_backup(path, self.session.app, password=password)
         except Exception as e:
             return False, f"导入失败：{e}"
 
@@ -424,7 +536,7 @@ class MinePage:
                                 weight=ft.FontWeight.W_600, expand=True)]),
                 ft.Text("导出一个文件带走全部资料（模型、API Key、提示词偏好、预设、"
                         "破甲库、任务模板、所有项目），电脑 ↔ 手机 导入即完全一致。"
-                        "备份含 API Key 明文，请妥善保管。", size=11,
+                        "默认用密码加密整个文件（密码无法找回，请记牢）。", size=11,
                         color=T.muted()),
                 ft.Row([
                     T.primary("导出备份", icon=ft.Icons.UPLOAD_FILE,

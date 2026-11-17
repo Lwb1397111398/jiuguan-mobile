@@ -390,7 +390,8 @@ class SyncPage:
             self._tf("keep", "云端每个项目保留历史版本（份）",
                      self._gi("sync_history_keep", 5),
                      keyboard_type=ft.KeyboardType.NUMBER,
-                     helper="0 = 不留，误覆盖就找不回来了"),
+                     helper="留最近几份覆盖前的云端旧版。填 0 = 关闭云端历史："
+                            "覆盖后旧版就找不回来了（本机覆盖前仍留一份快照）"),
             hint("冲突规则：谁最后改动谁覆盖（LWW）。覆盖前一定先存快照——"
                  "本机旧版进项目 backups/sync_overwrite_*.db，云端旧版进 history。"),
         ], spacing=T.GAP_S,

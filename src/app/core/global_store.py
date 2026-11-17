@@ -131,7 +131,7 @@ GLOBAL_SETTING_DEFAULTS = {
     "sync_auto_pull": "1",               # 打开项目时自动拉取云端最新
     "sync_auto_push": "1",               # 内容改动静默 60 秒后自动上传
     "sync_include_logs": "0",            # 连请求日志一起同步（体积大，默认只同步内容）
-    "sync_history_keep": "5",            # 云端每个项目保留几份历史版本（0=不留）
+    "sync_history_keep": "5",            # 云端每个项目留几份历史（0=关闭云端历史，覆盖后不可恢复）
 }
 GLOBAL_SETTING_KEYS = frozenset(GLOBAL_SETTING_DEFAULTS)
 

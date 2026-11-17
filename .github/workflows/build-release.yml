@@ -5,11 +5,94 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# 发版串行化（2026-11-17 第一阶段，防「旧构建后完成覆盖新 latest」）
+# ① 同一个 concurrency group 里同时只允许一个 run：后来的 run 排队，不会和
+#    正在上传的 run 抢同一个 latest Release（两个 run 同时 --clobber 会互相
+#    覆盖，甚至删了旧资产又没传完，留下一个没有 APK 的 latest）。
+# ② cancel-in-progress 故意为 false：真取消会打断 gh release upload --clobber
+#    的「先删旧资产、再传新资产」两段动作，可能留下空 latest；排队多花几分钟
+#    但每一步都是完整上传。
+# ③ 排队只能保证顺序，不能防「重跑旧提交 / 手工发版」：Release 步骤里另有
+#    tools/release_guard.py 的 versionCode 单调守卫（远端更大就跳过上传）。
+concurrency:
+  group: release-latest
+  cancel-in-progress: false
+
 jobs:
+  # 发版门禁（2026-11-17 CI 基线）：update 专项 + 手机测试必须先全绿，
+  # build 才允许启动；任何一步失败都不会产出/覆盖 latest Release。
+  test:
+    name: update 专项 + 手机测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      # 让所有 pip 调用（含 flet 构建子进程）都受已实测版本锁约束
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
+      PYTHONUTF8: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.10 (verified locally)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            constraints.txt
+
+      - name: Install locked runtime + dev dependencies
+        run: |
+          python --version
+          python -m pip install --disable-pip-version-check -c constraints.txt -r requirements-dev.txt
+          python -m pip check
+          python tools/ci/check_locked_versions.py .
+
+      - name: 测试范围说明（显式声明，不静默跳过）
+        # tests/test_app.py 是 Flet 渲染级集成测试：flet test 会自行 provision
+        # 一个原生 Flutter 测试宿主，并在宿主内按 pyproject 的 >= 范围重新解析
+        # Python 3.14 + 未锁定依赖——与本次 CI 的「一律用已实测锁文件」红线直接
+        # 冲突。它由本机 UI 验收覆盖；手机控件树回归在桌面仓 CI（检出本仓 src
+        # 后跑 test_mobile_*.py）执行。这里明确写出边界，不把它伪装成已跑。
+        run: |
+          echo "CI 门禁 = update 专项 + 手机测试（发版契约），全部使用 constraints.txt 锁定的版本"
+          echo "tests/test_app.py 需 flet test 原生宿主 + 自带依赖解析，属本机 UI 验收范围"
+
+      - name: update 专项（手机自更新全链路）
+        # 不加 -k、不加 --ignore；--runxfail / --strict-markers 防止静默跳过。
+        run: |
+          python -m pytest tests/test_mobile_update.py -q -ra --strict-markers --runxfail --junitxml=junit-update.xml --tb=short 2>&1 | tee pytest-update.log
+          CI_MIN_TESTS=40 python tools/ci/check_pytest_results.py junit-update.xml
+
+      - name: 手机测试（发版契约 / Release 元数据兼容）
+        run: |
+          python -m pytest tests/test_release_workflow.py -q -ra --strict-markers --runxfail --junitxml=junit-mobile.xml --tb=short 2>&1 | tee pytest-mobile.log
+          CI_MIN_TESTS=10 python tools/ci/check_pytest_results.py junit-mobile.xml
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pytest-update.log
+            pytest-mobile.log
+            junit-update.xml
+            junit-mobile.xml
+          if-no-files-found: warn
+          retention-days: 14
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
     steps:
       - name: Checkout (full history for build number)
         uses: actions/checkout@v4
@@ -26,13 +109,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Python for flet-cli
+      - name: Set up Python 3.12.10 (verified locally)
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.10'
 
-      - name: Install flet-cli 0.86.5
-        run: pip install flet-cli==0.86.5
+      - name: Install locked build toolchain (flet-cli 0.86.5)
+        # 与 test job 用同一份锁文件、同一批已实测版本；运行时与开发依赖
+        # 分文件管理（requirements.txt / requirements-dev.txt）。
+        # PIP_CONSTRAINT 同时约束 flet build apk 内部的 pip 调用。
+        run: |
+          python -m pip install --disable-pip-version-check -c constraints.txt -r requirements-dev.txt
+          python -m pip check
+          python tools/ci/check_locked_versions.py .
 
       - name: Set up Flutter 3.44.8 (pinned by flet)
         uses: subosito/flutter-action@v2
@@ -66,22 +155,79 @@ jobs:
           cp "$SRC" jiuguan-novel.apk
           ls -la jiuguan-novel.apk
 
-      - name: Release latest
+      - name: Compute APK SHA-256
+        id: sha
+        run: |
+          SHA=$(sha256sum jiuguan-novel.apk | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "APK SHA-256: $SHA"
+
+      - name: Write release notes (metadata + SHA-256)
+        env:
+          BUILD_NUM: ${{ steps.ver.outputs.num }}
+          APK_SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          git log -5 --pretty=format:'- %s (%h)' > commits.txt
+          # 守卫模块校验哈希格式：缺失/非法直接非零退出，宁可不发版
+          python tools/release_guard.py notes \
+            --build-num "$BUILD_NUM" \
+            --sha256 "$APK_SHA256" \
+            --commits-file commits.txt \
+            --out notes.md
+          head -3 notes.md
+
+      - name: Release latest (monotonic guard, no downgrade)
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_NUM: ${{ steps.ver.outputs.num }}
+          APK_SHA256: ${{ steps.sha.outputs.sha256 }}
         run: |
-          {
-            echo "<!-- appupdate versionCode=$BUILD_NUM versionName=0.1.$BUILD_NUM -->"
-            echo ""
-            echo "## 更新内容"
-            echo ""
-            git log -5 --pretty=format:'- %s (%h)'
-          } > notes.md
+          # 守卫脚本异常也必须失败退出（fail closed），不能带着空结论继续上传
+          set -euo pipefail
+          rm -f remote_body.txt
+          gh release view latest --json body -q .body > remote_body.txt 2>/dev/null || true
+          DECISION=$(python tools/release_guard.py decide \
+            --build-num "$BUILD_NUM" --remote-body-file remote_body.txt)
+          if [ "$DECISION" = "skip" ]; then
+            echo "uploaded=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::云端 latest 已是更新的版本（versionCode > $BUILD_NUM），本次构建不上传、不覆盖"
+            exit 0
+          fi
+          echo "uploaded=1" >> "$GITHUB_OUTPUT"
           if gh release view latest >/dev/null 2>&1; then
             gh release upload latest jiuguan-novel.apk --clobber
             gh release edit latest --notes-file notes.md --title "0.1.$BUILD_NUM"
           else
             gh release create latest jiuguan-novel.apk --notes-file notes.md --title "0.1.$BUILD_NUM"
           fi
-          echo "release latest updated to 0.1.$BUILD_NUM"
+          echo "release latest updated to 0.1.$BUILD_NUM (sha256=$APK_SHA256)"
+
+      - name: Verify published release metadata
+        # 本次跳过上传时不去校验云端（那是别人更新的版本，校验必然不符）
+        if: steps.release.outputs.uploaded == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUM: ${{ steps.ver.outputs.num }}
+          APK_SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          # 上传后回读云端说明，确认元数据/哈希真的落到了 GitHub（不信任本地文件）
+          gh release view latest --json body -q .body > published_body.txt
+          python - "$BUILD_NUM" "$APK_SHA256" <<'PY'
+          import re, sys
+          build, sha = sys.argv[1], sys.argv[2].lower()
+          body = open("published_body.txt", encoding="utf-8").read()
+          attrs = {}
+          # 两条注释都要看：首行 appupdate（旧客户端依赖）+ 第二行 apkupdate（哈希）
+          for cmt in re.findall(r"<!--\s*appupdate\b([^>]*)-->|<!--\s*apkupdate\b([^>]*)-->",
+                                body):
+              for part in cmt:
+                  if not part:
+                      continue
+                  for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s>]+)", part):
+                      attrs.setdefault(k.lower(), v)
+          assert attrs.get("versioncode") == build, attrs
+          assert attrs.get("apksha256") == sha, attrs
+          assert sha in body, "说明里缺少可读的 SHA-256"
+          print("published metadata OK:", attrs.get("versioncode"), sha)
+          PY

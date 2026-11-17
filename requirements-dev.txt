@@ -1,0 +1,16 @@
+# -*- coding: utf-8 -*-
+# 开发 / 测试依赖：CI 先跑 update 专项与手机测试，再构建 Release。
+# 运行时依赖单独放在 requirements.txt。
+# 版本取自 2026-11-17 已实测 .venv（Python 3.12.10），传递依赖由
+# constraints.txt 钉死。
+#   pip install -c constraints.txt -r requirements-dev.txt
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+PyYAML==6.0.3
+
+# flet test（渲染级集成测试）与 flet build apk 的命令行工具链
+flet-cli==0.86.5
+flet-desktop==0.86.5
+flet-web==0.86.5

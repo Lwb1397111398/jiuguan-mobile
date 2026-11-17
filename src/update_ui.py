@@ -10,6 +10,11 @@
 插件 Java 侧，与 pyjnius 无关），把 APK 直链交给平板浏览器/下载管理器，
 下载完点通知栏安装，全程不用电脑；同时保留 App 内一键安装（桥接恢复时
 自动可用），一键安装失败也会自动切到浏览器通路。
+
+2026-11-17 第一阶段（完整性）：弹窗把**官方 Release 地址 + SHA-256**摊给用户
+核对；浏览器通路的文案明确写「无法自动校验」（浏览器下载的文件 App 拿不到，
+不许谎称已校验）；App 内下载/复用/安装三处都校验 SHA-256，校验不通过则
+删文件、不唤起安装器。
 """
 import threading
 import time
@@ -18,14 +23,19 @@ import flet as ft
 
 import theme as T
 from update import (
+    ChecksumError,
     NetworkError,
     NoReleaseError,
+    _remove_quiet as _rm,
     browser_url_or_latest,
     check_update,
     download_update,
+    format_sha256,
     get_local_version,
     install_apk,
     is_android,
+    official_apk_url,
+    official_release_page,
     should_auto_check,
 )
 from widgets import toast
@@ -62,7 +72,9 @@ def update_card(page, session) -> ft.Control:
             await ft.UrlLauncher().launch_url(
                 LATEST_MIRROR_URL,
                 mode=ft.LaunchMode.EXTERNAL_APPLICATION)
-            status.value = "已打开平板浏览器，下载完点通知栏安装即可。"
+            status.value = ("已打开平板浏览器，下载完点通知栏安装即可。"
+                            "浏览器下载无法自动校验，安装前请到官方 Release 页"
+                            "核对 SHA-256。")
         except Exception:
             status.value = ("浏览器没打开成功，请长按复制这条链接到浏览器："
                             + LATEST_MIRROR_URL)
@@ -118,7 +130,7 @@ def update_card(page, session) -> ft.Control:
         # 再加一句同样意思的灰字只是重复占版面。
     if android:
         rows.append(ft.TextButton(
-            content=ft.Text("直接下载最新安装包（平板浏览器打开，不用电脑）",
+            content=ft.Text("直接下载最新安装包（浏览器打开，安装前核对 SHA-256）",
                             size=11),
             on_click=_open_latest))
     rows.append(status)
@@ -222,9 +234,41 @@ class _UpdateFlow:
         self._install_btn = ft.FilledButton("安装更新", visible=False,
                                             on_click=self._install)
         self._close_btn = ft.TextButton("稍后", on_click=self._close)
+        # 浏览器通路打开的地址（镜像优先，国内直连 github 常被污染）
         self._browser_url = browser_url_or_latest(info)
-        self._link = ft.Text(self._browser_url, size=10, selectable=True,
+        # 展示给用户核对的两个「参照物」：官方地址 + Release 页（镜像只是加速）
+        self._official_url = official_apk_url(info)
+        self._release_page = official_release_page()
+        self._mirror_url = self._browser_url
+        self._sha = format_sha256(getattr(info, "apk_sha256", ""))
+        self._link = ft.Text(self._official_url, size=10, selectable=True,
                              color=ft.Colors.ON_SURFACE_VARIANT)
+        self._mirror_link = ft.Text(self._mirror_url, size=10, selectable=True,
+                                    color=ft.Colors.ON_SURFACE_VARIANT)
+        self._release_link = ft.Text(self._release_page, size=10,
+                                     selectable=True,
+                                     color=ft.Colors.ON_SURFACE_VARIANT)
+        self._sha_text = ft.Text(
+            self._sha or "该版本未提供 SHA-256（App 内下载安装已停用）",
+            size=10, selectable=True, color=ft.Colors.ON_SURFACE_VARIANT)
+        if not getattr(info, "has_checksum", lambda: bool(self._sha))():
+            # 无法校验就不给 App 内安装入口：宁可只能走浏览器，也不装来路不明的包
+            self._download_btn.disabled = True
+
+    def _mid_height(self):
+        """中部信息区高度：至少 200、最多 420，随屏幕高收缩。
+
+        完整性信息（官方地址 + SHA-256 + 说明）比旧版长得多，手机上不设界会
+        把按钮顶出屏幕；Flet 0.86 的 `ft.Container` 没有 scroll 参数，
+        限高滚动只能给 `ft.Column(height=…, scroll=…)`。
+        """
+        try:
+            h = int(getattr(self.page, "height", 0) or 0)
+        except Exception:
+            h = 0
+        if h <= 0:          # 单测/未知环境
+            return 300
+        return max(200, min(h - 300, 420))
 
     def build(self):
         cur, _ = get_local_version()
@@ -237,18 +281,35 @@ class _UpdateFlow:
             ft.Text(f"当前 build {cur}  →  新版 build {self.info.version_code}",
                     size=13),
         ]
+        # 中部：更新说明 + 完整性信息，限高滚动（按钮/进度永远在屏幕内）
+        mid = []
         if self.info.notes:
-            # 更新说明（最近提交标题）可能多行：限高滚动，弹窗不撑爆手机屏
-            parts.append(ft.Column(
-                [ft.Text(self.info.notes, size=12, selectable=True)],
-                height=140, scroll=ft.ScrollMode.AUTO))
-        parts += [
+            mid.append(ft.Text(self.info.notes, size=12, selectable=True))
+        mid += [
             ft.Text("平板上点「用平板浏览器下载安装」即可：下载完点通知栏的"
                     "安装提示，全程不用电脑。",
                     size=11, color=ft.Colors.ON_SURFACE_VARIANT),
-            ft.Text("下载链接（可长按复制，浏览器打不开时自己贴过去）",
+            # ---- 完整性信息（2026-11-17）：官方地址 + SHA-256 摊给用户核对 ----
+            ft.Text("官方安装包地址（github.com 原站，可长按复制）",
                     size=10, color=ft.Colors.ON_SURFACE_VARIANT),
             self._link,
+            ft.Text("官方 Release 页面（可核对更新说明与校验值）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._release_link,
+            ft.Text("SHA-256（安装前请核对下载到的文件哈希与这一串完全一致）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._sha_text,
+            ft.Text("注意：浏览器下载由系统下载管理器完成，App 拿不到文件，"
+                    "无法自动校验；App 内「下载并安装」会自动校验 SHA-256，"
+                    "校验不通过不会安装。",
+                    size=10, color=T.warn()),
+            ft.Text("镜像加速地址（与官方地址同一个文件，官方地址打不开时用）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._mirror_link,
+        ]
+        parts += [
+            ft.Column(mid, spacing=8, scroll=ft.ScrollMode.AUTO,
+                      height=self._mid_height()),
             self._bar, self._status,
             ft.Row([
                 self._close_btn, self._download_btn, self._install_btn,
@@ -262,6 +323,15 @@ class _UpdateFlow:
     # ---------- 下载 ----------
 
     def _start_download(self, e=None):
+        if not getattr(self.info, "has_checksum", lambda: bool(self._sha))():
+            # 没有校验值 = 无法证明这个包是官方那份，App 内下载直接不开工
+            self._status.value = ("该版本没有提供 SHA-256 校验值，App 内安装已停用；"
+                                  "请点「用平板浏览器下载安装」并用上面的官方地址核对。")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         self._download_btn.visible = False
         self._bar.visible = True
         self._status.value = "正在下载更新包…"
@@ -284,20 +354,30 @@ class _UpdateFlow:
             except Exception:
                 pass
 
-        return download_update(self.info, progress=on_progress)
+        try:
+            return download_update(self.info, progress=on_progress)
+        except ChecksumError as e:
+            # 与网络失败分开上报：下载失败可以重试，内容不对必须换官方通路
+            return {"ok": False, "checksum": True, "error": str(e)}
 
     def _download_done(self, result):
         # run_bg 兜底约定：异常被包装成 {"ok": False, "error": ...}
         if isinstance(result, dict) and result.get("ok") is False:
             self._bar.visible = False
             self._bar.value = 0
-            self._status.value = "下载失败：" + str(result.get("error") or "网络异常")
-            self._download_btn.visible = True
-            self._download_btn.content = ft.Text("重试下载")
+            if result.get("checksum"):
+                self._status.value = (
+                    "校验失败，已删除下载文件、未安装：" + str(result.get("error") or "")
+                    + "。请用上面的官方地址手动下载并核对 SHA-256。")
+                self._download_btn.visible = False
+            else:
+                self._status.value = "下载失败：" + str(result.get("error") or "网络异常")
+                self._download_btn.visible = True
+                self._download_btn.content = ft.Text("重试下载")
         else:
             self._path = result
             self._bar.visible = False
-            self._status.value = ("下载完成。点「安装更新」试一键安装；"
+            self._status.value = ("下载完成，SHA-256 已校验通过。点「安装更新」试一键安装；"
                                   "若不可用会自动改用平板浏览器，全程不用电脑。")
             self._install_btn.visible = True
         try:
@@ -322,11 +402,13 @@ class _UpdateFlow:
         try:
             await ft.UrlLauncher().launch_url(
                 self._browser_url, mode=ft.LaunchMode.EXTERNAL_APPLICATION)
+            # 明确不宣称「已校验」：浏览器下载的文件 App 拿不到，校验只能是用户的活
             self._status.value = ("已交给平板浏览器下载：下载完点通知栏安装，"
-                                  "首次若提示「安装未知应用」允许一次即可，"
-                                  "全程不用电脑。")
+                                  "首次若提示「安装未知应用」允许一次即可。"
+                                  "浏览器下载无法自动校验，安装前请核对文件 "
+                                  "SHA-256 与上面那串一致。")
         except Exception as ex:
-            self._status.value = ("浏览器没打开成功，请长按复制上面的下载链接，"
+            self._status.value = ("浏览器没打开成功，请长按复制上面的官方安装包地址，"
                                   "贴到浏览器里打开。" + str(ex)[:60])
         try:
             self.page.update()
@@ -334,12 +416,27 @@ class _UpdateFlow:
             pass
 
     async def _install(self, e=None):
-        """App 内一键安装（pyjnius）；桥接不可用时自动切平板浏览器通路。"""
+        """App 内一键安装（pyjnius）；安装前复验 SHA-256，桥接不可用时切浏览器。"""
         if not self._path:
             await self._open_browser()
             return
         try:
-            started = install_apk(self._path)
+            started = install_apk(self._path,
+                                  getattr(self.info, "apk_sha256", ""))
+        except ChecksumError as ex:
+            # 第三道校验点没通过：删文件、禁止安装、把人引到官方通路
+            _rm(self._path)
+            self._path = None
+            self._install_btn.visible = False
+            self._download_btn.visible = True
+            self._download_btn.content = ft.Text("重新下载")
+            self._status.value = (f"安装已阻止：{ex}。文件已删除，"
+                                  "请重新下载或用上面的官方地址手动安装并核对 SHA-256。")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         except Exception:
             # 2026-11-16 老板平板：pyjnius 整链失败。旧文案让用户「从电脑上装」，
             # 但主力设备就是平板，等于没修 —— 现在自动走平板浏览器，全程不碰电脑。
