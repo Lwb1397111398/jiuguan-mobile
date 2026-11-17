@@ -30,9 +30,11 @@ python -m pytest tests/test_mobile_update.py tests/test_release_workflow.py -q
 
 推 `master` 后 **先测后发**：`test` job 跑 update 专项（`tests/test_mobile_update.py`）
 与手机测试（`tests/test_release_workflow.py`），`build` job 用 `needs: test` 挡在后面；
-两个 job 都只装 `constraints.txt` 锁定的已实测版本，环境变量 `PIP_CONSTRAINT`
-连 `flet build apk` 内部的 pip 调用一起约束。运行时依赖在 `requirements.txt`、
-开发/测试依赖在 `requirements-dev.txt`，两者分开。
+两个 job 都只装 `constraints.txt` 锁定的已实测版本（CI 工具链）；
+`flet build apk` 内部的 Android 独立环境不能套 `PIP_CONSTRAINT`（会与
+Python 3.14 / `--only-binary` 解析冲突），改由 `pyproject.toml` 的精确
+`==` pin 锁定。运行时依赖在 `requirements.txt`、开发/测试依赖在
+`requirements-dev.txt`，两者分开。
 
 - 不加 `-k` / `--ignore`；`--strict-markers --runxfail` + `tools/ci/check_pytest_results.py`
   逐条核查 JUnit，任何 skipped / xfail / failure 都会判红；失败时上传测试日志。

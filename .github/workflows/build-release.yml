@@ -94,7 +94,6 @@ jobs:
       contents: write
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
-      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
     steps:
       - name: Checkout (full history for build number)
         uses: actions/checkout@v4
@@ -119,7 +118,12 @@ jobs:
       - name: Install locked build toolchain (flet-cli 0.86.5)
         # 与 test job 用同一份锁文件、同一批已实测版本；运行时与开发依赖
         # 分文件管理（requirements.txt / requirements-dev.txt）。
-        # PIP_CONSTRAINT 同时约束 flet build apk 内部的 pip 调用。
+        # 锁只作用于这一步的 CI 工具链：flet build apk 内部会给 Android 打一个
+        # Python 3.14 + --only-binary 的独立环境，PIP_CONSTRAINT 若泄漏进去会
+        # 让平台专用解析直接 ResolutionImpossible（2026-11-17 实测）。
+        # APK 内依赖改由 pyproject.toml 的精确 pin 负责，不经环境变量。
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
         run: |
           python -m pip install --disable-pip-version-check -c constraints.txt -r requirements-dev.txt
           python -m pip check

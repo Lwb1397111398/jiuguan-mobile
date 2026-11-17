@@ -7,16 +7,22 @@ requires-python = ">=3.10"
 authors = [
     { name = "JiuGuan" }
 ]
+# 精确 pin 到 2026-11-17 已实测版本（constraints.txt 同源）。
+# flet build apk 会读这里给 Android 打独立环境，用 >= 会拉到未实测新版；
+# CI 自身的工具链则由 requirements*.txt + constraints.txt 锁定，两者互不干扰。
 dependencies = [
-    "flet>=0.86.5",
-    "requests>=2.31",
+    "flet==0.86.5",
+    "requests==2.34.2",
 ]
 
 [dependency-groups]
 dev = [
-    "flet-cli>=0.86.5",
-    "flet-desktop>=0.86.5",
-    "flet-web>=0.86.5",
+    "flet-cli==0.86.5",
+    "flet-desktop==0.86.5",
+    "flet-web==0.86.5",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "PyYAML==6.0.3",
 ]
 
 [tool.pytest.ini_options]
