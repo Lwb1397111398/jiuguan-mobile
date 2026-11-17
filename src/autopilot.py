@@ -30,6 +30,8 @@ import time
 from gen import start_generation
 
 from app.core.assembler import Assembler
+from app.core.dual_rules import (chapter_todo as core_chapter_todo,
+                                 parse_volume_split, volume_chapter_rule)
 
 STEP_LABELS = {
     "synopsis": "生成总纲", "synopsis_lock": "锁定总纲",
@@ -253,30 +255,17 @@ class AutoPilot:
         return None
 
     def _chapter_todo(self, ch: dict) -> dict | None:
+        """单章待办（规则见 core.dual_rules.chapter_todo）。
+
+        手机不生成细纲（supports_detail=False），大纲细化后直接写正文。
+        不能按 chapters.status 判完本：正文没写、状态仍停在「有大纲」时
+        必须返回 prose，否则会把整本书误报成「已完本」。
+        """
         store = self.session.store
         ch = store.get_chapter(ch["id"])
         if not ch:
             return None
-        status = ch.get("status") or "未规划"
-        if status == "未规划":
-            return {"kind": "outline", "chapter": ch}
-        # 与桌面 _chapter_todo 同口径：看 outline_refined（细化只置这个标记、
-        # 不动 status），否则「有大纲 + 已细化」会无限重排细化步骤。
-        if status == "有大纲" and not ch.get("outline_refined"):
-            return {"kind": "outline", "chapter": ch}
-        # 按大纲直写（2026-10-17）：不生成细纲，大纲细化后直接写正文
-        if store.get_prose_mode() == "outline":
-            if status in ("有大纲", "有细纲", "写作中"):
-                return {"kind": "prose", "chapter": ch}
-            if status == "已完成" and not store.memory_snapshot_for_chapter(ch["id"]):
-                return {"kind": "archive", "chapter": ch}
-            return None
-        if status in ("有细纲", "写作中"):
-            return {"kind": "prose", "chapter": ch}
-        if status == "已完成":
-            if not store.memory_snapshot_for_chapter(ch["id"]):
-                return {"kind": "archive", "chapter": ch}
-        return None
+        return core_chapter_todo(store, ch, supports_detail=False)
 
     def _on_step_result(self, step: dict):
         if not self._running or self._paused:
@@ -557,9 +546,11 @@ class AutoPilot:
                 self._lock_with_volumes(step["content"], step.get("title") or "",
                                         parsed["volumes"])
             elif kind == "volume_split":
-                chapters, err = Pipeline.parse_volume_chapters(text)
-                if err or not chapters:
-                    raise ValueError(f"切章解析失败：{err or '空'}")
+                # 解析门槛 + 章数校验与桌面同源（2026-11-17）
+                chapters, err = parse_volume_split(
+                    text, step.get("expect_chapters"))
+                if err:
+                    raise ValueError(err)
                 vol = step["volume"]
                 for c in chapters:
                     store.add_chapter({**c, "status": "有大纲",
@@ -639,14 +630,14 @@ class AutoPilot:
         from app.core.task_templates import render as render_task
         store = self.session.store
         vol = step["volume"]
-        mode = str(store.get_setting("volume_chapter_mode", "auto") or "auto")
-        raw = str(store.get_setting("volume_chapter_count", "") or "").strip()
-        rule = (f"本卷必须正好切分为 {raw} 章。" if mode == "exact" and raw.isdigit()
-                else "本卷章数不设硬性规定，由你根据剧情节奏与总纲篇幅自行判断。")
+        rule, expected = volume_chapter_rule(store)
+        # 期望章数在请求时快照进 step：重试/落库都按同一个数校验
+        step["expect_chapters"] = expected
         task = render_task("volume", store, chapter_rule=rule,
                            volume_no=vol.get("order_index") or 1,
                            volume_count=len(store.list_volumes()))
-        self._run_gen("volume", {"volume_id": vol["id"]}, task, step)
+        self._run_gen("volume", {"volume_id": vol["id"],
+                                 "expect_chapters": expected}, task, step)
 
     def _do_outline(self, step):
         from app.core.task_templates import render as render_task

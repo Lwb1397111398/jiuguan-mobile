@@ -462,15 +462,14 @@ class WritingPage:
         ed = getattr(self, "_desk_editor", None)
         if ch is None or ed is None:
             return ""
-        text = (ed.value or "").strip()
-        if not text:
-            return ""
+        # 与桌面同源：core.dual_rules.unsaved_prose_text（纯空白差异不算改过）
+        from app.core.dual_rules import unsaved_prose_text
         store = self.session.store
-        if text == (self._accepted_prose(ch["id"]) or "").strip():
-            return ""
-        if text == (store.prose_batch_merged(ch["id"]) or "").strip():
-            return ""
-        return text
+        return unsaved_prose_text(
+            ed.value or "",
+            (self._accepted_prose(ch["id"]),
+             store.prose_batch_merged(ch["id"])),
+        ).strip()
 
     def _goto_chapter(self, ch):
         """切到指定章（箭头、换一章、大纲页选章都走这里）。"""
@@ -1674,9 +1673,10 @@ class WritingPage:
 
     def _vol_write(self, vol: dict, title: str, summary: str):
         """保存卷名+描述并写回总纲本卷段。返回 (toast 文案, 需重建原因)。"""
+        from app.core.dual_rules import volume_title_or_default
         store = self.session.store
         saved = store.save_volume({"id": vol["id"],
-                                   "title": (title or "").strip() or "未命名分卷",
+                                   "title": volume_title_or_default(title),
                                    "summary": (summary or "").strip()})
         pushed = store.push_volume_to_synopsis_ex(vol["id"])
         suffix, reason = self._vol_after_write(pushed=pushed)
@@ -1691,8 +1691,9 @@ class WritingPage:
         name = T.field(hint="如 入局", autofocus=True)
 
         def _ok(ev):
+            from app.core.dual_rules import volume_title_or_default
             self.page.pop_dialog()
-            title = (name.value or "").strip() or "未命名分卷"
+            title = volume_title_or_default(name.value)
             v = store.insert_volume(len(store.list_volumes()) + 1,
                                     {"title": title, "summary": ""})
             self._vol_open_ids.add(v["id"])
@@ -4590,9 +4591,14 @@ class WritingPage:
         """整章一次调用：AI 只回传病灶段条目（P段号：改后的段落），
         程序把条目替换进初稿，其余段落原样保留（不经模型）。
         只改写法不改事实；结果与原版对比择一，点「应用并接受」直接落库。"""
-        from app.core.style_rewrite import apply_diff, build_whole
+        from app.core.dual_rules import rewrite_locked_reason
+        from app.core.style_rewrite import apply_diff, build_whole, thin_rewrite
         store = self.session.store
         cid = ch["id"]
+        locked = rewrite_locked_reason(store.get_chapter_prose_block(cid))
+        if locked:
+            toast(self.page, locked, error=True)
+            return
         ed = getattr(self, "_desk_editor", None)
         text = (ed.value if ed else "") or self._accepted_prose(cid)
         text = (text or "").strip()
@@ -4622,7 +4628,7 @@ class WritingPage:
                 toast(self.page, "未识别到替换条目（P段号：改写后的段落），输出可能不符合格式",
                       error=True)
                 return
-            res = apply_diff(text, repl, dels)
+            res = apply_diff(text, repl, dels, info.get("merges") or {})
             merged = res["text"]
             applied, skipped = res["applied"], res["skipped"]
             if skipped:
@@ -4646,16 +4652,29 @@ class WritingPage:
                 toast(self.page, "AI 判定全章无病灶，无需改写"
                       if info.get("none_declared") else "没有可落地的替换条目")
                 return
+            # 有人工对比 → 净删护栏只强警示、不拦（与桌面单章改写同口径）
+            try:
+                min_keep = float(store.get_setting(
+                    "rewrite_min_keep_ratio", "0.65") or 0.65)
+            except (TypeError, ValueError):
+                min_keep = 0.65
+            thin, ratio = thin_rewrite(text, merged, min_keep)
+            warn = ""
+            if thin:
+                warn = (f"注意：本章成稿只剩原稿的 {ratio:.0%}"
+                        f"（下限 {min_keep:.0%}），可能删过头；对比后再决定是否应用。")
             self._apply_diag(result, "prose_rewrite", merged)
-            self._pick_rewrite_version(ch, text, merged)
+            self._pick_rewrite_version(ch, text, merged, warn)
 
         start_generation(self.page, self.session, role="prose_rewrite",
                          context=ctx, task=task,
                          title=f"改写（整章 {len(text)} 字）", on_done=on_done,
                          on_started=on_started)
 
-    def _pick_rewrite_version(self, ch: dict, old: str, new: str):
+    def _pick_rewrite_version(self, ch: dict, old: str, new: str, warn: str = ""):
         """改写结果与原版对比择一（不做静默覆盖）。"""
+        warn_ctrl = ([ft.Text(warn, size=11, color=ft.Colors.ORANGE)]
+                     if warn else [])
         rg = ft.RadioGroup(value="new", content=ft.Column([
             ft.Radio(value="new", label=f"改写版（{len(new)} 字）"),
             ft.Radio(value="old", label=f"原版（{len(old)} 字）"),
@@ -4671,6 +4690,7 @@ class WritingPage:
         self.page.show_dialog(ft.BottomSheet(
             content=ft.Container(ft.Column([
                 ft.Text("改写完成，选一版", size=15, weight=ft.FontWeight.BOLD),
+                *warn_ctrl,
                 rg,
                 ft.Text("改写版", size=12, weight=ft.FontWeight.W_600),
                 ft.Container(ft.TextField(value=new, multiline=True, read_only=True,
