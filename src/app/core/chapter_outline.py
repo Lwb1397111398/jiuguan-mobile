@@ -30,6 +30,13 @@ _SECTION_START_RE = re.compile(r"^\s*(?:【[^】\r\n]+】|——)")
 # 模型爱给节拍标题自加粗，而加粗会挡住分批识别的行首节拍判定，大纲落库前统一剥掉。
 _BOLD_WHOLE_LINE_RE = re.compile(r"^\s*([*＊]){1,2}(.*?)\1{1,2}\s*$")
 
+# 子条目行：行首圈码紧跟括号数字（『①（1）…』『②(2)…』）。老板的大纲模板是
+# 两级结构——节拍N 标题行下挂 N（1）N（2）… 子条目，子条目行首圈码沿用父节拍。
+# 它不是顶级序号点：按顶级点解析会让序号重复（1,1,1,2,2,2…），分批标签变成
+# 『①、①、①、②、②』（2026-11-18 老板反馈）。判定收敛：圈码 == 当前点序号
+# 才并入（圈码不一致时维持原行为开新点，不动旧形态）。
+_SUB_POINT_RE = re.compile(r"^\s*([①-⑳])\s*[（(]\s*\d{1,3}\s*[)）]")
+
 
 def strip_whole_line_bold(text: str | None) -> str:
     """剥掉「整行被 ** 包裹」的加粗装饰，其余文字逐字保留。
@@ -158,6 +165,8 @@ def split_outline_points(content: str | None) -> list[dict]:
     序号时整段作为一个无编号点，便于旧项目平滑展示。
     【章末状态收束】【本章新增情节清单】等块标题行与「——展开…」节拍行
     独立成无序号点（自定义大纲模板兼容，预览更清晰）。
+    行首圈码紧跟括号数字（『①（1）…』）是节拍N 的子条目，并入当前点，
+    不当顶级序号点（老板模板两级结构，2026-11-18）。
     """
     text = str(content or "").strip()
     if not text:
@@ -166,6 +175,18 @@ def split_outline_points(content: str | None) -> list[dict]:
     current_index = 0
     current_lines: list[str] = []
     for line in text.splitlines():
+        sub = _SUB_POINT_RE.match(line)
+        if sub:
+            circled = _point_index(sub.group(1))
+            if current_lines and circled == current_index:
+                current_lines.append(line.strip())
+                continue
+            if not current_lines:
+                # 大纲开头就是子条目（无节拍标题行）：自立为父圈码的点
+                current_index = circled
+                current_lines = [line.strip()]
+                continue
+            # 圈码 != 当前点序号 → 维持旧行为（按序号点开新点）
         match = _POINT_START_RE.match(line)
         if match:
             if current_lines:

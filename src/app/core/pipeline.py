@@ -2161,7 +2161,7 @@ def plan_batches(blocks: list[dict], size: int, by_count: bool = False) -> list[
 
 _OUTLINE_BEAT_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?(?:[*＊]{1,2}\s*)?[—…\-–·．\.]{0,3}\s*"
-    r"(?:展开分卷节拍|分卷节拍|本章节拍|节拍)\s*"
+    r"(?:展开分卷|分卷|本章|展开)?节拍\s*"
     r"([①-⑳]|\d{1,2}|[一二两三四五六七八九十]{1,3})"
 )
 
