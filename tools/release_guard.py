@@ -15,7 +15,14 @@ r"""发版守卫（CI 与单测共用，纯标准库、不 import 项目代码�
    字段顺序与 `-->` 结尾都不能动 —— 0.1.52 及更早的客户端用
    `versionCode=(\d+)\s+versionName=([^\s>-]+)\s*-->` 整行匹配，多一个属性
    就会让它们解析失败、以为「已是最新版」，从此收不到任何更新。
-   所以哈希单独放第二行 `<!-- apkupdate apkSha256=<hex> -->`。
+   所以哈希（以及 2026-11-20 起的签名指纹）单独放第二行：
+
+       <!-- apkupdate apkSha256=<hex> apkSigner=<hex> -->
+
+   `apkSigner` 是**新包签名证书的 SHA-256**（公开信息，不含私钥）：App 端拿它
+   与本机 `_version.APP_SIGNER_SHA256` 比对，不同 = 这一版必须卸载重装
+   （详见 `src/update.py` 顶部与换钥方案 P0）。老客户端只解析首行，不受影响；
+   老 Release 没有 apkSigner，新客户端按「不知道」处理、不阻断更新。
    单测 `test_old_client_can_still_parse_new_notes` 钉死这条。
 
 2. **版本单调判定**（`decide` 子命令）：云端 latest 的 versionCode 比本次
@@ -51,6 +58,15 @@ def normalize_sha256(value) -> str:
     return s if _SHA256_RE.match(s) else ""
 
 
+def normalize_signer(value) -> str:
+    """规范化证书指纹（keytool 的 `FE:A1:…` 也吃）：非法返回空串。"""
+    s = str(value or "").strip().lower()
+    if s.startswith("sha256:"):
+        s = s[len("sha256:"):]
+    s = re.sub(r"[\s:\-]", "", s)
+    return s if _SHA256_RE.match(s) else ""
+
+
 def parse_version_code(body):
     """从 Release 说明里读 versionCode；没有元数据/格式不对返回 None。"""
     m = _META_RE.search(str(body or ""))
@@ -69,25 +85,39 @@ def metadata_line(build_num) -> str:
     return (f"<!-- appupdate versionCode={code} versionName=0.1.{code} -->")
 
 
-def sha256_line(sha256) -> str:
-    """哈希单独一行：新客户端会把这条注释和首行合并解析。"""
+def sha256_line(sha256, signer="") -> str:
+    """哈希（+可选签名指纹）单独一行：新客户端会把这条注释和首行合并解析。
+
+    只在 `signer` 非空时追加 `apkSigner`（老发版/手工发版没有这项）；给了但
+    格式非法就抛 ValueError —— 宁可不发版，也不能写一条 App 端会静默忽略
+    的假指纹（那等于换钥时没预警）。
+    """
     digest = normalize_sha256(sha256)
     if not digest:
         raise ValueError("SHA-256 缺失或格式非法，拒绝生成发版说明")
-    return f"<!-- apkupdate apkSha256={digest} -->"
+    attrs = f"apkSha256={digest}"
+    if str(signer or "").strip():
+        sig = normalize_signer(signer)
+        if not sig:
+            raise ValueError("apkSigner 格式非法（需要 64 位 hex 证书指纹），拒绝生成发版说明")
+        attrs += f" apkSigner={sig}"
+    return f"<!-- apkupdate {attrs} -->"
 
 
-def build_notes(build_num, sha256, commits="") -> str:
+def build_notes(build_num, sha256, commits="", signer="") -> str:
     """生成完整 Release 说明：两行元数据 + 更新内容 + 校验值 + 人工安装提示。"""
     digest = normalize_sha256(sha256)
     if not digest:
         raise ValueError("SHA-256 缺失或格式非法，拒绝生成发版说明")
+    sig = normalize_signer(signer) if str(signer or "").strip() else ""
+    if str(signer or "").strip() and not sig:
+        raise ValueError("apkSigner 格式非法（需要 64 位 hex 证书指纹），拒绝生成发版说明")
     body = str(commits or "").strip()
     if not body:
         body = "- （本次提交没有可用说明）"
-    return "\n".join([
+    lines = [
         metadata_line(build_num),
-        sha256_line(digest),
+        sha256_line(digest, sig),
         "",
         "## 更新内容",
         "",
@@ -99,13 +129,26 @@ def build_notes(build_num, sha256, commits="") -> str:
         "",
         digest,
         "",
+    ]
+    if sig:
+        lines += [
+            "## 签名证书（SHA-256）",
+            "",
+            sig,
+            "",
+            "App 内更新会用它判断「能否直接覆盖安装」：与本机指纹不同时会提示"
+            "先备份、卸载旧版、再安装新包（安卓不允许签名不同的包覆盖安装）。",
+            "",
+        ]
+    lines += [
         "App 内更新会自动校验这个值，校验不通过不会安装；"
         "用浏览器手动下载的，安装前请自行核对文件 SHA-256 与上面一致。",
         "",
         "官方地址："
         f"https://github.com/{REPO}/releases/download/latest/{ASSET_NAME}",
         "",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def decide(remote_code, build_num) -> str:
@@ -131,6 +174,8 @@ def main(argv=None) -> int:
     p_notes = sub.add_parser("notes", help="生成 Release 说明（含 SHA-256 元数据）")
     p_notes.add_argument("--build-num", required=True, type=int)
     p_notes.add_argument("--sha256", required=True)
+    # 签名指纹：CI 必须传（发版检查单要求）；本地手工发版可不传（老格式）
+    p_notes.add_argument("--signer", default="")
     p_notes.add_argument("--commits-file", default="")
     p_notes.add_argument("--out", required=True)
 
@@ -143,7 +188,8 @@ def main(argv=None) -> int:
     if args.cmd == "notes":
         try:
             text = build_notes(args.build_num, args.sha256,
-                               _read(args.commits_file) if args.commits_file else "")
+                               _read(args.commits_file) if args.commits_file else "",
+                               signer=args.signer)
         except ValueError as e:
             print(f"release_guard: {e}", file=sys.stderr)
             return 2

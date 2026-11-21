@@ -55,9 +55,12 @@ class JailbreakLibrary:
     @staticmethod
     def _summary(text: str) -> str:
         jb = _jb_api()
-        mode, head, prelude, tail, prefill, order = jb.parse_jailbreak_full(text or "")
+        # 第七项是工具会话骨架（2026-11-21）：不列出来，老板会以为那段内容丢了
+        (mode, head, prelude, tail, prefill, order,
+         session) = jb.parse_jailbreak_full_ex(text or "")
         segs = [n for n, v in (("锚定", head), ("预确认", prelude), ("条款", order),
-                              ("推杆", tail), ("预填充", prefill)) if (v or "").strip()]
+                              ("推杆", tail), ("预填充", prefill),
+                              ("工具会话骨架", session)) if (v or "").strip()]
         label = jb.JB_MODE_LABELS.get(mode, mode)
         return f"{label} · {'＋'.join(segs) if segs else '空破甲'} · {len(text or '')} 字"
 
@@ -324,22 +327,28 @@ class JailbreakLibrary:
 
     def _edit_dialog(self, text: str, name: str, old_name):
         jb = _jb_api()
-        mode, head, prelude, tail, prefill, order = jb.parse_jailbreak_full(text or "")
+        (mode, head, prelude, tail, prefill, order,
+         session) = jb.parse_jailbreak_full_ex(text or "")
         head_ex, prelude_ex, order_ex, tail_ex, prefill_ex = self._examples()
+        session_ex = jb.TOOLSESSION_EXAMPLE
 
         name_f = T.field("", name, dense=True)
         # 裸下拉（后面要读 mode_dd.value 交给 build_jailbreak_text）
         mode_dd = T.select("", mode, [
             (jb.JB_MODE_LAYERED, jb.JB_MODE_LABELS[jb.JB_MODE_LAYERED]),
             (jb.JB_MODE_RUNTIME, jb.JB_MODE_LABELS[jb.JB_MODE_RUNTIME]),
+            (jb.JB_MODE_TOOLLOOP, jb.JB_MODE_LABELS[jb.JB_MODE_TOOLLOOP]),
         ])
-        # 五段文本框不再带 label：_seg() 已经在框上方排了「① 锚定层」标题 + 说明，
+        # 各段文本框不再带 label：_seg() 已经在框上方排了「① 锚定层」标题 + 说明，
         # 再叠一个浮标签等于同一句话写两遍。
         head_f = T.field("", head, multiline=True, min_lines=3, max_lines=7)
         prelude_f = T.field("", prelude, multiline=True, min_lines=3, max_lines=7)
         tail_f = T.field("", tail, multiline=True, min_lines=2, max_lines=5)
         order_f = T.field("", order, multiline=True, min_lines=2, max_lines=7)
         prefill_f = T.field("", prefill, multiline=True, min_lines=2, max_lines=5)
+        # 第六段：工具会话骨架。编辑器按段重拼文件，少了这一格，
+        # 打开这套破甲再保存就会把骨架整段丢掉（桌面同款修复，2026-11-21）。
+        session_f = T.field("", session, multiline=True, min_lines=8, max_lines=16)
 
         def _seg(title: str, tip: str, field: ft.TextField, example: str,
                  warning: str = "") -> ft.Control:
@@ -363,7 +372,9 @@ class JailbreakLibrary:
         form = ft.Column([
             T.field_group(name_f, "破甲名称"),
             T.field_group(mode_dd, "投放模式"),
-            ft.Text("破甲分五段注入，每段都可留空（全空 = 不注入）。点「填示例」填入内置参考写法。",
+            ft.Text("破甲分段注入，每段都可留空（全空 = 不注入）。点「填示例」填入内置参考写法。\n"
+                    "「工具会话骨架」只在「工具会话」模式下生效：以 @system/@user/"
+                    "@call/@tool/@tools 描述整份报文的角色序列。",
                     size=11, color=T.muted()),
             _seg("① 锚定层", "注入最后一条 system 消息，负责身份定性（建议三五行）",
                  head_f, head_ex),
@@ -375,6 +386,8 @@ class JailbreakLibrary:
             _seg("⑤ 预填充层", "作为请求最后一条 assistant 消息预填开头，让模型接着往下写"
                               "（只对部分模型有效，留空则不产生这条消息）",
                  prefill_f, prefill_ex),
+            _seg("⑥ 工具会话骨架", "仅「工具会话」模式生效；{{CONTEXT}}/{{TASK}} 是素材与任务的注入点",
+                 session_f, session_ex),
         ], scroll=ft.ScrollMode.AUTO, spacing=2)
 
         def _cancel(ev):
@@ -410,7 +423,8 @@ class JailbreakLibrary:
             body = jb.build_jailbreak_text(head_f.value or "", prelude_f.value or "",
                                           tail_f.value or "", mode_dd.value,
                                           prefill_f.value or "",
-                                          order_f.value or "")
+                                          order_f.value or "",
+                                          session_f.value or "")
             pre = (prelude_f.value or "").strip()
             if pre and not jb.parse_prelude(pre):
                 self.page.pop_dialog()

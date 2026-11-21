@@ -19,6 +19,8 @@ UI 面向手机：确认环节用 bottom sheet / 对话框。
 生成结果的拒答/截断/未写完判定统一走 `src/diagnose.py`，落库前必过
 `_guard_incomplete`（与桌面「应用结果」同口径）。
 """
+import threading
+
 import flet as ft
 
 import theme as T
@@ -28,6 +30,9 @@ from gen import start_generation
 
 from app.core.assembler import Assembler
 
+# 写作台编辑器「停止键入多久后自动存草稿」。桌面 WritingDesk 同为 800ms；
+# 太快会在长篇里反复写库（手机上还占 IO），太慢则杀进程丢得多。
+DRAFT_DEBOUNCE_SECONDS = 0.8
 
 
 def chapter_rule_text(store) -> tuple[str, int | None]:
@@ -87,10 +92,76 @@ class WritingPage:
         self._batch_req = ""        # 分批创作要求（每批注入）
         self._batch_plan = ""       # 批次规划文本（每批注入，可重新规划）
         self._batch_partial = ""    # 已累积的全部批次原文（尚未落库）
+        # 写作台编辑器「停止键入自动存草稿」（2026-11-19，矩阵 B3）：
+        # 桌面 WritingDesk 早有这条（800ms → store.save_text_block_draft），手机
+        # 只有点「接受本章」才落库，误关/被杀就丢。这里对齐桌面，但判据更严：
+        # 只有「底稿本来就在库里」或「从空白起手写」才自动存；AI 生成稿、
+        # 续写预览、批次合并预览一律不因自动存稿进库（红线一：接受才落库）。
+        self._editor_shown = ""          # 程序化载入的文本（用户没动过 → 不是手写稿）
+        self._editor_chapter_id = None   # 编辑器内容归属的章（切章后旧回调不许写新章）
+        self._editor_store = None        # 归属的项目库（换项目后旧回调一律放弃）
+        self._editor_loaded_db = ""      # 载入时库里的整章正文（后台落库检测基线）
+        self._editor_from_db = False     # 底稿来自库（可自动存）/ 来自程序预览（不可）
+        self._editor_base_empty = False  # 底稿为空（从零手写，允许建草稿块）
+        self._draft_timer = None         # threading.Timer（防抖，Flet 无 QTimer）
+        self._draft_seq = 0              # 键入序号：旧定时器醒来发现序号变了就放弃
+        self._draft_lock = threading.RLock()
+        self._draft_delay = DRAFT_DEBOUNCE_SECONDS   # 测试可调小
+        self._timer_factory = threading.Timer        # 测试可换成同步假定时器
 
     # ---------- 通用 ----------
 
     TAB_LABELS = ["总纲", "分卷", "大纲", "写作台", "记忆", "设定"]
+
+    def invalidate(self):
+        """整机替换（全量导入）前让本页彻底停手，之后本实例不再使用。
+
+        必须做全的五件事，少一件就可能「跨越库替换继续写」：
+        ① 停两台自动模式引擎（它们的工作线程会 create/update 章节与正文）；
+        ② 停当前流式任务（pipeline 线程会写 request_logs / 草稿）；
+        ③ 取消防抖存稿定时器，并 +1 序号让已醒来的回调自己放弃；
+        ④ 断开编辑器绑定（旧编辑器 + 新库同 id 章节 = 串稿写入）；
+        ⑤ 清空切章接力队列与分批状态机（它们的回调会按旧计划写库）。
+        页面实例随后由 runtime 丢弃重建，这里只保证「即使还有人持有它也写不进」。
+        """
+        for name in ("_ap", "_ap_outline"):
+            ap = getattr(self, name, None)
+            if ap is not None:
+                try:
+                    ap.stop()
+                except Exception:
+                    pass
+            setattr(self, name, None)
+        self._ap_retrying = ""
+
+        task, self._task = getattr(self, "_task", None), None
+        if task is not None:
+            try:
+                task.stop()
+            except Exception:
+                pass
+
+        self._cancel_draft_timer()      # 序号 +1：旧定时器醒来一律判废
+        with self._draft_lock:
+            self._desk_editor = None
+            self._editor_chapter_id = None
+            self._editor_store = None
+            self._editor_shown = ""
+            self._editor_loaded_db = ""
+            self._editor_from_db = False
+            self._editor_base_empty = False
+
+        self._relay_queue = []
+        self._batch_running = False
+        self._batch_no = 0
+        self._batch_snapshot = ""
+        self._batch_req = ""
+        self._batch_plan = ""
+        self._batch_partial = ""
+        self._chapter_id = None
+        self._chapter_scope = None
+        self._pending_rewrite.clear()
+        self._vol_open_ids.clear()
 
     def build(self) -> ft.Control:
         if not self.session.has_project:
@@ -291,6 +362,9 @@ class WritingPage:
             pass
 
     def refresh(self):
+        # 整页重建会换掉 TextField：先把还没到 800ms 的手改稿冲刷落库，
+        # 否则重建后编辑器按库内容重填，这段字就没了（矩阵 B3）。
+        self.flush_editor_draft()
         # 总纲分批运行中：批次成果在内存累积区（库内容还是旧总纲），整页重建会把
         # 界面刷回旧库内容、盖掉确认框底下的批次展示——只做轻量刷新（对齐桌面
         # synopsis_page.refresh 的跳过防呆）；批次链结束走落库/放弃 → 恢复正常刷新。
@@ -454,10 +528,14 @@ class WritingPage:
         ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     def _unsaved_editor_text(self, ch) -> str:
-        """编辑器里还没「接受本章」的手改稿（空串 = 没有 / 与库内一致）。
+        """编辑器里还没落库的手改稿（空串 = 没有 / 与库内一致）。
 
         加「上一章/下一章」后切章变成高频动作，不拦一下等于把刚手写的段落
         直接丢掉（切章会整页重建，编辑器按库内正文重新填）。
+        2026-11-19 起自动存草稿（矩阵 B3）会把「停手 800ms 后的手改」写进
+        整章正文块，所以判据必须把**库里的草稿文本**也算作「已落库」——
+        否则每次切章都为已经存好的草稿弹一次确认。AI 预览/合并预览不在库里，
+        仍然照旧拦一下。
         """
         ed = getattr(self, "_desk_editor", None)
         if ch is None or ed is None:
@@ -465,11 +543,13 @@ class WritingPage:
         # 与桌面同源：core.dual_rules.unsaved_prose_text（纯空白差异不算改过）
         from app.core.dual_rules import unsaved_prose_text
         store = self.session.store
-        return unsaved_prose_text(
-            ed.value or "",
-            (self._accepted_prose(ch["id"]),
-             store.prose_batch_merged(ch["id"])),
-        ).strip()
+        candidates = [self._accepted_prose(ch["id"]),
+                      store.prose_batch_merged(ch["id"])]
+        if getattr(self, "_editor_chapter_id", None) == ch["id"]:
+            # 同一章：整章正文块里的草稿也算已落库（桌面 _stash_chapter_draft
+            # 也是把 chapter_prose_text 作为候选之一）
+            candidates.append(store.chapter_prose_text(ch["id"]))
+        return unsaved_prose_text(ed.value or "", candidates).strip()
 
     def _goto_chapter(self, ch):
         """切到指定章（箭头、换一章、大纲页选章都走这里）。"""
@@ -478,6 +558,9 @@ class WritingPage:
         if self._task is not None and not self._task.stopped:
             toast(self.page, "正在生成，先停止再切章", error=True)
             return
+        # 切章前先冲刷：停手没到 800ms 的手改稿先落库，再判断「有没有没落库的稿」
+        # （否则刚打完字就切章，确认框会拦下其实已经能存的正文）。
+        self.flush_editor_draft()
         if self._unsaved_editor_text(self._current_chapter()):
             confirm(self.page, "本章还有没落库的手改稿",
                     "切到别的章会把编辑器里这段没点「接受本章」的正文丢掉。"
@@ -2951,6 +3034,170 @@ class WritingPage:
 
     # ---------- 写作台：编辑器区（一次性 / 分批共用） ----------
 
+    # ---------- 写作台：手改稿自动存草稿（矩阵 B3） ----------
+
+    def _generating(self) -> bool:
+        """是否正在流式生成：这段时间编辑器里是 AI 稿，不算手写。"""
+        t = self._task
+        return t is not None and not getattr(t, "stopped", False)
+
+    def _cancel_draft_timer(self):
+        """取消待触发的防抖存稿（序号 +1 让已醒来的旧回调自己放弃）。"""
+        with self._draft_lock:
+            self._draft_seq += 1
+            timer, self._draft_timer = self._draft_timer, None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _on_editor_change(self, e=None):
+        """真实键入入口（对齐桌面 `_on_editor_text_changed`）。
+
+        Flet 的 `on_change` 只在用户输入时触发；程序化赋值（AI 流式上屏、
+        `_set_editor`、批次合并预览）不会走到这里——即便在某些平台被误触发，
+        `_editor_shown` 判据也会把它挡在写库之前。
+        """
+        if self._generating():
+            return
+        self._schedule_draft_save()
+
+    def _schedule_draft_save(self):
+        """重启「停止键入 800ms」防抖：连续键入只落最后一稿。"""
+        self._cancel_draft_timer()
+        with self._draft_lock:
+            editor = getattr(self, "_desk_editor", None)
+            cid = self._editor_chapter_id
+            if editor is None or cid is None:
+                return
+            # 三件套（章 id / 库 / 编辑器）一次取齐：定时器醒来要按这套判据
+            # 确认「还是同一章、同一块编辑器」，缺一个都可能把旧稿写进新章。
+            timer = self._timer_factory(
+                self._draft_delay, self._draft_timer_fired,
+                args=(self._draft_seq, cid, self._editor_store, editor))
+            # 守护线程：进程退出不等它——正常退出/切后台会先走 flush_editor_draft。
+            timer.daemon = True
+            self._draft_timer = timer
+            timer.start()
+
+    def _draft_timer_fired(self, seq: int, cid, store, editor):
+        """防抖到点（定时器线程）：确认还是同一章、同一块编辑器才落库。"""
+        if seq != self._draft_seq:
+            return
+        if getattr(self, "_desk_editor", None) is not editor:
+            return
+        if getattr(self, "_editor_chapter_id", None) != cid:
+            return
+        self._autosave_draft(chapter_id=cid, store=store, editor=editor)
+
+    def flush_editor_draft(self) -> bool:
+        """立即冲刷待保存的手改稿（切章 / 切后台 / 退出 / 整页重建前调用）。
+
+        返回是否真的写入了一份草稿。取消防抖，不等 800ms。
+        """
+        self._cancel_draft_timer()
+        return self._autosave_draft()
+
+    def _autosave_draft(self, chapter_id=None, store=None, editor=None) -> bool:
+        """把手写正文存成草稿（防抖到点 / 冲刷时调用，矩阵 B3）。
+
+        与桌面 `WritingDesk._autosave_draft` 同职责，判据更严（红线一）：
+        · 底稿必须「本来就在库里」或「从空白起手写」；AI 生成稿、续写预览、
+          批次合并预览 —— 无论用户有没有在上面动字，一律不因自动保存落库；
+        · 生成中 / 已锁定 / 空文本 / 与库文本相同 → 不写；
+        · 后台刚落库了新稿（库内容 ≠ 载入时基线）→ 放弃，绝不覆盖较新的正文；
+        · 只写 content（`store.save_chapter_prose_draft`），不推进版本/章节状态，
+          同 version 首次手改前保留旧稿快照。
+        """
+        with self._draft_lock:
+            store = store or self.session.store
+            editor = editor if editor is not None else getattr(self, "_desk_editor", None)
+            cid = chapter_id if chapter_id is not None else self._editor_chapter_id
+            if store is None or editor is None or cid is None:
+                return False
+            if getattr(store, "is_closed", False):
+                return False
+            if self._editor_store is not store:
+                return False          # 换过项目：旧编辑器内容不属于这本
+            if self._editor_chapter_id != cid:
+                return False          # 已切章：旧内容绝不能写进新章
+            if getattr(self, "_desk_editor", None) is not editor:
+                return False          # 页面已重建：这块编辑器不在屏幕上了
+            if self._generating():
+                return False
+            if not (self._editor_from_db or self._editor_base_empty):
+                return False          # 底稿是程序预览（AI 稿/批次合并）：不许自动落库
+            text = editor.value or ""
+            if not text.strip():
+                return False          # 绝不把正文存成空壳
+            if text == (self._editor_loaded_db or ""):
+                return False          # 与库一致，没必要写
+            if text == (self._editor_shown or ""):
+                return False          # 程序载入的原文，用户没动过
+            try:
+                saved = store.save_chapter_prose_draft(
+                    cid, text, create_if_missing=(not self._editor_from_db),
+                    expect_content=self._editor_loaded_db or "")
+            except Exception:
+                return False          # 存草稿是尽力而为，失败不打断输入
+            if not saved:
+                return False
+            # 库里现在是「屏幕上的这份」：基线跟着走，后续键入继续按增量存。
+            self._editor_loaded_db = text
+            self._editor_from_db = True
+            self._editor_base_empty = False
+            return True
+
+    def _chapter_prose_locked(self, cid: int, tb: dict | None = None) -> bool:
+        """本章正文是否锁定（整章块优先；没有整章块时看分块正文）。"""
+        if tb is not None:
+            return tb.get("status") == "已锁定"
+        return any(b.get("status") == "已锁定" and (b.get("content") or "").strip()
+                   for b in self.session.store.list_text_blocks(cid))
+
+    def _chapter_editor_source(self, ch: dict, whole: bool) -> dict:
+        """编辑器底稿从哪来（决定「能不能自动存草稿」）。
+
+        优先级与桌面 `_load_chapter_editor` 一致：整章正文块（含自动存的草稿）
+        → 已接受/已锁定的分块正文 → 分批合并预览 → 空。
+
+        `from_db` = 底稿就是库里的整章正文；`base_empty` = 从空白起手写。
+        两者都为假（AI 预览 / 合并预览）时自动存稿一律不写库。
+        """
+        store = self.session.store
+        cid = ch["id"]
+        tb = store.get_chapter_prose_block(cid)
+        db_text = (tb.get("content") or "") if tb else ""
+        locked = self._chapter_prose_locked(cid, tb)
+        if db_text.strip():
+            return {"text": db_text, "db_text": db_text, "from_db": True,
+                    "base_empty": False, "locked": locked, "tb": tb}
+        prose = self._accepted_prose(cid)
+        if not whole and not prose.strip():
+            prose = store.prose_batch_merged(cid)
+        return {"text": prose, "db_text": db_text,
+                "from_db": bool(tb is not None and (prose or "") == db_text),
+                "base_empty": not (prose or "").strip(),
+                "locked": locked, "tb": tb}
+
+    def _bind_editor(self, editor, ch: dict, src: dict):
+        """登记「这块编辑器代表哪一章的哪种底稿」——自动存稿的全部判据来源。
+
+        字段更新必须在 `_draft_lock` 内一次做完：定时器线程可能正卡在
+        `_autosave_draft` 的判据中间，半新半旧的字段会让「旧编辑器 + 新章 id」
+        组合出一次串稿写入（矩阵 B3 红线）。
+        """
+        self._cancel_draft_timer()      # 上一块编辑器的待存内容作废（已由 refresh 冲刷）
+        with self._draft_lock:
+            self._desk_editor = editor
+            self._editor_shown = src["text"] or ""
+            self._editor_chapter_id = ch["id"]
+            self._editor_store = self.session.store
+            self._editor_loaded_db = src["db_text"] or ""
+            self._editor_from_db = bool(src["from_db"])
+            self._editor_base_empty = bool(src["base_empty"])
+
     def _desk_editor_block(self, ch: dict, whole: bool,
                            reserved_px: int | None = None) -> list:
         """编辑器区：正文纸 + 一句提示。
@@ -2969,9 +3216,8 @@ class WritingPage:
         reserved_px=None：分批模式，纸在长列表里跟着排（不 expand，14 行）；
         给值时：文字区按视口换算行数（纸本体会 expand 撑满）。
         """
-        prose = self._accepted_prose(ch["id"])
-        if not whole and not prose.strip():
-            prose = self.session.store.prose_batch_merged(ch["id"])
+        src = self._chapter_editor_source(ch, whole)
+        prose = src["text"]
         fill = reserved_px is not None
         # 不 expand（分批模式，纸在长列表里）时给 8 行：14/10 行都会让首屏只露出
         # 半张纸、被底部操作栏硬切一刀，看着像布局崩了。分批模式的首屏重点是
@@ -2986,6 +3232,10 @@ class WritingPage:
                        "分批的合并预览显示在这里，检查/修改后「接受本章」落库；"
                        "也可手写"),
             multiline=True,
+            # 已锁定的正文只读：手改无处落库（自动存稿也会拒绝），
+            # 让「改不动」在界面上就是真的改不动（桌面 _load_chapter_editor 同口径）。
+            read_only=bool(src["locked"]),
+            on_change=self._on_editor_change,
             # min 与 max 都给 lines：只给 min_lines 时 TextField 会随内容一路
             # 长高（整章 5000 字 → 纸长到 3000px），把底部操作栏顶穿。
             min_lines=lines,
@@ -2997,7 +3247,7 @@ class WritingPage:
             border=ft.InputBorder.NONE,
             content_padding=ft.Padding(left=18, right=18, top=14, bottom=14),
         )
-        self._desk_editor = editor
+        self._bind_editor(editor, ch, src)
 
         def _focus(e):
             # 点纸的任意空白处都把焦点给输入框（否则大纸下半截点了没反应）
@@ -3020,8 +3270,15 @@ class WritingPage:
         )
         # 提示只留一行：长说明会把纸挤矮（原来两行 40px，手机上正好把最后
         # 一段正文顶到操作栏底下）。细节都在「更多」里。
-        tip = ("改完点「接受本章」落库，旧版自动存快照" if whole else
-               "检查合并预览后点「接受本章」落库")
+        tb = src["tb"]
+        if src["locked"]:
+            tip = "本章正文已锁定：不可编辑（自动存稿也不会动它）"
+        elif (tb is not None and tb.get("status") not in ("已接受", "已锁定")
+              and (src["db_text"] or "").strip()):
+            tip = "手改稿已自动存为草稿；点「接受本章」落库（旧版存快照）"
+        else:
+            tip = ("改完点「接受本章」落库，旧版自动存快照" if whole else
+                   "检查合并预览后点「接受本章」落库")
         return [paper, T.hint_text(tip, size=10)]
 
     def _chapter_desk_controls(self, ch: dict) -> list:
@@ -3754,14 +4011,30 @@ class WritingPage:
         accepted = [b for b in blocks if b["status"] in ("已接受", "已锁定")]
         return "\n\n".join(b["content"] for b in accepted)
 
-    def _set_editor(self, text: str):
+    def _set_editor(self, text: str, from_db: bool = False):
+        """程序化设置编辑器文本（不触发自动存稿）。
+
+        同时记 `_editor_shown`：程序展示的 AI 稿 / 合并预览不是用户手写，
+        自动存稿据此绕开它（与桌面同名判据同义，2026-11-19 矩阵 B3）。
+        `from_db=True` 只给「把库里正文原样回填」用，此后允许继续自动存草稿。
+        **其他情况（含生成前清空、流式输出、改写预览、清空编辑器）一律不算
+        手写底稿**——否则「生成中途停止 + 用户改两个字」会把 AI 半截稿自动存进库。
+        """
+        self._cancel_draft_timer()      # 程序覆盖 = 之前未刷的键入作废
         ed = getattr(self, "_desk_editor", None)
-        if ed is not None:
+        if ed is None:
+            return
+        # 值 + 判据字段一起换（锁内）：否则定时器可能在「值已换、_editor_shown
+        # 还没换」的缝里把 AI 预览当成手写稿存进库（矩阵 B3 红线一）。
+        with self._draft_lock:
+            self._editor_shown = text or ""
+            self._editor_from_db = bool(from_db)
+            self._editor_base_empty = False
             ed.value = text
-            try:
-                self.page.update()
-            except Exception:
-                pass
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     def _prose_stop(self, e):
         if self._task:
@@ -3792,6 +4065,9 @@ class WritingPage:
         # 按大纲直写：组装器跳过细纲，只用本章大纲（对齐桌面，2026-10-17）
         if store.get_prose_mode() == "outline":
             context["outline_only"] = True
+        # 生成前先冲刷手改稿：on_started 会清空编辑器接流式输出，不先存就丢
+        # （矩阵 B3；AI 稿仍要用户点「接受本章」才落库，这条只存手写稿）。
+        self.flush_editor_draft()
         self._task = None
         prose_holder = {"text": ""}
 
@@ -3807,6 +4083,9 @@ class WritingPage:
             # 超过这个量只在下面的收尾里一次性落纸，用户仍能看到「已生成 N 字」。
             if ed is not None and len(buffer) <= 6000:
                 ed.value = buffer
+                # 这是程序上屏的 AI 稿：记成「程序展示文本」，自动存稿必须绕开
+                # （即便个别平台把赋值也当成 on_change 回调过来）。
+                self._editor_shown = buffer
 
         def on_done(result):
             self._task = None
@@ -3814,7 +4093,11 @@ class WritingPage:
                             f"chars={len(prose_holder['text'])}")
             if not result.get("ok"):
                 if not prose_holder["text"]:
-                    self._set_editor(self._accepted_prose(cid))
+                    fallback = self._accepted_prose(cid)
+                    # 回填的就是库里的正文才允许接着自动存草稿（分块正文拼出来的
+                    # 文本与整章块不是同一份，不能当基线）。
+                    self._set_editor(fallback,
+                                     from_db=(fallback == (self._editor_loaded_db or "")))
                 return
             if result.get("status") == "stopped":
                 toast(self.page, "已停止（保留已生成部分，可手动修改或重新生成）")

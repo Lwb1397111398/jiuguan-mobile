@@ -64,6 +64,23 @@ def diagnose(result, role: str, text: str, batch_continue: bool = False):
                 "输出疑似拒答（可能未按要求生成正文）。可直接编辑当前内容后落库，"
                 "或换个档案重新生成（落库前会再确认一次）。")
 
+    # 3.5) 批尾状态栏收货（2026-11-11 桌面引入，2026-11-19 放宽判据后对齐）：
+    #      输出停在【滚动状态包】里 = 正文已写完（协议顺序固定：正文 → 状态包 →
+    #      完成标志）。**判据不再绑定 truncated**：渠道超时/网关掐线/不给
+    #      finish_reason 的中断（abrupt）同样算——状态包只是锦上添花，不能让
+    #      完整正文被判「没写完」而重新生成。reason 留空 = 落库前不弹确认。
+    #      判据 = 状态栏已开始 **且** 没有正常完成信号（end_mark 缺失或 length 截断）。
+    #      正常写完的稿子（end_mark=True 且未截断）即使带完整状态包也不算「未完结」，
+    #      据此不误标；判据与桌面 TaskRunDialog/pipeline 同源。
+    state_bar_ok = bool(result.get("state_bar_accepted")) or (
+        state_bar_started(text)
+        and (not result.get("end_mark", True) or bool(result.get("truncated"))))
+    if state_bar_ok:
+        return ("", "",
+                "正文已完整收下，仅批尾状态栏（【滚动状态包】）未完结——"
+                "状态包只是给下一批接力用的提示信息，缺字段时会自动退化为"
+                "末尾两段衔接，不影响正文。可直接落库。")
+
     # 4) 连接被服务端/网关中途掐断（EOF 但没收到结束标记）
     if result.get("abrupt"):
         secs = (result.get("duration_ms") or 0) / 1000
@@ -73,17 +90,9 @@ def diagnose(result, role: str, text: str, batch_continue: bool = False):
                 "（如 100 秒）或网络波动，内容可能没写完。若反复出现，"
                 "建议到「模型」页把该档案的超时调大，并确认渠道没有短超时限制。")
 
-    # 5) 上限截断（finish_reason=length）——带状态栏收货豁免（2026-11-11 桌面同款）：
-    #    正文已写到批尾状态栏（【滚动状态包】标记行 / 连续字段行出现在输出末尾窗口）
-    #    时，正文本身已完整，渠道只是掐在状态栏里 → 不判「疑似不完整」（reason 留空，
-    #    落库前不弹确认），只给一条正常提示——对齐桌面 TaskRunDialog：正文完整
-    #    不亮异常、不设 _incomplete_reason。
+    # 5) 上限截断（finish_reason=length）：状态栏已开始的场景已由 3.5 收货，
+    #    走到这里必然是正文中间被截断。
     if result.get("truncated"):
-        if state_bar_started(text):
-            return ("", "",
-                    "输出在末尾状态栏处被长度上限截断——正文已完整收下，残缺状态栏"
-                    "不影响正文（分批接力缺字段时自动退化为末尾两段衔接），"
-                    "可直接落库。")
         cont = int(result.get("continued") or 0)
         reason = (f"输出被长度上限截断（已自动续写 {cont} 轮仍被截断）" if cont > 0
                   else "输出被长度上限截断")

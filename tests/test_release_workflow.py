@@ -228,3 +228,118 @@ def test_guard_cli_decide_missing_file_is_upload(tmp_path, capsys):
                      "--remote-body-file", str(tmp_path / "nope.txt")])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "upload"
+
+
+# ---------- 2026-11-20 P0：apkSigner 元数据 + 构建期注入/自检 ----------
+
+SIGNER = "d" * 64
+
+
+def _colon(fp):
+    return ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()
+
+
+def _step_index(name_part):
+    for i, s in enumerate(_steps()):
+        if name_part in str(s.get("name") or ""):
+            return i
+    raise AssertionError(f"workflow 里找不到步骤：{name_part}")
+
+
+def test_build_notes_includes_signer_on_second_line():
+    """签名指纹进第二行；首行一字不动；App 端能解析出来。"""
+    notes = guard.build_notes(61, DIGEST, "- x", signer=_colon(SIGNER))
+    lines = notes.splitlines()
+    assert lines[0] == "<!-- appupdate versionCode=61 versionName=0.1.61 -->"
+    assert lines[1] == ("<!-- apkupdate apkSha256=%s apkSigner=%s -->"
+                        % (DIGEST, SIGNER))
+    assert SIGNER in notes                      # 人可读段也摊开，供人工核对
+    info = update.parse_release({
+        "name": "0.1.61", "body": notes,
+        "assets": [{"name": update.ASSET_NAME, "size": 1,
+                    "browser_download_url": "https://github.com/x/y.apk"}]})
+    assert info is not None
+    assert info.apk_sha256 == DIGEST
+    assert info.apk_signer == SIGNER
+
+
+def test_build_notes_without_signer_keeps_old_second_line():
+    """老格式（手工发版/没指纹）第二行仍是纯 apkSha256，App 端当「不知道」。"""
+    notes = guard.build_notes(61, DIGEST)
+    assert notes.splitlines()[1] == "<!-- apkupdate apkSha256=%s -->" % DIGEST
+    info = update.parse_release({
+        "name": "x", "body": notes,
+        "assets": [{"name": update.ASSET_NAME, "size": 1,
+                    "browser_download_url": "u"}]})
+    assert info.apk_signer == ""
+    assert info.has_signer() is False
+
+
+def test_guard_refuses_bad_signer():
+    """指纹给了但格式非法 → 拒绝发版（不能让 App 端静默忽略，换钥就没预警了）。"""
+    for bad in ("deadbeef", "z" * 64, "a" * 63):
+        with pytest.raises(ValueError):
+            guard.build_notes(61, DIGEST, signer=bad)
+        with pytest.raises(ValueError):
+            guard.sha256_line(DIGEST, signer=bad)
+
+
+def test_guard_cli_notes_accepts_signer(tmp_path):
+    out = tmp_path / "notes.md"
+    rc = guard.main(["notes", "--build-num", "61", "--sha256", DIGEST,
+                     "--signer", _colon(SIGNER), "--out", str(out)])
+    assert rc == 0
+    text = out.read_text(encoding="utf-8")
+    assert ("<!-- apkupdate apkSha256=%s apkSigner=%s -->" % (DIGEST, SIGNER)
+            in text)
+
+
+def test_old_client_can_still_parse_notes_with_signer():
+    """兼容红线：带 apkSigner 的说明，首行仍能被旧客户端严格正则解析。"""
+    import re
+    old_re = re.compile(
+        r"<!--\s*appupdate\s+versionCode=(\d+)\s+versionName=([^\s>-]+)\s*-->")
+    first = guard.build_notes(61, DIGEST, signer=SIGNER).splitlines()[0].strip()
+    m = old_re.search(first)
+    assert m and (m.group(1), m.group(2)) == ("61", "0.1.61")
+    assert "apkSigner" not in first
+
+
+def test_workflow_injects_signer_before_build():
+    """构建前：从 keystore 算指纹 → 写进 _version.py → 再构建。"""
+    step = _step("Compute signer fingerprint")
+    assert step.get("id") == "signer"
+    run = str(step.get("run") or "")
+    assert "signer_guard.py keystore" in run
+    assert "--keystore" in run and "--alias" in run
+
+    ver_run = str(_step("Generate _version.py").get("run") or "")
+    assert "APP_SIGNER_SHA256" in ver_run
+    assert "steps.signer.outputs.sha256" in ver_run
+
+    assert _step_index("Compute signer fingerprint") < \
+        _step_index("Generate _version.py") < _step_index("Build APK")
+
+
+def test_workflow_verifies_apk_signer_after_build():
+    """构建后：用 apksigner 核对产物签名与注入值一致（不一致拒绝发版）。"""
+    run = str(_step("Verify APK signer").get("run") or "")
+    assert "signer_guard.py verify" in run
+    assert "--expected" in run and "steps.signer.outputs.sha256" in run
+    assert _step_index("Stage APK") < _step_index("Verify APK signer")
+
+
+def test_notes_step_passes_signer():
+    step = _step("Write release notes")
+    env = step.get("env") or {}
+    assert "steps.signer.outputs.sha256" in str(env.get("APK_SIGNER") or "")
+    assert "--signer" in str(step.get("run") or "")
+
+
+def test_published_metadata_asserts_signer():
+    step = _step("Verify published release metadata")
+    run = str(step.get("run") or "").lower()
+    assert "apksigner" in run
+    assert 'attrs.get("apksigner") == signer' in run
+    env = step.get("env") or {}
+    assert "steps.signer.outputs.sha256" in str(env.get("APK_SIGNER") or "")

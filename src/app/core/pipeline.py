@@ -3591,7 +3591,19 @@ class Pipeline:
         # 兼容外部/测试客户端旧签名：没有思考回调时无需传入新参数。
         if on_thinking is not None:
             complete_kwargs["on_thinking"] = on_thinking
+        # 工具交稿（破甲档案 ---MODE:TOOLLOOP---）：只有 build 带 tools 时才传，
+        # 普通档案与测试用的假客户端仍走原来的签名，一个字节都不变。
+        if build.get("tools"):
+            complete_kwargs["tools"] = build["tools"]
+            if build.get("tool_choice") is not None:
+                complete_kwargs["tool_choice"] = build["tool_choice"]
+            if build.get("tool_reply"):
+                complete_kwargs["tool_reply"] = build["tool_reply"]
         resp = client.complete(build["messages"], **complete_kwargs)
+        # 工具交稿失败（调了工具但参数字段里没有正文）：必须当场报错。
+        # 静默当成功会让下游把「空正文」判成模型拒答 → 自动模式加码破限 → 方向全错。
+        if resp.get("tool_error") and not (resp.get("text") or "").strip():
+            raise ApiError("工具交稿失败：%s" % resp["tool_error"])
         # 截断自动续写（防截断）：只在 finish_reason=length（硬信号）、开关开、
         # 长文本创作角色、且已有正文时触发；JSON 类角色拼接必坏，永不续写。
         # 状态栏已开始时跳过（2026-11-11 老板需求）：正文已写完，续写状态栏
@@ -3649,24 +3661,29 @@ class Pipeline:
         # 通过即视为完成，避免把完整产物当半截稿废弃、白烧一轮重试 token。
         # 判据一律「保守优先」（证据不足返回 False），标志正常命中时完全不参与。
         complete_fallback = ""
+        state_bar_accepted = False
         if not end_mark_found:
             fb_ok, fb_note = self._structural_complete(role, formal_text, context)
             if fb_ok:
                 end_mark_found = True
                 complete_fallback = fb_note
-        # 状态栏截断收货豁免（2026-11-11 老板需求）：正文写完、渠道把输出掐在
-        # 批尾状态栏里（truncated=finish_reason=length 硬信号，safety_blocked
-        # 时 truncated 恒为 False 天然排除——平台审核掐断的处置协议不变）。
-        # 正文已完整，残缺状态栏只影响下一批的接力注入（parse_batch_prose 会
-        # 切走残栏；缺字段时下一批退化为「末尾两段」衔接），不值得烧续写轮
-        # 再整章重写。此处把 end_mark 归一为 True，自动模式/手动窗不再按
-        # 「未写完」重试；complete_fallback 让老板看得见这次收货的依据。
-        if (not end_mark_found and resp.get("truncated")
-                and role in ("prose", "prose_rewrite")
+        # 批尾状态栏收货豁免（2026-11-11 老板需求，2026-11-19 放宽判据）：正文写完、
+        # 输出停在批尾状态栏里时按完成收货——状态包只是「锦上添花」，只影响下一批的
+        # 接力注入（parse_batch_prose 会切走残栏；缺字段时下一批退化为「末尾两段」
+        # 衔接），不值得烧续写轮再整章重写。
+        # **判据只认 state_bar_started，不再要求 truncated**：旧版绑 truncated
+        # （finish_reason=length）才豁免，渠道超时/网关掐线/不给 finish_reason 的
+        # 中断（truncated=False）照样被判「未写完」重生成——老板 2026-11-19 实测
+        # 自动模式正是这样反复重跑。协议顺序固定为「正文 → 状态包 → 完成标志」，
+        # 状态包开头出现 = 正文已写完，与它是被长度上限还是连接中断掐断无关。
+        # safety_blocked（平台审核）不在此列：审核掐断的处置协议不变（不重试、
+        # 不换渠道），且 auto_pilot/手动窗的审核分支都排在收货提示之前。
+        if (not end_mark_found and role in ("prose", "prose_rewrite")
                 and state_bar_started(formal_text)):
             end_mark_found = True
-            complete_fallback = ("状态栏已开始后被输出上限截断：正文已完整，"
-                                 "残缺状态栏不影响正文，按完成收货")
+            state_bar_accepted = True
+            complete_fallback = ("批尾状态栏已开始：正文已完整，状态包没写完不影响正文，"
+                                 "按完成收货")
         # 中间残留标志兜底清理（2026-09-10）：模型把标志打在正文中间（分节/多段
         # 输出时常见）时，末尾剥离拿不到 → 标志随内容落库。这里对「强形式」标志行
         # 做一次全文清理（只认【生成完毕】这类，绝不碰「本章完/结束。」等正常行文）。
@@ -3747,6 +3764,10 @@ class Pipeline:
             "reasoning_tokens": int(resp.get("reasoning_tokens") or 0),
             # 输出完成标志是否命中（软截断检测；开关关闭时恒 True 不参与判定）
             "end_mark": bool(end_mark_found),
+            # 因「批尾状态栏已开始」而按完成收货（正文完整、状态包没写完）。
+            # 与截断原因无关（length / 连接中断 / 渠道不给 finish_reason 都算），
+            # 手动窗与自动模式据此显式标注「仅滚动状态包未完结」，双端同源。
+            "state_bar_accepted": bool(state_bar_accepted),
             # 标志缺失但结构完整性备选通过时的依据说明（未用到为空串）：
             # UI 据此提示「未见标志，按结构完整性判定为完成」，自动模式不重试。
             "complete_fallback": complete_fallback,

@@ -26,6 +26,7 @@ from update import (
     ChecksumError,
     NetworkError,
     NoReleaseError,
+    SignerMismatchError,
     _remove_quiet as _rm,
     browser_url_or_latest,
     check_update,
@@ -34,9 +35,11 @@ from update import (
     get_local_version,
     install_apk,
     is_android,
+    local_signer_sha256,
     official_apk_url,
     official_release_page,
     should_auto_check,
+    signer_short,
 )
 from widgets import toast
 
@@ -45,12 +48,16 @@ CHECK_DELAY = 8  # 启动后延迟秒数：避开启动高峰，也避免弹窗�
 
 # ---------- 检查更新卡片（「我的」页顶部 + 设置页共用） ----------
 
-def update_card(page, session) -> ft.Control:
+def update_card(page, session, on_go_backup=None) -> ft.Control:
     """「当前版本 + 检查更新」卡片。
 
     2026-11-16 从设置页最底部提升为「我的」页顶部第一张卡（老板：更新按钮
     不该藏在二十张设置卡片后面）；设置页保留同款卡片（引用同一实现）。
-    桌面预览模式显示「仅手机版可用」。"""
+    桌面预览模式显示「仅手机版可用」。
+
+    on_go_backup：换签名版本的弹窗里「先备份」要跳到导出流程。「我的」页传
+    `_export_full`；设置页没有备份入口，传 None（弹窗改为文字指引）。
+    """
     from update import (LATEST_MIRROR_URL, get_local_version, is_android,
                         jnius_diag, platform_diag)
     code, name = get_local_version()
@@ -92,7 +99,7 @@ def update_card(page, session) -> ft.Control:
             page.update()
         except Exception:
             return
-        job, done = manual_check(page)
+        job, done = manual_check(page, on_go_backup)
         from bridge import run_bg
         run_bg(page, job, done)
 
@@ -153,13 +160,25 @@ def schedule_silent_check(page, session):
 
 
 def _silent_check(page, session):
-    """后台线程：静默检查，任何失败都不打扰用户。"""
+    """后台线程：静默检查，任何失败都不打扰用户。
+
+    全量导入会换掉整个 Session：这条 8 秒定时器如果还活着，会把
+    `update_last_check` 写进**导入后**的配置（旧定时器落库，老板明确禁止）。
+    会话一失效就直接放弃，连写配置都不做。
+    """
+    if not getattr(session, "alive", True):
+        return
     try:
         local_code, _ = get_local_version()
         info = check_update(local_code)
-        session.app.set_setting("update_last_check", str(time.time()))
     except Exception:
         return  # 静默：网络失败/云端没发布都跳过，等下次启动
+    if not getattr(session, "alive", True):
+        return
+    try:
+        session.app.set_setting("update_last_check", str(time.time()))
+    except Exception:
+        pass
     if info is None:
         return
     try:
@@ -170,7 +189,7 @@ def _silent_check(page, session):
 
 # ---------- 手动检查（设置页「检查更新」按钮） ----------
 
-def manual_check(page):
+def manual_check(page, on_go_backup=None):
     """设置页入口。返回 job/done 两个函数，交 run_bg 执行。"""
     def job():
         try:
@@ -193,7 +212,7 @@ def manual_check(page):
                 toast(page, "已是最新版")
             else:
                 try:
-                    show_update_sheet(page, info)
+                    show_update_sheet(page, info, on_go_backup)
                 except Exception:
                     pass
         elif kind == "norelease":
@@ -208,9 +227,12 @@ def manual_check(page):
 
 # ---------- 更新弹窗 ----------
 
-def show_update_sheet(page, info):
-    """弹「发现新版本」BottomSheet：主推平板浏览器安装 + App 内一键安装备选。"""
-    flow = _UpdateFlow(page, info)
+def show_update_sheet(page, info, on_go_backup=None):
+    """弹「发现新版本」BottomSheet：主推平板浏览器安装 + App 内一键安装备选。
+
+    `info.signer_changed()` 为真时弹窗换成「换签名迁移」版式（不提供安装器入口）。
+    """
+    flow = _UpdateFlow(page, info, on_go_backup)
     page.show_dialog(ft.BottomSheet(
         content=flow.build(), show_drag_handle=True, use_safe_area=True))
 
@@ -218,10 +240,16 @@ def show_update_sheet(page, info):
 class _UpdateFlow:
     """一个弹窗对应一个实例：持有控件引用，下载线程只碰这些控件。"""
 
-    def __init__(self, page, info):
+    def __init__(self, page, info, on_go_backup=None):
         self.page = page
         self.info = info
+        self._on_go_backup = on_go_backup
         self._path = None
+        # 远端签名与本机不同：不能覆盖安装，整个弹窗换成迁移版式（2026-11-20）
+        try:
+            self._signer_changed = bool(info.signer_changed())
+        except Exception:
+            self._signer_changed = False
         self._bar = ft.ProgressBar(value=0, visible=False)
         self._status = ft.Text("", size=12,
                                color=ft.Colors.ON_SURFACE_VARIANT)
@@ -241,6 +269,9 @@ class _UpdateFlow:
         self._release_page = official_release_page()
         self._mirror_url = self._browser_url
         self._sha = format_sha256(getattr(info, "apk_sha256", ""))
+        self._remote_signer = signer_short(
+            getattr(info, "apk_signer", ""))
+        self._local_signer = signer_short(local_signer_sha256())
         self._link = ft.Text(self._official_url, size=10, selectable=True,
                              color=ft.Colors.ON_SURFACE_VARIANT)
         self._mirror_link = ft.Text(self._mirror_url, size=10, selectable=True,
@@ -251,9 +282,18 @@ class _UpdateFlow:
         self._sha_text = ft.Text(
             self._sha or "该版本未提供 SHA-256（App 内下载安装已停用）",
             size=10, selectable=True, color=ft.Colors.ON_SURFACE_VARIANT)
+        self._signer_text = ft.Text(
+            (f"远端 {self._remote_signer or '未提供'}"
+             f"　本机 {self._local_signer or '未知'}"),
+            size=10, selectable=True, color=ft.Colors.ON_SURFACE_VARIANT)
         if not getattr(info, "has_checksum", lambda: bool(self._sha))():
             # 无法校验就不给 App 内安装入口：宁可只能走浏览器，也不装来路不明的包
             self._download_btn.disabled = True
+        if self._signer_changed:
+            # 签名不同：App 内下载/安装必然失败（安卓拒绝覆盖），一律不提供
+            self._download_btn.disabled = True
+            self._download_btn.visible = False
+            self._install_btn.visible = False
 
     def _mid_height(self):
         """中部信息区高度：至少 200、最多 420，随屏幕高收缩。
@@ -272,6 +312,8 @@ class _UpdateFlow:
 
     def build(self):
         cur, _ = get_local_version()
+        if self._signer_changed:
+            return self._build_migration(cur)
         parts = [
             ft.Row([
                 ft.Icon(ft.Icons.SYSTEM_UPDATE, color=ft.Colors.PRIMARY),
@@ -320,9 +362,121 @@ class _UpdateFlow:
         return ft.Container(ft.Column(parts, spacing=8),
                             padding=16, width=520)
 
+    # ---------- 换签名迁移版式（2026-11-20 P0） ----------
+
+    def _build_migration(self, cur):
+        """远端换了签名：**不给安装器入口**，只给「先备份」和「官方下载页」。
+
+        老板要求（P0 第 4 条）：远端指纹与本地不同时禁止直接调用安装器，
+        改为「先备份 / 打开官方下载页」。点「安装更新」只会得到系统级
+        「应用未安装」，用户根本看不出要先备份卸载——所以入口直接换掉。
+        """
+        steps = [
+            "① 先备份：「我的 → 全量备份 → 导出备份」，完成后点"
+            "「另存到手机」存进「下载」，或「分享」到网盘/微信。"
+            "卸载 App 不会删掉那份文件。",
+            "② 卸载旧版：系统设置 → 应用 → 酒馆小说生成器 → 卸载"
+            "（数据随卸载删除，第①步已经兜住）。",
+            "③ 安装新包：用下面的官方下载页下载并安装。",
+            "④ 导入恢复：打开新版 →「我的 → 导入备份」→ 选第①步的备份文件，"
+            "输入当时的密码。",
+        ]
+        mid = [
+            ft.Text("这一版更换了应用签名（旧签名已不再安全）。安卓不允许"
+                    "「签名不同」的版本直接覆盖安装，点「安装更新」只会提示"
+                    "「应用未安装」。", size=12, color=T.warn()),
+            *[ft.Text(s, size=12, selectable=True) for s in steps],
+        ]
+        if self.info.notes:
+            mid.append(ft.Text(self.info.notes, size=11, selectable=True))
+        mid += [
+            ft.Text("签名指纹（公开信息，可对照 Release 说明）", size=10,
+                    color=ft.Colors.ON_SURFACE_VARIANT),
+            self._signer_text,
+            ft.Text("官方下载页（先看说明再下载；可核对 SHA-256 与签名指纹）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._release_link,
+            ft.Text("官方安装包直链（github.com 原站，可长按复制）", size=10,
+                    color=ft.Colors.ON_SURFACE_VARIANT),
+            self._link,
+            ft.Text("SHA-256（安装前请核对下载到的文件哈希与这一串完全一致）",
+                    size=10, color=ft.Colors.ON_SURFACE_VARIANT),
+            self._sha_text,
+            ft.Text("App 内下载与一键安装已停用：签名不同的包交给安装器也装不上，"
+                    "只会让你以为「更新坏了」。", size=10,
+                    color=ft.Colors.ON_SURFACE_VARIANT),
+        ]
+        go_backup = ft.FilledButton("先备份", on_click=self._go_backup)
+        open_page = ft.FilledButton("打开官方下载页",
+                                    on_click=self._open_official_page)
+        return ft.Container(ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.SYSTEM_UPDATE, color=T.warn()),
+                ft.Text(f"新版本 {self.info.version_name}：需要卸载重装",
+                        size=16, weight=ft.FontWeight.BOLD, expand=True),
+            ]),
+            ft.Text(f"当前 build {cur}  →  新版 build {self.info.version_code}",
+                    size=13),
+            ft.Column(mid, spacing=8, scroll=ft.ScrollMode.AUTO,
+                      height=self._mid_height()),
+            self._status,
+            ft.Row([self._close_btn, go_backup, open_page], wrap=True,
+                   spacing=6, alignment=ft.MainAxisAlignment.END),
+        ], spacing=8), padding=16, width=520)
+
+    def _go_backup(self, e=None):
+        """「先备份」：跳到「我的」页的导出流程；没有回调就给文字指引。"""
+        if self._on_go_backup is not None:
+            try:
+                self.page.pop_dialog()
+            except Exception:
+                pass
+            try:
+                self._on_go_backup()
+                return
+            except Exception as ex:
+                self._status.value = (f"打开备份入口失败：{ex}。"
+                                      "请到「我的 → 全量备份」手动导出。")
+        else:
+            self._status.value = ("请到「我的 → 全量备份 → 导出备份」，完成后点"
+                                  "「另存到手机」或「分享」；确认文件已保存好，"
+                                  "再卸载旧版。")
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    async def _open_official_page(self, e=None):
+        """打开官方 Release 页（换签名时给用户看说明与下载，不给直装）。"""
+        self._status.value = "正在打开官方下载页…"
+        try:
+            self.page.update()
+        except Exception:
+            pass
+        try:
+            await ft.UrlLauncher().launch_url(
+                self._release_page, mode=ft.LaunchMode.EXTERNAL_APPLICATION)
+            self._status.value = ("已打开官方下载页：先备份，再下载安装；"
+                                  "装完打开新版导入备份。")
+        except Exception as ex:
+            self._status.value = ("浏览器没打开成功，请长按复制上面的官方下载页地址。"
+                                  + str(ex)[:60])
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
     # ---------- 下载 ----------
 
     def _start_download(self, e=None):
+        if self._signer_changed:
+            self._status.value = ("这一版更换了签名，不能覆盖安装：请先「先备份」，"
+                                  "再卸载旧版、从官方下载页装新包。")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         if not getattr(self.info, "has_checksum", lambda: bool(self._sha))():
             # 没有校验值 = 无法证明这个包是官方那份，App 内下载直接不开工
             self._status.value = ("该版本没有提供 SHA-256 校验值，App 内安装已停用；"
@@ -394,6 +548,10 @@ class _UpdateFlow:
         EXTERNAL_APPLICATION 明确交给外部浏览器，避免 in-app WebView 下不了
         APK。万一这步也失败，弹窗里已有可长按复制的直链兜底。
         """
+        if self._signer_changed:
+            # 换签名时「下载直链」装不上，改用官方下载页（含迁移说明）
+            await self._open_official_page()
+            return
         self._status.value = "正在打开平板浏览器…"
         try:
             self.page.update()
@@ -416,13 +574,33 @@ class _UpdateFlow:
             pass
 
     async def _install(self, e=None):
-        """App 内一键安装（pyjnius）；安装前复验 SHA-256，桥接不可用时切浏览器。"""
+        """App 内一键安装（pyjnius）；安装前复验 SHA-256 与签名，桥接不可用切浏览器。"""
+        if self._signer_changed:
+            # 签名不同：连安装器都不许调（调了只会得到系统级「应用未安装」）
+            self._status.value = ("安装已阻止：这一版更换了应用签名，安卓不允许覆盖安装。"
+                                  "请先备份 → 卸载旧版 → 安装新包 → 导入备份。")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         if not self._path:
             await self._open_browser()
             return
         try:
             started = install_apk(self._path,
-                                  getattr(self.info, "apk_sha256", ""))
+                                  getattr(self.info, "apk_sha256", ""),
+                                  expected_signer=getattr(self.info, "apk_signer", ""),
+                                  local_signer=local_signer_sha256())
+        except SignerMismatchError as ex:
+            # 最后一道签名闸门（与 SHA 校验分开）：不删文件也没意义，直接拦
+            self._install_btn.visible = False
+            self._status.value = (f"安装已阻止：{ex}")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            return
         except ChecksumError as ex:
             # 第三道校验点没通过：删文件、禁止安装、把人引到官方通路
             _rm(self._path)

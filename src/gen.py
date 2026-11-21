@@ -54,6 +54,9 @@ def _execute(page, pipe, role, context, task, title, on_done, on_text,
     ctx = {**context, "extra": extra} if extra else context
     tk = StreamTask(page)
     tk.on_text = on_text
+    # 登记到进程级任务表：全量导入前 bridge.stop_all_tasks() 一次叫停所有生成，
+    # 不依赖「页面有没有把这个 tk 存进 self._task」（弹层里发起的常常没存）。
+    tk.register()
 
     def job():
         if bare_profile is not None:
@@ -75,16 +78,21 @@ def _execute(page, pipe, role, context, task, title, on_done, on_text,
             pass
 
     def done(result):
-        if isinstance(result, dict) and result.get("ok") is False \
-                and result.get("error"):
-            toast(page, f"{title}失败：{result['error']}", error=True)
-        elif isinstance(result, dict) and result.get("channel_note"):
-            # 渠道故障自动切换的如实反馈（2026-09-18）：成功也提示换了哪条渠道
-            toast(page, result["channel_note"])
-        if on_done:
-            try:
-                on_done(result)
-            except Exception:
-                pass
+        try:
+            if isinstance(result, dict) and result.get("ok") is False \
+                    and result.get("error"):
+                toast(page, f"{title}失败：{result['error']}", error=True)
+            elif isinstance(result, dict) and result.get("channel_note"):
+                # 渠道故障自动切换的如实反馈（2026-09-18）：成功也提示换了哪条渠道
+                toast(page, result["channel_note"])
+            if on_done:
+                try:
+                    on_done(result)
+                except Exception:
+                    pass
+        finally:
+            # 无论回调有没有炸都要注销：否则任务表会留下已结束的僵尸任务
+            tk.unregister()
+
     from bridge import run_bg
     run_bg(page, job, done)

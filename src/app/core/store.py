@@ -2270,6 +2270,27 @@ class ProjectStore(QObject):
                 return sp
         return ""
 
+    def _save_text_block_draft_tx(self, row: dict, content: str):
+        """事务内版「存草稿」：同 version 未留痕则先补旧稿快照，然后覆写 content。
+
+        只改 content/updated_at——不动 status、不升 version、不发信号。
+        必须在 `_transaction()` 内调用（直接用 self.conn，勿套 _exec/_rows）。
+        """
+        block_id = row["id"]
+        old = row.get("content") or ""
+        content = content or ""
+        if old and old != content:
+            has = self.conn.execute(
+                "SELECT 1 FROM text_block_snapshots WHERE text_block_id=? AND version=?",
+                (block_id, row["version"])).fetchone()
+            if not has:
+                self.conn.execute(
+                    "INSERT INTO text_block_snapshots(text_block_id,version,content,created_at)"
+                    " VALUES(?,?,?,?)",
+                    (block_id, row["version"], old, db.now()))
+        self.conn.execute("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?",
+                          (content, db.now(), block_id))
+
     def save_text_block_draft(self, block_id: int, content: str):
         """保存草稿（覆写 content，不改 status、不发信号，可反复改）。
 
@@ -2285,19 +2306,71 @@ class ProjectStore(QObject):
             row = self.conn.execute("SELECT * FROM text_blocks WHERE id=?", (block_id,)).fetchone()
             if row is None:
                 return
-            row = dict(row)
-            old = row.get("content") or ""
-            if old and old != (content or ""):
-                has = self.conn.execute(
-                    "SELECT 1 FROM text_block_snapshots WHERE text_block_id=? AND version=?",
-                    (block_id, row["version"])).fetchone()
-                if not has:
-                    self.conn.execute(
-                        "INSERT INTO text_block_snapshots(text_block_id,version,content,created_at)"
-                        " VALUES(?,?,?,?)",
-                        (block_id, row["version"], old, db.now()))
-            self.conn.execute("UPDATE text_blocks SET content=?, updated_at=? WHERE id=?",
-                              (content, db.now(), block_id))
+            self._save_text_block_draft_tx(dict(row), content)
+
+    def save_chapter_prose_draft(self, chapter_id: int, content: str, *,
+                                 create_if_missing: bool = False,
+                                 expect_content: str | None = None) -> dict | None:
+        """把手改的整章正文存成草稿（双端「停止键入自动存稿」的共享接口）。
+
+        与 `accept_chapter_prose` 严格隔离：**不创建章节版本、不推进章节状态、
+        不给每次键入留快照**——只是覆写整章正文块的 content。语义：
+        - 空白内容不写（绝不把正文存成空壳）；
+        - 正文块「已锁定」→ 不写，返回 None（锁定章一个字都不许动）；
+        - 已有整章块 → 走 `save_text_block_draft` 同一套「同 version 首改补快照」；
+        - 没有整章块 → 只有 `create_if_missing=True` 才建 `kind='chapter'` 的
+          「草稿」块。手机端只在「编辑器本来就是空白、用户从零手写」时传 True；
+          底稿来自 AI/批次合并预览时必须传 False —— 程序预览不得因自动保存落库。
+        - `expect_content` 非 None 时做乐观锁：块当前 content 与它不等就放弃
+          （后台刚落了新稿，旧编辑器内容绝不能覆盖较新的正文）。
+
+        返回写入后的正文块；未写入返回 None。不 emit `texts_changed`（自动存稿
+        不该触发整页重载，否则用户正在打的字会被刷掉）。
+        """
+        content = content or ""
+        if not content.strip():
+            return None
+        # 先做一次无锁读：绝大多数「跳过」不写库，避免每次停顿都 bump write_seq
+        # （云同步靠它判断脏，白 bump 会让守护线程做无意义的指纹比对）。
+        tb = self.get_chapter_prose_block(chapter_id)
+        if tb is None:
+            if not create_if_missing:
+                return None
+        else:
+            if tb.get("status") == "已锁定":
+                return None
+            if (expect_content is not None
+                    and (tb.get("content") or "") != (expect_content or "")):
+                return None
+        block_id = None
+        with self._transaction():
+            rows = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM text_blocks WHERE chapter_id=? AND kind='chapter'"
+                " ORDER BY id", (chapter_id,)).fetchall()]
+            row = max(rows, key=lambda r: len(r.get("content") or "")) if rows else None
+            if row is None:
+                if not create_if_missing:
+                    return None
+                maxidx = self.conn.execute(
+                    "SELECT COALESCE(MAX(order_index),0) AS m FROM text_blocks"
+                    " WHERE chapter_id=?", (chapter_id,)).fetchone()
+                created = db.now()
+                cur = self.conn.execute(
+                    "INSERT INTO text_blocks(chapter_id,scene_block_id,order_index,content,"
+                    "status,version,kind,created_at,updated_at)"
+                    " VALUES(?,?,?,?,?,1,?,?,?)",
+                    (chapter_id, None, (int(maxidx["m"]) + 1) if maxidx else 1,
+                     content, "草稿", "chapter", created, created))
+                block_id = cur.lastrowid
+            else:
+                if row.get("status") == "已锁定":
+                    return None
+                if (expect_content is not None
+                        and (row.get("content") or "") != (expect_content or "")):
+                    return None
+                self._save_text_block_draft_tx(row, content)
+                block_id = row["id"]
+        return self.get_text_block(block_id)
 
     def accept_text_block(self, block_id: int, content: str):
         """接受正文：旧版自动存快照，version+1，状态→已接受（事务：读旧版+存快照+推进版本原子）。

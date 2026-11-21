@@ -67,12 +67,17 @@ jobs:
         # 不加 -k、不加 --ignore；--runxfail / --strict-markers 防止静默跳过。
         run: |
           python -m pytest tests/test_mobile_update.py -q -ra --strict-markers --runxfail --junitxml=junit-update.xml --tb=short 2>&1 | tee pytest-update.log
-          CI_MIN_TESTS=40 python tools/ci/check_pytest_results.py junit-update.xml
+          CI_MIN_TESTS=45 python tools/ci/check_pytest_results.py junit-update.xml
+
+      - name: 签名预埋专项（apkSigner / 指纹比较 / 禁止安装）
+        run: |
+          python -m pytest tests/test_mobile_signer.py -q -ra --strict-markers --runxfail --junitxml=junit-signer.xml --tb=short 2>&1 | tee pytest-signer.log
+          CI_MIN_TESTS=20 python tools/ci/check_pytest_results.py junit-signer.xml
 
       - name: 手机测试（发版契约 / Release 元数据兼容）
         run: |
           python -m pytest tests/test_release_workflow.py -q -ra --strict-markers --runxfail --junitxml=junit-mobile.xml --tb=short 2>&1 | tee pytest-mobile.log
-          CI_MIN_TESTS=10 python tools/ci/check_pytest_results.py junit-mobile.xml
+          CI_MIN_TESTS=15 python tools/ci/check_pytest_results.py junit-mobile.xml
 
       - name: Upload test logs on failure
         if: failure()
@@ -81,8 +86,10 @@ jobs:
           name: mobile-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             pytest-update.log
+            pytest-signer.log
             pytest-mobile.log
             junit-update.xml
+            junit-signer.xml
             junit-mobile.xml
           if-no-files-found: warn
           retention-days: 14
@@ -135,6 +142,19 @@ jobs:
           flutter-version: 3.44.8
           channel: stable
 
+      - name: Compute signer fingerprint (from keystore, before build)
+        id: signer
+        # 从**实际签名材料**算证书 SHA-256，注入 _version.py 供 App 端比对
+        # 「远端是否换了签名」。**不用 pyjnius**（老板平板整链失败）。
+        # 注意：这里的口令是仓库里那把已公开的旧钥口令（P1 换成 Secrets 后再改）。
+        run: |
+          SIGNER=$(python tools/signer_guard.py keystore \
+            --keystore android/keystore/app.keystore \
+            --alias androiddebugkey --storepass android)
+          test -n "$SIGNER" || { echo "算不出签名指纹，拒绝构建"; exit 1; }
+          echo "sha256=$SIGNER" >> "$GITHUB_OUTPUT"
+          echo "signer=$SIGNER"
+
       - name: Generate _version.py (pyjnius bridge fallback for update screen)
         run: |
           cat > src/_version.py <<EOF
@@ -142,6 +162,7 @@ jobs:
           # AUTO-GENERATED in CI before flet build. Do not edit.
           APP_VERSION_CODE = ${{ steps.ver.outputs.num }}
           APP_VERSION_NAME = "0.1.${{ steps.ver.outputs.num }}"
+          APP_SIGNER_SHA256 = "${{ steps.signer.outputs.sha256 }}"
           EOF
 
       - name: Build APK (arm64, unified signing)
@@ -161,6 +182,14 @@ jobs:
           cp "$SRC" jiuguan-novel.apk
           ls -la jiuguan-novel.apk
 
+      - name: Verify APK signer matches injected fingerprint (fail closed)
+        # 「打算用哪把钥」(keystore) 与「实际签成了什么」(APK) 必须一致；
+        # 不一致就拒绝发版——否则 App 端的换钥预警是错的（那才是真事故）。
+        run: |
+          python tools/signer_guard.py verify \
+            --expected "${{ steps.signer.outputs.sha256 }}" \
+            --apk jiuguan-novel.apk
+
       - name: Compute APK SHA-256
         id: sha
         run: |
@@ -168,16 +197,18 @@ jobs:
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
           echo "APK SHA-256: $SHA"
 
-      - name: Write release notes (metadata + SHA-256)
+      - name: Write release notes (metadata + SHA-256 + signer)
         env:
           BUILD_NUM: ${{ steps.ver.outputs.num }}
           APK_SHA256: ${{ steps.sha.outputs.sha256 }}
+          APK_SIGNER: ${{ steps.signer.outputs.sha256 }}
         run: |
           git log -5 --pretty=format:'- %s (%h)' > commits.txt
-          # 守卫模块校验哈希格式：缺失/非法直接非零退出，宁可不发版
+          # 守卫模块校验哈希/指纹格式：缺失/非法直接非零退出，宁可不发版
           python tools/release_guard.py notes \
             --build-num "$BUILD_NUM" \
             --sha256 "$APK_SHA256" \
+            --signer "$APK_SIGNER" \
             --commits-file commits.txt \
             --out notes.md
           head -3 notes.md
@@ -216,15 +247,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_NUM: ${{ steps.ver.outputs.num }}
           APK_SHA256: ${{ steps.sha.outputs.sha256 }}
+          APK_SIGNER: ${{ steps.signer.outputs.sha256 }}
         run: |
-          # 上传后回读云端说明，确认元数据/哈希真的落到了 GitHub（不信任本地文件）
+          # 上传后回读云端说明，确认元数据/哈希/签名指纹真的落到了 GitHub（不信任本地文件）
           gh release view latest --json body -q .body > published_body.txt
-          python - "$BUILD_NUM" "$APK_SHA256" <<'PY'
+          python - "$BUILD_NUM" "$APK_SHA256" "$APK_SIGNER" <<'PY'
           import re, sys
-          build, sha = sys.argv[1], sys.argv[2].lower()
+          build, sha, signer = sys.argv[1], sys.argv[2].lower(), sys.argv[3].lower()
           body = open("published_body.txt", encoding="utf-8").read()
           attrs = {}
-          # 两条注释都要看：首行 appupdate（旧客户端依赖）+ 第二行 apkupdate（哈希）
+          # 两条注释都要看：首行 appupdate（旧客户端依赖）+ 第二行 apkupdate（哈希/签名）
           for cmt in re.findall(r"<!--\s*appupdate\b([^>]*)-->|<!--\s*apkupdate\b([^>]*)-->",
                                 body):
               for part in cmt:
@@ -234,6 +266,8 @@ jobs:
                       attrs.setdefault(k.lower(), v)
           assert attrs.get("versioncode") == build, attrs
           assert attrs.get("apksha256") == sha, attrs
+          assert attrs.get("apksigner") == signer, attrs
           assert sha in body, "说明里缺少可读的 SHA-256"
-          print("published metadata OK:", attrs.get("versioncode"), sha)
+          assert signer in body, "说明里缺少可读的签名指纹"
+          print("published metadata OK:", attrs.get("versioncode"), sha, signer)
           PY

@@ -23,8 +23,10 @@ from .store import ProjectStore, lore_context_hit
 from .style_checker import high_frequency_phrases, recent_chapter_texts
 from .chapter_outline import chapter_outline_text, outline_draft_text
 from .jailbreak_builtin import (
-    JB_MODE_RUNTIME, LIGHT_PUSHER, parse_prelude, format_prelude, parse_jailbreak,
-    parse_jailbreak_full, split_jailbreak as _split_jailbreak, MODEL_PRELUDE_RULES,
+    JB_MODE_RUNTIME, JB_MODE_TOOLLOOP, LIGHT_PUSHER, parse_prelude, format_prelude,
+    parse_jailbreak, parse_jailbreak_full, parse_jailbreak_full_ex,
+    render_tool_session, split_jailbreak as _split_jailbreak,
+    split_jailbreak_mode, MODEL_PRELUDE_RULES,
     completion_guard_for_model, RUNTIME_HOST_DECLARATION,
 )
 from .recall import RecallIndex, norm as _rnorm, parse_title_setting, rumor_objects
@@ -2251,6 +2253,19 @@ class Assembler:
 
         modules: list[dict] = []
 
+        # 工具会话型破甲探测（2026-11-21）：这类破甲**自带思考协议**（预设要求
+        # 「think_nya 里千字以上、显式标号逐段推演六个维度」），与项目「思考纪律」
+        # （同一件事只推一遍、不预写成段正文、上限 2–3 万字）和「协议栈增强」
+        # （另一套思考预算）正面冲突——两套同时发，模型会一边被要求展开、一边被
+        # 要求收敛，结果是两头都不落地。既然这类破甲以预设为主，就让预设那套说了算：
+        # 探测到 toolloop 就**不再注入**这两个模块（预览里也不会出现，保持透明）。
+        # light 档不套骨架（等同关掉），此时仍按常规注入。
+        _toolloop_on = False
+        if (self.store.get_jailbreak_enabled()
+                and self.store.get_jailbreak_strength() != "light"):
+            _jb_probe = self.store.resolve_jailbreak_text_for_profile(profile) or ""
+            _toolloop_on = split_jailbreak_mode(_jb_probe)[0] == JB_MODE_TOOLLOOP
+
         def add(title, kind, text, priority, critical=False, order=None, **extra):
             # order：消息内排列位置（越小越靠前，None=沿用 priority 作位置）。
             # priority 只管超预算时的裁剪顺序，order 只管发送顺序，两者解耦：
@@ -2595,7 +2610,7 @@ class Assembler:
         # 第二个条件 context["protocol_stack"]：拒答重试轮的自动升级（总纲首轮被拒 →
         # 重试轮无条件挂栈），由 `pipeline.Pipeline.run` 置位，理由与实测数据见那里。
         # 提成变量是因为「思考纪律」要用它做互斥（见下方 4.4）。
-        stack_on = role == "synopsis" and (
+        stack_on = (not _toolloop_on) and role == "synopsis" and (
             context.get("protocol_stack")
             or self.store.get_setting_int("protocol_stack_enabled", 0))
         if stack_on:
@@ -2613,7 +2628,7 @@ class Assembler:
         # 与协议栈互斥：协议栈的「思考预算 3500 token / 逐项点名」是它把任务拉进
         # 「按格式执行」轨道的一部分（拒答重试的救命药），本段再压会破坏那 4/6 的收益。
         # critical=True：开关开着必须送达，静默被裁等于白开（与 end_mark / 协议栈同款经验）。
-        if think_guard_enabled(self.store) and not stack_on:
+        if think_guard_enabled(self.store) and not stack_on and not _toolloop_on:
             _tg = think_guard_text(role)
             if _tg:
                 add("思考纪律", "think_guard", _tg, 12, critical=True, order=12.5)
@@ -2724,8 +2739,48 @@ class Assembler:
             return out
         if mode != "full":
             return out  # off（memory）：纯机械提取，不注入任何破甲
-        jb_mode, head, prelude_text, tail, prefill_text, order_text = parse_jailbreak_full(jb_text)
+        (jb_mode, head, prelude_text, tail, prefill_text, order_text,
+         session_text) = parse_jailbreak_full_ex(jb_text)
         runtime = (jb_mode == JB_MODE_RUNTIME)
+        # 工具会话型（2026-11-21，形态来源见 jailbreak_builtin.JB_TOOL_MARKER）：
+        # 整套报文由骨架决定，锚定/预确认/条款/推杆一律降级成「user 侧内容」，
+        # 由 _finalize_toolloop 并入 {{CONTEXT}}/{{TASK}}——不再各自占 system 或
+        # 独立消息位。**形态一致就是这套破甲的效力来源**，别把这些段拆回去单发。
+        # 两个例外：① 强度 light 跳过骨架只留推杆（与 layered 降档口径一致）；
+        # ② build_bare（role=None，AI 识别/整理等辅助任务）不套骨架 —— 那些任务
+        #    要的是纯文本/JSON 交稿，工具交稿会把结果塞进字段、直接打断解析。
+        if jb_mode == JB_MODE_TOOLLOOP and role is not None:
+            if strength == "light":
+                if tail.strip():
+                    out.append({"title": "破限·推杆", "kind": "jailbreak_tail",
+                                "text": tail, "priority": 13, "critical": True})
+                return out
+            if not session_text.strip():
+                raise ValueError(
+                    "破甲档案声明了 ---MODE:TOOLLOOP--- 但没有 ---TOOLSESSION--- 段")
+            out.append({"title": "破限·工具会话骨架", "kind": "jailbreak_toolloop",
+                        "text": session_text, "priority": 5, "critical": True})
+            if head.strip():
+                out.append({"title": "破限·锚定（并入 user 侧）", "kind": "jailbreak",
+                            "text": head, "priority": 5, "critical": True})
+            if prelude_text.strip():
+                pairs = parse_prelude(prelude_text)
+                if pairs:
+                    out.append({"title": "破限·预确认（并入 user 侧）",
+                                "kind": "jailbreak_prelude", "text": prelude_text,
+                                "priority": 5, "critical": True, "pairs": pairs})
+            if order_text.strip():
+                out.append({"title": "破限·创作条款", "kind": "jailbreak_order",
+                            "text": order_text, "priority": 12, "critical": True})
+            if tail.strip():
+                pusher = (tail if force_full
+                          else self._dynamic_pusher(role, context, block, tail))
+                if pusher:
+                    out.append({"title": "破限·推杆", "kind": "jailbreak_tail",
+                                "text": pusher, "priority": 13, "critical": True})
+            # 预填充/收尾护栏不发：骨架末条是 tool（不是 assistant），
+            # 「大 user 之后要有 assistant 起手」那条形态锁已由骨架自带。
+            return out
         if runtime:
             # 运行时协议层：整块压 user 最末（priority 14 > 推杆 13）；协议层本体不进 system
             if head:
@@ -2954,6 +3009,11 @@ class Assembler:
 
         # 裁剪后按 order/priority 重排（发送顺序；裁剪移除的模块自然消失）
         modules.sort(key=lambda m: m.get("order", m["priority"]))
+        # 工具会话型（toolloop）：整份报文由破甲骨架决定，不走下面的 system/user
+        # 分派。放在这里而不是函数开头，是为了让预算裁剪/排序对两种形态完全一致
+        # ——被裁掉的模块不会出现在 {{CONTEXT}}/{{TASK}} 里，预览清单也对得上。
+        if any(m["kind"] == "jailbreak_toolloop" for m in modules):
+            return self._finalize_toolloop(modules, profile, role, dropped, budget)
         # 组装 messages（三层分布式破甲 + 预确认层）：
         # - kind=jailbreak（锚定层）：独立成最后一条 system，紧贴 user 任务（等效酒馆深度注入）
         # - kind=jailbreak_prelude（预确认层）：伪造 user/assistant 认账对话对，
@@ -3084,6 +3144,89 @@ class Assembler:
             "messages": messages,
             "modules": modules,
             "msg_modules": msg_modules,
+            "est_input_tokens": est_in,
+            "est_output_tokens": est_out,
+            "est_cost": round(est_cost, 4),
+            "dropped": dropped,
+            "budget": budget,
+        }
+
+    def _finalize_toolloop(self, modules: list[dict], profile: dict,
+                           role: str | None, dropped: list[str],
+                           budget: int) -> dict:
+        """工具会话型报文（---MODE:TOOLLOOP---）：全部模块拼成 user 侧内容，
+        交给破甲档案的 ---TOOLSESSION--- 骨架渲染成酒馆那种 messages + tools。
+
+        为什么不走常规分派：这套破甲的权重来自「模型以为自己在一个已经进行到
+        一半的工具流程里」——system 只有一句思考指令，素材与任务藏在 tool 返回
+        里，而它在伪造历史里已经亲口答应过要写。把锚定层单独发成第二条 system
+        就等于把这个形态破掉，权重立刻掉回普通宣言（见 docs/酒馆破限迁移总览.md
+        案例十四）。
+
+        预填充/收尾护栏不发：骨架末条是 tool 不是 assistant，那条「大 user 之后
+        要有 assistant 起手」的形态锁已由骨架自带。
+        """
+        skip = ("jailbreak_toolloop", "jailbreak_prefill", "jailbreak_prefill_tail")
+        mod_id = {id(m): i for i, m in enumerate(modules)}
+        pieces: list[str] = []
+        offsets: list[tuple[int, int, str]] = []
+        pos = 0
+        for m in modules:
+            if m["kind"] in skip:
+                continue
+            text = m.get("text") or ""
+            if m["kind"] == "jailbreak_prelude":
+                # toolloop 的伪造对话在骨架里；作者若另写了预确认对，降级成纯文本
+                # 并入 user 侧——信息不丢，也不多出几条独立消息破坏形态。
+                text = "\n".join(
+                    ("用户：%s" if str(p.get("role")) == "user" else "回应：%s")
+                    % str(p.get("content") or "").strip()
+                    for p in (m.get("pairs") or []))
+            if not text.strip():
+                continue
+            if pieces:
+                pos += 2
+            pieces.append(text)
+            offsets.append((mod_id[id(m)], pos, text))
+            pos += len(text)
+        user_text = "\n\n".join(pieces)
+        spec_mod = next(m for m in modules if m["kind"] == "jailbreak_toolloop")
+        rendered = render_tool_session(spec_mod["text"],
+                                       context_text=user_text, task_text=user_text)
+        if rendered["error"]:
+            # 骨架配错必须当场喊停：发出去只会得到一份模型看不懂的报文，
+            # 表现为「莫名其妙拒答/乱答」，比直接报错难排查十倍。
+            raise ValueError("破甲「工具会话」骨架配置有误：%s" % rendered["error"])
+        messages = rendered["messages"]
+        # msg_modules 与 messages 平行：骨架固定文本不给定位（空 refs，预览清单
+        # 照常列出、点击不跳转）；含 user_text 片段的消息按实际位置定位。
+        msg_modules: list[list[tuple[int, int, str]]] = []
+        for msg in messages:
+            content = msg.get("content") or ""
+            refs = []
+            for idx, _off, txt in offsets:
+                at = content.find(txt)
+                if at >= 0:
+                    refs.append((idx, at, txt))
+            msg_modules.append(refs)
+        ratio = self._token_ratio()
+        est_in = 0
+        for msg in messages:
+            est_in += estimate_tokens(msg.get("content") or "", ratio)
+            if msg.get("tool_calls"):
+                est_in += estimate_tokens(
+                    json.dumps(msg["tool_calls"], ensure_ascii=False), ratio)
+        est_out = self._est_output_tokens(role, profile)
+        est_cost = estimate_cost(est_in, est_out,
+                                 profile.get("input_price", 0),
+                                 profile.get("output_price", 0))
+        return {
+            "messages": messages,
+            "modules": modules,
+            "msg_modules": msg_modules,
+            "tools": rendered["tools"],
+            "tool_choice": rendered["tool_choice"],
+            "tool_reply": rendered["tool_reply"],
             "est_input_tokens": est_in,
             "est_output_tokens": est_out,
             "est_cost": round(est_cost, 4),

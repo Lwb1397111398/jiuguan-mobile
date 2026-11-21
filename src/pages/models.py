@@ -52,6 +52,22 @@ class ModelsPage:
 
     # ---------- 基础 ----------
 
+    def invalidate(self):
+        """整机替换（全量导入）时调用：丢掉子页面与破甲库实例缓存。
+
+        本页自己不缓存档案/路由（每次都从 gstore 现读），但子页面实例会跨重建
+        存活；旧实例持有旧 Session，导入后必须一起丢弃——否则「模型 → 破甲库」
+        还能打开导入前的破甲内容，看着像导入没生效。
+        """
+        self._sub = None
+        jb, self._jb = getattr(self, "_jb", None), None
+        fn = getattr(jb, "invalidate", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
     @property
     def gstore(self):
         return self.session.app.gstore

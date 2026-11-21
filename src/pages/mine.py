@@ -5,6 +5,7 @@ import os
 
 import flet as ft
 
+import backup_io
 import health
 import theme as T
 from widgets import section, menu_group, toast, confirm
@@ -12,19 +13,63 @@ from bridge import run_bg
 
 
 class MinePage:
-    def __init__(self, page, session):
+    def __init__(self, page, session, runtime=None):
         self.page = page
         self.session = session
         self.on_refresh = None  # main() 注入：重建本页
+        # 应用级运行时（runtime.AppRuntime）：全量导入成功后由它把旧 Session /
+        # 全部页面 / 项目缓存一次性作废并重建。None = 独立使用（单元测试）。
+        self.runtime = runtime
         self._sub = None        # 子页面（None=本页；"jailbreak"/"cards"/"templates"/"presets"/"settings"/"sync"）
         self._subs = {}         # 子页面实例缓存（惰性创建，保留页内状态）
         self._picker = ft.FilePicker()
+        # 系统分享（flet 0.86 服务控件）：备份要能发到网盘/微信——那是
+        # 「卸载 App 也不会删」的第二个去处（P0 换钥过渡版，见 backup_io.py）
+        self._share = ft.Share()
+        # 没有 runtime 时的本地导入闸门（防重复点击 + 成功回调只执行一次）
+        self._import_busy = False
+        self._import_token = 0
+        self._import_done_token = 0
         # flet 0.86：FilePicker 是服务控件（不渲染），必须挂 page.services；
         # 误挂 page.overlay（渲染层）会被前端画成红色错误块「Unknown control:
         # FilePicker」，盖住页面左侧（2026-11-15 真机截图定位）。
-        page.services.append(self._picker)
+        # 挂载做成幂等：全量导入失败时本页会原地重建，invalidate() 已把旧 picker
+        # 从 services 摘掉，build() 必须能补回来，否则「导入备份」按钮从此没反应。
+        self._mount_services()
+
+    def _mount_services(self):
+        backup_io.mount_service(self.page, self._picker)
+        backup_io.mount_service(self.page, self._share)
 
     # ---------- 子页面 ----------
+
+    def invalidate(self):
+        """整机替换前让本页停手：丢掉全部子页面实例。
+
+        子页面（破甲库/偏好卡/预设/设置/云同步/任务模板）都持有旧 Session；
+        不丢就会在导入后继续显示旧数据、继续按旧连接写库。
+
+        **这里不摘 FilePicker**：导入失败回滚时本页还要继续用（「导入备份」
+        按钮不能失灵）；只有确定要丢弃本页时才走 `dispose()`。
+        """
+        self._sub = None
+        for obj in list(self._subs.values()):
+            fn = getattr(obj, "invalidate", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        self._subs.clear()
+
+    def dispose(self):
+        """本页即将被整体丢弃（导入成功重建 / 退出）：连服务控件一起摘掉。
+
+        不摘的话每次导入都会在 `page.services` 里多留一个服务控件。
+        """
+        self.invalidate()
+        backup_io.unmount_service(self.page, self._picker)
+        backup_io.unmount_service(self.page, self._share)
 
     def _sub_refresh(self):
         """子页面重建（复用 main() 注入的整页重建回调）。"""
@@ -239,18 +284,109 @@ class MinePage:
             if not ok:
                 toast(self.page, msg, error=True)
                 return
-            self.page.show_dialog(ft.AlertDialog(
-                modal=True, title=ft.Text("备份完成"),
-                content=ft.Text(
-                    f"{msg}\n\n文件位置：{path}\n\n把它传到电脑（微信/网盘/数据线均可），"
-                    "在电脑版「导出页 → 导入全量备份」选择该文件，输入同一个密码即可同步。",
-                    size=13),
-                actions=[ft.FilledButton(
-                    "好", on_click=lambda ev: self.page.pop_dialog())],
-                actions_alignment=ft.MainAxisAlignment.END,
-            ))
+            self._show_export_receipt(path, msg)
         run_bg(self.page,
                lambda: self._do_export(path, password, allow_plain), done)
+
+    def _show_export_receipt(self, path: str, msg: str):
+        """导出成功后的「收货单」：包内清单 + 另存到手机 + 系统分享。
+
+        换钥过渡版（P0）的关键一步：备份文件默认落在应用私有目录
+        （`data_dir/exports/`），**卸载 App 就一起没了**。用户必须能把它
+        「另存到手机（下载/网盘）」或分享出去，否则「先备份再卸载」等于空话。
+        """
+        summary = None
+        try:
+            from app.core.exporter import backup_summary
+            summary = backup_summary(self.session.app)
+        except Exception:
+            summary = None
+        status = ft.Text("", size=12, color=T.muted(), selectable=True)
+
+        try:
+            h = int((getattr(self.page, "height", 0) or 0) * 0.45)
+        except Exception:
+            h = 320
+        h = max(220, min(h or 320, 420))
+
+        async def _save(ev):
+            status.value = "正在等系统「另存」窗口…（选「下载」或网盘目录）"
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            res = await backup_io.save_backup_copy(
+                self._picker, path, os.path.basename(path))
+            if res.get("ok"):
+                status.value = (
+                    "已另存到你选择的位置（如「下载」）。卸载 App 不会删这份文件；"
+                    "换新包后用「导入备份」选它即可恢复。")
+            elif res.get("cancelled"):
+                status.value = "已取消另存：这份还在应用私有目录里，卸载会丢。"
+            else:
+                status.value = str(res.get("error") or "另存失败")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        async def _share(ev):
+            status.value = "正在打开系统分享…"
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            res = await backup_io.share_backup(
+                self._share, path,
+                text="酒馆小说生成器 全量备份（含可解密的 API Key，请勿公开分享）")
+            if res.get("ok"):
+                status.value = ("已交给系统分享面板：发到网盘/微信/文件管理器都行。"
+                                "发出去的那份卸载 App 不会删。")
+            else:
+                status.value = str(res.get("error") or "分享失败")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("备份完成"),
+            content=ft.Container(ft.Column([
+                ft.Text(msg, size=12, selectable=True),
+                ft.Text(backup_io.receipt_text(summary), size=12,
+                        selectable=True),
+                ft.Text(f"应用内位置（卸载会丢）：{path}", size=10,
+                        color=T.muted(), selectable=True),
+                ft.Text(backup_io.SAFE_HINT, size=11, color=T.warn()),
+                status,
+            ], spacing=8, tight=True, scroll=ft.ScrollMode.AUTO, height=h)),
+            actions=[
+                ft.TextButton("关闭", on_click=lambda ev: self.page.pop_dialog()),
+                ft.TextButton("分享", on_click=_share),
+                ft.FilledButton("另存到手机", on_click=_save),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+
+    def _migration_notice(self) -> ft.Control:
+        """换钥预警（P0）：先把「要卸载重装」这件事讲清楚，并给出动作。
+
+        文案与 `docs/签名换钥与安装用户数据迁移方案.md` 附录 A 同口径：
+        先备份 → 卸载 → 安装新包 → 导入恢复。这里只做说明，不催用户操作——
+        真正需要换钥时，更新弹窗会按远端 `apkSigner` 自动切到迁移流程。
+        """
+        return T.card(ft.Column([
+            ft.Row([ft.Icon(ft.Icons.VERIFIED_USER, color=T.warn(), size=20),
+                    ft.Text("提前知道：将来某一版要「卸载重装」一次", size=14,
+                            weight=ft.FontWeight.W_600, expand=True)]),
+            ft.Text("为了保护作品安全，那个版本会更换应用签名。安卓不允许"
+                    "「签名不同」的版本直接覆盖安装，所以顺序是："
+                    "① 先备份 → ② 卸载旧版 → ③ 安装新包 → ④ 导入备份恢复。",
+                    size=11, color=T.muted()),
+            ft.Text("现在就可以做一次：上面「导出备份」→ 完成后点「另存到手机」"
+                    "存进「下载」，或点「分享」发到网盘/微信。"
+                    "那份文件卸载 App 不会删。", size=11, color=T.muted()),
+        ], spacing=T.GAP_S))
 
     def _do_export(self, path, password=None, allow_plain=False):
         try:
@@ -261,14 +397,28 @@ class MinePage:
             return False, f"备份失败：{e}"
 
     async def _import_full(self, e):
+        # 导入进行中：连选文件都不让开（重复进入会二次替换整个资料库）
+        if self._importing_now():
+            toast(self.page, "正在导入，请稍候…")
+            return
         # flet 0.86：pick_files 是 async，必须 await（2026-11-16 修复
         # 「'coroutine' object is not subscriptable」真机闪退）
         files = await self._picker.pick_files(
             dialog_title="选择全量备份文件", allow_multiple=False)
         self._import_picked(files)
 
+    def _importing_now(self) -> bool:
+        """是否已有全量导入在跑（重复点击的唯一判据）。"""
+        rt = self.runtime
+        if rt is not None:
+            return bool(rt.importing)
+        return bool(self._import_busy)
+
     def _import_picked(self, files):
         if not files:
+            return
+        if self._importing_now():
+            toast(self.page, "正在导入，请稍候…")
             return
         path = files[0].path
         if not path:
@@ -326,26 +476,74 @@ class MinePage:
                 lambda: self._start_import(path, password), yes_text="导入")
 
     def _start_import(self, path: str, password):
+        # 进导入态：重复点击在这里被挡住（第二次返回 None），并且先把会写库的
+        # 自动模式 / 流式任务 / 防抖存稿 / 云同步守护全部静默——它们绝不能
+        # 跨过「库被整体替换」这条线继续写（详见 runtime.py 顶部说明）。
+        rt = self.runtime
+        token = rt.begin_import() if rt is not None else self._begin_local_import()
+        if token is None:
+            toast(self.page, "正在导入，请稍候…")
+            return
         toast(self.page, "正在解密并恢复全部资料…")
 
         def done(r):
-            if isinstance(r, dict):
-                toast(self.page, str(r.get("error") or "导入失败"), error=True)
+            if isinstance(r, dict):           # run_bg 的异常兜底形态
+                self._finish_import(token, False,
+                                    str(r.get("error") or "导入失败"))
                 return
             ok, msg = r
-            if not ok:
-                toast(self.page, msg, error=True)
-                return
-            self.page.show_dialog(ft.AlertDialog(
-                modal=True, title=ft.Text("导入完成"),
-                content=ft.Text(msg + "\n\n建议重启应用后使用。", size=13),
-                actions=[ft.FilledButton(
-                    "好", on_click=lambda ev: (
-                        self.page.pop_dialog(),
-                        self.on_refresh() if self.on_refresh else None))],
-                actions_alignment=ft.MainAxisAlignment.END,
-            ))
+            self._finish_import(token, bool(ok), msg)
+
         run_bg(self.page, lambda: self._do_import(path, password), done)
+
+    def _begin_local_import(self):
+        """没有 runtime 时的导入闸门（单元测试 / 独立使用）。"""
+        if self._import_busy:
+            return None
+        self._import_busy = True
+        self._import_token += 1
+        return self._import_token
+
+    def _finish_import(self, token: int, ok: bool, msg: str):
+        """导入结果收尾：**同一令牌只处理一次**（连点/回调重入都不会重建两次）。"""
+        rt = self.runtime
+        if rt is None:
+            if token != self._import_token or token == self._import_done_token:
+                return
+            self._import_done_token = token
+            self._import_busy = False
+            toast(self.page, msg, error=not ok)
+            if ok and self.on_refresh:
+                self.on_refresh()
+            return
+
+        if not ok:
+            # 失败/回滚：runtime 不重建页面，只把 core 关掉的项目重新打开
+            if rt.import_failed(token):
+                toast(self.page, msg, error=True)
+            return
+        # 成功：作废旧 Session + 全部页面/子页面缓存，再按导入后的数据重建。
+        # 只有拿到「本次真的重建成功」才弹完成框——按钮重复点击不会重建两次；
+        # 重建失败时 runtime 已切阻断页（rt.dead），绝不弹「导入完成」盖在
+        # 「旧界面已停用」上，只给一句中性提示（不加按钮、不改阻断页版式）。
+        if not rt.import_succeeded(token):
+            if rt.dead:
+                toast(self.page, "界面已停用，请重新打开应用")
+            return
+        self._show_import_done(msg)
+
+    def _show_import_done(self, msg: str):
+        from runtime import strip_restart_hint
+        text = strip_restart_hint(msg)
+        self.page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("导入完成"),
+            content=ft.Text(
+                text + "\n\n已按备份重建全部页面（项目 / 创作 / 模型 / 我的），"
+                       "当前显示的就是导入后的资料。", size=13),
+            actions=[ft.FilledButton(
+                "好", on_click=lambda ev: self.page.pop_dialog())],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
 
     def _do_import(self, path, password=None):
         try:
@@ -507,6 +705,8 @@ class MinePage:
     # ---------- 构建 ----------
 
     def build(self) -> ft.Control:
+        # 重建时补挂服务控件（invalidate() 摘过；见 __init__ 的说明）
+        self._mount_services()
         # 子页面分派：有打开的子页面就先渲染它（页内返回按钮把 _sub 置回 None 并重建）。
         # 缺了这段，子页面入口点了不跳转（历史缺陷，2026-09-18 修）。
         if self._sub:
@@ -518,8 +718,10 @@ class MinePage:
         banner = health.banner(self.page, s, self.on_refresh)
 
         # 检查更新置顶（老板 2026-11-16：更新按钮不该藏在设置页二十张卡片后面）
+        # on_go_backup：换签名版本的更新弹窗里「先备份」直接跳到这里导出
         from update_ui import update_card
-        ub = update_card(self.page, s)
+        ub = update_card(self.page, s,
+                         on_go_backup=lambda: self._export_full(None))
 
         def _tile(icon, title, subtitle, handler, async_handler=False):
             """统一菜单条目（转发 theme.nav_tile：圆角图标底座 + 右箭头）。"""
@@ -536,8 +738,9 @@ class MinePage:
                                 weight=ft.FontWeight.W_600, expand=True)]),
                 ft.Text("导出一个文件带走全部资料（模型、API Key、提示词偏好、预设、"
                         "破甲库、任务模板、所有项目），电脑 ↔ 手机 导入即完全一致。"
-                        "默认用密码加密整个文件（密码无法找回，请记牢）。", size=11,
-                        color=T.muted()),
+                        "默认用密码加密整个文件（密码无法找回，请记牢）。"
+                        "导出后可「另存到手机」或分享到网盘：卸载 App 不会删那份。",
+                        size=11, color=T.muted()),
                 ft.Row([
                     T.primary("导出备份", icon=ft.Icons.UPLOAD_FILE,
                               on_click=self._export_full, expand=True),
@@ -545,6 +748,7 @@ class MinePage:
                             on_click=self._import_full, expand=True),
                 ], spacing=T.GAP_S),
             ], spacing=T.GAP_S)),
+            self._migration_notice(),
             T.card(ft.Column([
                 ft.Row([ft.Icon(ft.Icons.CLOUD_SYNC, color=T.brand(), size=20),
                         ft.Text("云同步（数据胶囊）", size=14,

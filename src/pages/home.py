@@ -20,6 +20,13 @@ class HomePage:
 
     # ---------- 动作 ----------
 
+    def invalidate(self):
+        """整机替换（全量导入）时调用：本页不缓存项目列表，无状态需要清。
+
+        留这个入口是为了「所有页面都能被统一失效」这条纪律可检查——
+        以后本页若加了缓存，必须在这里清掉，而不是只靠重建页面对象。
+        """
+
     def _open(self, path: str):
         try:
             self.session.open_project(path)

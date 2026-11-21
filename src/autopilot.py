@@ -321,7 +321,7 @@ class AutoPilot:
             return OUTLINE_STEP_NAME
         return STEP_LABELS.get(step.get("kind", ""), "")
 
-    def _run_gen(self, role, context, task, step, max_tokens=None):
+    def _run_gen(self, role, context, task, step, max_tokens=None, min_chars=None):
         """统一的自动生成调用（免预览、重试节拍、断连续写、失败暂停）。
 
         重试推杆（2026-09-19 与桌面版对齐）：**被渠道内容策略拦下时不带**——
@@ -338,11 +338,24 @@ class AutoPilot:
         （部分正文/上轮思考）→ 任务指令换成 build_continue_task 产物（前文/思考段
         是 critical 模块，超预算不裁）；continue_round 只在真带上了上轮思考时给
         （内核据此临时降思考档位，判据与手动「继续生成」同一口径：bool(思考)）。
+
+        输出质量闸（2026-11-19，能力矩阵 D4）：判据与顺序在
+        `app.core.quality_gate.output_issue`（与桌面 `_run` 同一个函数）——
+        空输出/拒答/部分拒绝+降级替代/破限失败信号/字数下限/正文结尾未闭合/
+        缺完成标志，外加两处豁免（分批非末批不跑未闭合；批尾状态栏已开始则两道
+        闸都放行）。这里只负责把不合格转成既有重试节拍，**绝不进 _apply_step**：
+        不合格的稿不落库、不置「已完成」、不归档。
+        `min_chars` 默认取 `quality_gate.STEP_MIN_CHARS`（桌面每步显式传 300 的同值），
+        个别步骤要差异时显式传，别在手机侧另立一套阈值。
         """
         from app.core.pipeline import REFUSAL_RETRY_EXTRA
         from app.core.pipeline import (build_continue_task,
                                        continuation_segment_issue,
                                        join_continuation)
+        from app.core.quality_gate import (STEP_MIN_CHARS, describe_issue,
+                                           output_issue)
+        if min_chars is None:
+            min_chars = STEP_MIN_CHARS
         cont_base = self._cont_base
         cont_think = self._cont_thinking
         cont_round = bool(cont_base.strip() or cont_think.strip())
@@ -369,8 +382,12 @@ class AutoPilot:
 
         def on_done(result):
             self._task = None
+            # 已停机（用户点停止 / 全量导入把旧会话作废）：旧任务的结果一律不落库、
+            # 不排重试——否则迟到的成功结果会写进**已经被替换过**的资料库。
+            if not self._running:
+                return
             text = (result.get("text") or "").strip()
-            from app.core.pipeline import detect_refusal, detect_upstream_block
+            from app.core.pipeline import detect_upstream_block
             # 先把「本次是不是被渠道拦下」记下来（下一次重试据此不叠推杆）
             self._last_fail_blocked = (bool(result.get("upstream_blocked"))
                                        or bool(detect_upstream_block(text)))
@@ -405,10 +422,9 @@ class AutoPilot:
                 self._bump_retry_or_fail(
                     step, "被渠道内容策略拦截（请求没送到模型就被上游拦下）")
                 return
-            if not text or detect_refusal(text):
-                self._retry += 1
-                self._bump_retry_or_fail(step, "输出为空或疑似拒答")
-                return
+            # 空输出 / 拒答不再在这里单独判：交给下方质量闸（与桌面同一个函数），
+            # 这样「部分拒绝 + 降级替代」才会被判成 partial_refusal 而不是笼统的
+            # 「空或拒答」，任务中心能看出命中哪一句。
             # 续写轮：先**单独体检这一轮新写出来的那段**，合格才拼回前文
             # （对齐桌面 2026-11-10）。旧闸门看的是合并稿：前文够长就必然过闸，
             # 「续写 0 字」「只补一句此处省略」都会落库。现在不合格只丢弃该段、
@@ -437,7 +453,18 @@ class AutoPilot:
                 else:
                     text = join_continuation(cont_base, text)
                 self._cont_rounds += 1
-                self._cont_breakpoint_clear()  # 新增段合格：断点使命完成，轮数留给说明
+            # 输出质量闸（能力矩阵 D4，判据/顺序/豁免全在 core，与桌面同一个函数）：
+            # 不合格 → 走既有重试节拍，**不进 _apply_step**（不落库、不置已完成、
+            # 不归档）。续写轮的底稿此时**不清**（对齐桌面：质量闸失败留给下一拍
+            # 继续接力，真正成功才清）——见下方 gate 通过后的 _cont_breakpoint_clear。
+            gate = output_issue(role, text, result, context=context,
+                                min_chars=min_chars)
+            if gate:
+                self._retry += 1
+                self._bump_retry_or_fail(step, describe_issue(gate))
+                return
+            if cont_round:
+                self._cont_breakpoint_clear()  # 真正成功：断点使命完成，轮数留给说明
             self._retry = 0
             self._apply_step(step, result, text)
 
@@ -514,8 +541,13 @@ class AutoPilot:
         self._set_state("error", f"{self._step_title(step)}：{msg}")
 
     def _apply_step(self, step, result, text):
-        """解析并落库（工作线程回调里执行；落库后 tick 下一步）。"""
-        from app.core.pipeline import Pipeline
+        """解析并落库（工作线程回调里执行；落库后 tick 下一步）。
+
+        只处理**已过 `_run_gen` 质量闸**的文本：闸门不合格的结果在这里根本到不了，
+        所以本函数里的 `accept_chapter_prose` / `set_chapter_status("已完成")` /
+        写批次 / 置 `outline_refined` 都只对合格稿生效。
+        """
+        from app.core.pipeline import MIN_OUTLINE_CHARS, Pipeline
         store = self.session.store
         kind = step["kind"]
         # 断点接力成功说明（对齐桌面 ok note：「断点续写 N 轮接力」）：
@@ -557,8 +589,11 @@ class AutoPilot:
                                        "volume_id": vol["id"]})
             elif kind == "outline":
                 ch = store.get_chapter(step["chapter"]["id"])
+                # 空壳大纲门槛与桌面同源（MIN_OUTLINE_CHARS=200）：只回标题/一段
+                # 衔接段也算失败 → 走重试，不置 outline_refined（否则续跑跳过该章）。
                 data, err = Pipeline.parse_outline_chapter(
-                    text, ch, field_defs=store.get_outline_fields())
+                    text, ch, field_defs=store.get_outline_fields(),
+                    min_chars=MIN_OUTLINE_CHARS)
                 if err or not data or not (data.get("outline_content") or "").strip():
                     raise ValueError(f"大纲解析失败：{err or '空'}")
                 store.update_chapter(ch["id"], data)

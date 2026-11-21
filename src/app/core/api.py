@@ -73,9 +73,157 @@ def _request_with_proxy_fallback(http_call, url, **kw):
         return http_call(url, **kw)
 
 
+# ---------------- 工具交稿（2026-11-21，复刻酒馆 SPreset 报文）----------------
+#
+# 有的破甲预设不让模型写 content，而是让它调一个工具、把思考与正文分别塞进
+# 工具参数的字段里（小猫之神 Meowssiah 的 `soliumbra_reply{think_nya, game_content}`）。
+# 这条通道的全部权重来自「模型以为自己在一个进行到一半的工具流程里」，所以必须
+# 真发 tools、真收 tool_calls，不能改成「在正文里输出 JSON」——那样形态就变了。
+#
+# 三个纯函数负责把这条通道**归一化成普通正文/思考**：上层 pipeline、quality_gate、
+# 归档、记忆一行都不用改，它们看到的仍是 (text, thinking)。
+#
+# 增量提取的动机：tool_call.arguments 是**一整串 JSON 片段**流下来的，不像 content
+# 那样天然分块。等生成完再一次性回吐，界面会长时间空白（模型在写 JSON 转义），
+# 老板会以为卡死。所以按字段做「半截 JSON 取值」，能确定多少吐多少。
+
+
+def _partial_json_string(buf: str, field: str) -> str | None:
+    """从半截（或完整）JSON 文本里取 ``field`` 字段当前已确定的字符串值。
+
+    找不到该字段 / 值还没开始 → None；值已结束 → 完整值；值写到一半被网络
+    切片截断 → 已经确定的那部分（转义序列被切断时**不猜**，留给下一片）。
+
+    只认「上一非空白字符是 { 或 ,」的 key，避免命中别的字符串值里恰好出现的
+    同名字段（正文里写一句 `"game_content"` 不算字段）。
+    """
+    key = '"%s"' % field
+    i = buf.find(key)
+    while i >= 0:
+        j = i - 1
+        while j >= 0 and buf[j] in " \t\r\n":
+            j -= 1
+        if j >= 0 and buf[j] in "{,":
+            break
+        i = buf.find(key, i + len(key))
+    if i < 0:
+        return None
+    i += len(key)
+    n = len(buf)
+    while i < n and buf[i] in " \t\r\n":
+        i += 1
+    if i >= n or buf[i] != ":":
+        return None
+    i += 1
+    while i < n and buf[i] in " \t\r\n":
+        i += 1
+    if i >= n or buf[i] != '"':
+        return None
+    i += 1
+    out: list[str] = []
+    while i < n:
+        ch = buf[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                break                    # 转义对被切断：等下一片
+            esc = buf[i + 1]
+            if esc == "u":
+                if i + 6 > n:
+                    break                # \uXXXX 被切断
+                try:
+                    out.append(chr(int(buf[i + 2:i + 6], 16)))
+                except ValueError:
+                    break
+                i += 6
+                continue
+            mapping = {'"': '"', "\\": "\\", "/": "/", "b": "\b",
+                       "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+            out.append(mapping.get(esc, buf[i:i + 2]))
+            i += 2
+            continue
+        if ch == '"':
+            break                        # 值结束
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+class _ToolArgStream:
+    """按字段增量回吐 tool_call.arguments 里的字符串值。
+
+    一个实例只管一个字段：`feed(新增片段)` 返回「相对上次多出来的正文」。
+    """
+
+    def __init__(self, field: str):
+        self.field = field
+        self.buf = ""
+        self.emitted = 0
+
+    def feed(self, chunk: str) -> str:
+        if not chunk or not self.field:
+            return ""
+        self.buf += chunk
+        value = _partial_json_string(self.buf, self.field)
+        if not value or len(value) <= self.emitted:
+            return ""
+        new = value[self.emitted:]
+        self.emitted = len(value)
+        return new
+
+
+def extract_tool_reply(tool_calls: dict, spec: dict) -> tuple[str, str, str]:
+    """从累积的 tool_calls 里取出（思考，正文），返回 (thinking, text, error)。
+
+    tool_calls: {index: {"id","name","args"}}（流式按 index 累积的结果）
+    spec:       {"name","think_field","text_field"}（破甲骨架 @reply 段声明）
+
+    - 优先认 ``spec["name"]`` 指定的那个工具；同名多个时取第一个能解析出正文的。
+    - 参数是半截 JSON（模型被掐断）时走 ``_partial_json_string`` 兜底，**不丢已写部分**
+      ——截断时正文往往已经写了大半，扔掉比留着糟。
+    - 返回 error 非空表示「调了工具但拿不到正文」，上层应报错而不是静默成功。
+    """
+    if not tool_calls:
+        return "", "", ""
+    want = str((spec or {}).get("name") or "")
+    think_field = str((spec or {}).get("think_field") or "")
+    text_field = str((spec or {}).get("text_field") or "")
+    if not text_field:
+        return "", "", "破甲骨架 @reply 没有指定正文字段"
+    ordered = [tool_calls[k] for k in sorted(tool_calls)]
+    matched = [s for s in ordered
+               if not want or not s.get("name") or s.get("name") == want]
+    if not matched:
+        names = "、".join(sorted({str(s.get("name") or "?") for s in ordered}))
+        return "", "", (f"模型调用的是 {names}，与破甲档案声明的交稿工具 "
+                        f"{want or '(未声明)'} 不一致")
+    for slot in matched:
+        raw = slot.get("args") or ""
+        if not raw.strip():
+            continue
+        obj = None
+        try:
+            loaded = json.loads(raw)
+            obj = loaded if isinstance(loaded, dict) else None
+        except json.JSONDecodeError:
+            obj = None
+        if obj is None:
+            # 半截 JSON：逐字段兜底提取
+            obj = {}
+            for f in (think_field, text_field):
+                if f:
+                    v = _partial_json_string(raw, f)
+                    if v is not None:
+                        obj[f] = v
+        text = obj.get(text_field)
+        if isinstance(text, str) and text.strip():
+            think = obj.get(think_field) if think_field else ""
+            return (think if isinstance(think, str) else ""), text, ""
+    return "", "", ("模型调用了交稿工具但参数里没有 %s ——多为中途被掐断或"
+                    "工具参数格式被渠道改写" % text_field)
+
+
 class ApiError(Exception):
     """API 调用错误，携带人类可读信息。"""
-
     def __init__(self, message: str, status_code: int | None = None, body: str = ""):
         super().__init__(message)
         self.status_code = status_code
@@ -311,7 +459,9 @@ class LLMClient:
 
     def _payload(self, messages: list[dict], temperature: float | None,
                  max_tokens: int | None, stream: bool,
-                 include_reasoning: bool = True) -> dict:
+                 include_reasoning: bool = True,
+                 tools: list[dict] | None = None,
+                 tool_choice=None) -> dict:
         p = {"model": self.model, "messages": messages, "stream": stream}
         if temperature is not None:
             p["temperature"] = temperature
@@ -323,7 +473,16 @@ class LLMClient:
             # 不认该字段的渠道多数静默忽略（个别 422 → complete 里按
             # 参数不支持摘除后重发，与 reasoning 参数同一处理路径）。
             p["stream_options"] = {"include_usage": True}
-        if include_reasoning:
+        if tools:
+            p["tools"] = tools
+            if tool_choice is not None:
+                p["tool_choice"] = tool_choice
+            # 工具交稿模式**不发**任何思考档位参数（2026-11-21，酒馆实测口径）：
+            # 小猫之神预设的 FinalRequestProcessing 明确 `delete request.reasoning_effort`，
+            # 整条报文的权重靠伪造工具历史，不靠推高思考档位；而按项目 SOP §4.6，
+            # 显式抬高档位（尤其 max→high）会让部分模型把预算花在「先审查素材」
+            # 上，稳定拒答。工具模式下不发送 = 走渠道默认，两边都安全。
+        elif include_reasoning:
             p.update(self._reasoning_parameters())
         return p
 
@@ -544,6 +703,12 @@ class LLMClient:
             container = choice.get("delta") or choice.get("message") or {}
             if isinstance(container, dict):
                 text, thinking = cls._container_parts(container)
+                # 工具交稿：tool_calls 是**增量片段**（同 index 反复追加 arguments），
+                # 统一序列化成事件交给 complete 按 index 累积。非流式的 message 也走
+                # 这里（容器二选一），两种情况的下游处理因此完全一致。
+                tc = container.get("tool_calls")
+                if isinstance(tc, list) and tc:
+                    events.append(("tool_delta", json.dumps(tc, ensure_ascii=False)))
             add("thinking", thinking)
             add("content", text)
         return events
@@ -583,6 +748,21 @@ class LLMClient:
                    "超出模型", "超过模型", "tokens 超限", "token 数超出")
         return any(marker in text for marker in markers)
 
+    @staticmethod
+    def _tools_unsupported(status: int, body: str) -> bool:
+        """渠道拒绝 tools / tool_choice 字段（工具交稿模式专用降级判据）。
+
+        只认参数校验类状态码，不认 401/403（那是额度/认证）与 5xx（上游故障）——
+        把那些当成「不支持工具」会导致白白降级掉破甲形态。
+        """
+        if status not in (400, 404, 405, 422):
+            return False
+        text = (body or "").lower()
+        markers = ("tool_choice", "tools", "tool_calls", "tool call",
+                   "function call", "function_call", "不支持", "未知参数",
+                   "unrecognized", "unsupported", "unknown parameter")
+        return any(marker in text for marker in markers)
+
     # -- 主调用 --
 
     def complete(self, messages: list[dict], temperature: float | None = None,
@@ -590,7 +770,10 @@ class LLMClient:
                  on_chunk: Callable | None = None, stop_event: threading.Event | None = None,
                  retries: int = 1, on_thinking: Callable | None = None,
                  _include_reasoning: bool = True,
-                 _read_timeout: int | None = None) -> dict:
+                 _read_timeout: int | None = None,
+                 tools: list[dict] | None = None,
+                 tool_choice=None, tool_reply: dict | None = None,
+                 _tool_choice_override=None, _drop_tools: bool = False) -> dict:
         """调用模型，返回正文、思考内容和用量信息。
 
         - stream=True 且给 on_chunk：逐块回调增量文本
@@ -599,16 +782,35 @@ class LLMClient:
         - 网络异常自动重试 retries 次
         - _read_timeout：内部参数，覆盖档案超时（仅供流式空响应降级非流式时
           放宽读超时用——非流式要等整个生成完成，120 秒默认值必死）
+        - tools / tool_choice：破甲档案声明的工具集（工具交稿模式）。给了就真发，
+          并自动接收 tool_calls——**思考与正文从工具参数字段里拆回来**，上层看到的
+          `text`/`thinking` 与普通模式完全一样（见 extract_tool_reply 注释）。
+        - tool_reply：{"name","think_field","text_field"}，交稿字段映射。
+        - _tool_choice_override / _drop_tools：内部降级用（渠道不认 required 或
+          干脆不认 tools 时逐级退让，见下方 400 分支）。
         """
         if not self.model:
             raise ApiError("模型档案未填写模型名（model）")
         if not self.base_url:
             raise ApiError("模型档案未填写接口地址（base_url）")
+        if _drop_tools:
+            tools, tool_choice = None, None
+        elif _tool_choice_override is not None:
+            tool_choice = _tool_choice_override
+        if not tools:
+            tool_reply = None
         url = self._chat_url()
         payload = self._payload(messages, temperature, max_tokens, stream,
-                                include_reasoning=_include_reasoning)
+                                include_reasoning=_include_reasoning,
+                                tools=tools, tool_choice=tool_choice)
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        # 工具交稿（2026-11-21）：按 index 累积 tool_calls 的 id/name/arguments。
+        # 同一段 arguments 会被渠道切成很多片、反复以同 index 送来，只能追加不能覆盖。
+        tool_calls: dict[int, dict] = {}
+        arg_stream = (_ToolArgStream(str((tool_reply or {}).get("text_field") or ""))
+                      if tool_reply else None)
+        tool_error = ""
         prompt_tokens = completion_tokens = 0
         truncated = False
         last_error = None
@@ -634,7 +836,21 @@ class LLMClient:
 
             此前每个 return 各写一份字段，新增字段必然漏掉某几支（abrupt 就只在
             正常 EOF 分支出现过）。集中一处后，下游拿到的形态恒定。
+
+            工具交稿的归一化也在这里做：流式阶段 text_parts 收的是「半截 JSON 里
+            已能确定的正文」（供界面边写边显示），收尾时用完整参数覆盖一次，
+            避免半截提取与完整提取在转义边界上的细微差异留下脏字符。
             """
+            nonlocal tool_error
+            if tool_reply and tool_calls:
+                th, tx, terr = extract_tool_reply(tool_calls, tool_reply)
+                if tx:
+                    text_parts[:] = [tx]
+                    if th:
+                        thinking_parts[:] = [th]
+                    tool_error = ""
+                elif terr:
+                    tool_error = terr
             out = {"text": "".join(text_parts),
                    "thinking": "".join(thinking_parts),
                    "prompt_tokens": prompt_tokens,
@@ -643,7 +859,11 @@ class LLMClient:
                    "finish_reason": finish_reason,
                    "safety_blocked": safety_blocked,
                    "reasoning_tokens": reasoning_tokens,
-                   "duration_ms": int((time.time() - t0) * 1000)}
+                   "duration_ms": int((time.time() - t0) * 1000),
+                   "tool_error": tool_error,
+                   "tool_name": next((str(s.get("name") or "")
+                                      for s in tool_calls.values()
+                                      if s.get("name")), "")}
             out.update(kw)
             return out
 
@@ -656,6 +876,10 @@ class LLMClient:
             if attempt > 0:
                 text_parts.clear()
                 thinking_parts.clear()
+                tool_calls.clear()
+                tool_error = ""
+                if arg_stream is not None:
+                    arg_stream = _ToolArgStream(arg_stream.field)
                 completion_tokens = 0
                 truncated = False
                 finish_reason = ""
@@ -686,11 +910,32 @@ class LLMClient:
                                 self._reasoning_unsupported(resp.status_code, body)):
                             # 未知兼容渠道常把思考参数当成非法字段；去掉后重发一次，
                             # 保证正文生成不被渠道能力差异阻断。
+                            # tools 必须原样带上：漏传就等于静默退回纯文本模式，
+                            # 模型不调工具 → 交稿字段永远拿不到。
                             return self.complete(
                                 messages, temperature=temperature, max_tokens=max_tokens,
                                 stream=stream, on_chunk=on_chunk, stop_event=stop_event,
                                 retries=retries, on_thinking=on_thinking,
-                                _include_reasoning=False)
+                                _include_reasoning=False,
+                                tools=tools, tool_choice=tool_choice,
+                                tool_reply=tool_reply)
+                        if tools and self._tools_unsupported(resp.status_code, body):
+                            # 渠道不认 tools / tool_choice：逐级退让——
+                            # ① required → auto（多数渠道只认 auto/none 两个枚举）
+                            # ② 还失败 → 摘掉 tools，退回纯文本交稿。
+                            # 退到纯文本就不再是预设那套形态了（权重会掉），
+                            # 所以只在渠道确实拒绝时才走，且按「text 有内容就算成功」
+                            # 兜底：那时 tool_calls 为空，_ret 不会去拆字段。
+                            drop = str(tool_choice) != "required"
+                            return self.complete(
+                                messages, temperature=temperature, max_tokens=max_tokens,
+                                stream=stream, on_chunk=on_chunk, stop_event=stop_event,
+                                retries=retries, on_thinking=on_thinking,
+                                _include_reasoning=_include_reasoning,
+                                tools=tools, tool_choice=tool_choice,
+                                tool_reply=tool_reply,
+                                _tool_choice_override=None if drop else "auto",
+                                _drop_tools=drop)
                         mt = payload.get("max_tokens")
                         if mt and self._max_tokens_unsupported(resp.status_code, body):
                             # 输出上限超模型最大输出 → 减半重发（递归直到渠道可接受）。
@@ -707,7 +952,9 @@ class LLMClient:
                                     max_tokens=next_mt,
                                     stream=stream, on_chunk=on_chunk, stop_event=stop_event,
                                     retries=retries, on_thinking=on_thinking,
-                                    _include_reasoning=_include_reasoning)
+                                    _include_reasoning=_include_reasoning,
+                                    tools=tools, tool_choice=tool_choice,
+                                    tool_reply=tool_reply)
                         raise ApiError(f"HTTP {resp.status_code}：{body}", resp.status_code, body)
                     if not stream:
                         # 非流式同样登记活动响应：abort 才能中断挂起的 json() 阻塞读
@@ -717,6 +964,22 @@ class LLMClient:
                         finally:
                             self._active_resp = None
                         content, thinking = self._response_parts(obj)
+                        # 工具交稿：非流式响应里 tool_calls 是完整的一条，直接登记
+                        # （流式与它共用 _ret 里的 extract_tool_reply 归一化）。
+                        if tool_reply:
+                            choices0 = obj.get("choices") or []
+                            msg0 = (choices0[0].get("message") or {}) \
+                                if choices0 and isinstance(choices0[0], dict) else {}
+                            for i, item in enumerate(msg0.get("tool_calls") or []):
+                                if not isinstance(item, dict):
+                                    continue
+                                fn = item.get("function") if isinstance(
+                                    item.get("function"), dict) else {}
+                                tool_calls[i] = {
+                                    "id": str(item.get("id") or ""),
+                                    "name": str(fn.get("name") or ""),
+                                    "args": str(fn.get("arguments") or ""),
+                                }
                         if thinking:
                             thinking_parts.append(thinking)
                             if on_thinking:
@@ -794,6 +1057,43 @@ class LLMClient:
                                 safety_blocked = True
                                 if not finish_reason:
                                     finish_reason = "content_filter"
+                                continue
+                            if kind == "tool_delta":
+                                # 工具交稿：按 index 累积 id/name/arguments。
+                                # arguments 是**分片**的——同 index 会反复来，
+                                # 只有 id/name 可能在首片出现、之后只给 arguments。
+                                saw_data = True
+                                try:
+                                    arr = json.loads(delta)
+                                except json.JSONDecodeError:
+                                    arr = []
+                                for item in arr:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    slot_idx = item.get("index")
+                                    if not isinstance(slot_idx, int):
+                                        slot_idx = 0
+                                    slot = tool_calls.setdefault(
+                                        slot_idx, {"id": "", "name": "", "args": ""})
+                                    if isinstance(item.get("id"), str) and item["id"]:
+                                        slot["id"] = item["id"]
+                                    fn = item.get("function")
+                                    if not isinstance(fn, dict):
+                                        continue
+                                    if isinstance(fn.get("name"), str) and fn["name"]:
+                                        slot["name"] = fn["name"]
+                                    piece = fn.get("arguments")
+                                    if isinstance(piece, str) and piece:
+                                        slot["args"] += piece
+                                        completion_tokens += max(1, len(piece))
+                                        # 正文边写边显示：从半截 JSON 里取已能确定
+                                        # 的字段值，只回吐新增部分。
+                                        if arg_stream is not None:
+                                            new_text = arg_stream.feed(piece)
+                                            if new_text:
+                                                text_parts.append(new_text)
+                                                if on_chunk:
+                                                    on_chunk(new_text)
                                 continue
                             if kind == "usage":
                                 # include_usage 终止帧：真实用量覆盖逐字估算值。
@@ -948,7 +1248,9 @@ class LLMClient:
                                  stream=False, on_chunk=on_chunk, stop_event=stop_event,
                                  retries=0, on_thinking=on_thinking,
                                  _include_reasoning=_include_reasoning,
-                                 _read_timeout=min(max(self.timeout * 3, 300), 600))
+                                 _read_timeout=min(max(self.timeout * 3, 300), 600),
+                                 tools=tools, tool_choice=tool_choice,
+                                 tool_reply=tool_reply)
         msg = last_error or "未知错误"
         if "(read timeout=" in msg:
             # 读超时九成是思考模型等首字节超档案超时（等头阶段无心跳无重试放大），

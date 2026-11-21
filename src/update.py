@@ -30,6 +30,20 @@ Release 说明第一行是 HTML 注释元数据（GitHub 页面不渲染，App �
 gh-proxy.com / gh-proxy.org 能透传 API；ghfast.top / ghproxy.net 只透传下载
 （API 返 403）——所以它们只进下载候选，不进查询链。
 
+**换签名预埋（2026-11-20，P0 旧钥过渡版）**：Release 第二行元数据新增可选
+`apkSigner`（新包的**签名证书 SHA-256**，公开信息）：
+
+    <!-- apkupdate apkSha256=<64 hex> apkSigner=<64 hex> -->
+
+首行 `appupdate` 与第二行 `apkSha256` 的格式一律不动（旧客户端只认首行）。
+本机指纹**不从运行中的包读**（pyjnius 在老板平板上整链失败），而是构建时由
+keytool 从签名材料算出、写进 `src/_version.py` 的 `APP_SIGNER_SHA256`。
+远端指纹与本机不同 = 这个包不能覆盖安装（安卓必然拒绝），此时：
+① 不下载、不唤起安装器（UI 改给「先备份」+「打开官方下载页」）；
+② 弹窗把迁移四步摊开（先备份 → 卸载 → 装新包 → 导入）。
+任一端缺指纹（老 Release / 老板还没升到带指纹的版本）→ 无法判断，
+保持原流程，绝不误拦正常更新。
+
 安装（两条通路，2026-11-16 老板平板实测后补的第二条）：
 ① pyjnius 一键装：flet 模板 AndroidManifest 已内置 FileProvider
    （authority 为 "<包名>.provider"，res/xml/provider_paths.xml 已暴露
@@ -111,6 +125,15 @@ class ChecksumError(Exception):
     """
 
 
+class SignerMismatchError(Exception):
+    """远端安装包的签名证书与本机不同 → 安卓必然拒绝覆盖安装。
+
+    与 ChecksumError 分开：哈希对得上只说明「文件就是官方那份」，
+    签名不同说明「这一版不能装在当前设备上（需卸载重装）」。
+    补救方向也不同：换签名时**不能**重试/换渠道，只能先备份再卸载。
+    """
+
+
 def _headers(extra=None):
     h = {"User-Agent": USER_AGENT,
          "Accept": "application/vnd.github+json"}
@@ -179,6 +202,58 @@ def ensure_apk_verified(path, expected_sha256):
 def format_sha256(value) -> str:
     """展示用哈希：**不加分隔符**（用户要能整串复制去比对），只做小写规范化。"""
     return normalize_sha256(value)
+
+
+# ---------- 签名证书指纹（2026-11-20 P0 换钥预埋） ----------
+
+def normalize_signer(value) -> str:
+    """规范化证书 SHA-256 指纹：小写、去空白、允许冒号/短横线分隔与 `sha256:` 前缀。
+
+    keytool 打印的是 `FE:A1:B9:…`（冒号分隔大写），apksigner 打印的是
+    `fea1b974…`（小写无分隔）——同一个证书两种写法，比较前必须先规范化。
+    非法值（长度不对/含非 hex/空）一律返回空串 = 「没有可用指纹」，
+    调用方据此保持原流程（不知道 ≠ 不同）。
+    """
+    s = str(value or "").strip().lower()
+    if s.startswith("sha256:"):
+        s = s[len("sha256:"):]
+    s = re.sub(r"[\s:\-]", "", s)
+    return s if _SHA256_RE.match(s) else ""
+
+
+def local_signer_sha256() -> str:
+    """本机 APK 的签名证书 SHA-256（构建时写入 `_version.py`，**不用 pyjnius**）。
+
+    老板平板 pyjnius 桥接整链失败（`手机自更新模块总览.md` §七），运行中读包签名
+    必然拿不到 → 远端换了签名也永远发现不了。构建脚本在 `flet build` 之前用
+    keytool 从签名材料算出指纹、写进 `src/_version.py`（与 APP_VERSION_CODE 同处），
+    这里只读常量。取不到（老包 / 开发环境）返回空串 = 未知，不阻断更新。
+    """
+    try:
+        from _version import APP_SIGNER_SHA256
+    except Exception:
+        return ""
+    return normalize_signer(APP_SIGNER_SHA256)
+
+
+def signer_changed(remote_signer, local_signer=None) -> bool:
+    """远端包签名与本机是否不同（两者都已知且不一致才算）。
+
+    任一端为空 = 无法判断 → False（保持原流程）。这是向后兼容的关键：
+    0.1.53 及更早的包没有 APP_SIGNER_SHA256，旧 Release 也没有 apkSigner。
+    """
+    remote = normalize_signer(remote_signer)
+    local = (local_signer_sha256() if local_signer is None
+             else normalize_signer(local_signer))
+    if not remote or not local:
+        return False
+    return remote != local
+
+
+def signer_short(value) -> str:
+    """指纹前缀（12 位）——给界面显示，完整值仍可复制。"""
+    s = normalize_signer(value)
+    return (s[:12] + "…") if s else ""
 
 
 def _remove_quiet(path):
@@ -347,6 +422,8 @@ def parse_release(data, source_prefix=""):
         source_prefix=source_prefix,
         # 缺失/格式非法 → 空串，UI 据此关闭 App 内安装、只给浏览器通路
         apk_sha256=normalize_sha256(attrs.get("apksha256")),
+        # 缺失/格式非法 → 空串 = 不知道远端是什么签名（保持原流程）
+        apk_signer=normalize_signer(attrs.get("apksigner")),
     )
 
 
@@ -355,10 +432,15 @@ class UpdateInfo:
 
     apk_sha256 是 Release 元数据里的安装包哈希（可能为空 = 老发版格式）：
     App 内下载/复用/安装三处都以它为准，空值意味着「无法校验，不许装」。
+
+    apk_signer 是远端包的签名证书 SHA-256（2026-11-20 起；可能为空 = 老格式）：
+    与本机 `local_signer_sha256()` 不同时，`signer_changed()` 为真 →
+    不许下载/安装，UI 改成「先备份 → 卸载 → 装新包 → 导入」。
     """
 
     def __init__(self, version_code, version_name, apk_url, size=0,
-                 notes="", title="", source_prefix="", apk_sha256=""):
+                 notes="", title="", source_prefix="", apk_sha256="",
+                 apk_signer=""):
         self.version_code = int(version_code)
         self.version_name = str(version_name or "")
         self.apk_url = str(apk_url or "")
@@ -367,6 +449,7 @@ class UpdateInfo:
         self.title = str(title or "")
         self.source_prefix = str(source_prefix or "")
         self.apk_sha256 = normalize_sha256(apk_sha256)
+        self.apk_signer = normalize_signer(apk_signer)
 
     def has_update(self, local_version_code):
         """远端 versionCode 更大才算有更新（重装同版本走「检查」按钮也不误报）。"""
@@ -375,6 +458,14 @@ class UpdateInfo:
     def has_checksum(self) -> bool:
         """元数据给了合法 SHA-256？没给就不能在 App 内装（只能走浏览器）。"""
         return bool(self.apk_sha256)
+
+    def has_signer(self) -> bool:
+        """元数据给了远端签名指纹？（老 Release 没有，视为「不知道」）"""
+        return bool(self.apk_signer)
+
+    def signer_changed(self) -> bool:
+        """远端签名与本机不同 → 这一版必须卸载重装（安卓不允许覆盖）。"""
+        return signer_changed(self.apk_signer)
 
     def describe(self):
         s = f"新版本 {self.version_name}（build {self.version_code}）"
@@ -453,6 +544,11 @@ def download_update(info, progress=None):
         raise ChecksumError(
             "该版本没有提供 SHA-256 校验值，App 内下载已停用；"
             "请用官方地址手动下载安装")
+    if getattr(info, "signer_changed", lambda: False)():
+        # 下载了也装不上（安卓必拒），别浪费流量、更别让用户以为「点一下就好」
+        raise SignerMismatchError(
+            "这一版更换了应用签名，不能直接覆盖安装：请先备份 → 卸载旧版 → "
+            "安装新包 → 导入备份")
     dest = os.path.join(get_download_dir(), f"update-{info.version_code}.apk")
     if os.path.exists(dest):
         size_ok = info.size <= 0 or os.path.getsize(dest) == info.size
@@ -574,13 +670,20 @@ def official_release_page():
     return f"https://github.com/{REPO}/releases/tag/latest"
 
 
-def install_apk(apk_path, expected_sha256=""):
-    """唤起系统安装器（**安装前必须过 SHA-256 校验**）。
+def install_apk(apk_path, expected_sha256="", *, expected_signer="",
+                local_signer=None):
+    """唤起系统安装器（**安装前必须过 SHA-256 校验 + 签名一致性闸门**）。
 
     2026-11-17 第一阶段：第三道校验点。下载完成到用户点「安装更新」之间，
     文件可能被清缓存、被别的进程换掉、或被上一版逻辑写坏——这里再算一次
     哈希，不等就抛 ChecksumError 并删掉文件，绝不把未经校验的包交给安装器。
     expected_sha256 为空同样拒绝（无法校验 ≠ 校验通过）。
+
+    2026-11-20 P0：再判一次签名。远端 `expected_signer` 与本机指纹
+    （默认读 `_version.APP_SIGNER_SHA256`）都已知且不同 → 抛
+    `SignerMismatchError`，**不唤起安装器**（安卓会直接拒，用户只看到
+    「应用未安装」，不会知道要先备份卸载）。任一端为空 = 不知道 → 放行，
+    保持老流程（旧包/旧 Release 没有这项元数据）。
 
     返回 True = 已跳安装器；False = 缺「安装未知应用」授权，已跳系统开关页，
     用户开完回来再点一次「安装更新」。非 Android 抛 RuntimeError。
@@ -588,6 +691,10 @@ def install_apk(apk_path, expected_sha256=""):
     if not is_android():
         raise RuntimeError("安装更新仅手机版可用（桌面预览模式）")
     ensure_apk_verified(apk_path, expected_sha256)
+    if signer_changed(expected_signer, local_signer):
+        raise SignerMismatchError(
+            "安装已阻止：这是更换签名后的版本，安卓不允许覆盖安装。"
+            "请先备份 → 卸载旧版 → 安装新包 → 导入备份")
     from jnius import autoclass
     PythonActivity = autoclass("com.flet.serious_python_android.PythonActivity")
     activity = PythonActivity.mActivity

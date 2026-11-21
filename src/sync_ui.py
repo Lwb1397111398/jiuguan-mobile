@@ -97,6 +97,9 @@ def pull_on_open(page, session, on_pulled=None) -> bool:
         return False
 
     def work():
+        # 全量导入已换掉整个资料库：这次拉取基于旧会话，直接放弃（别拿旧库写）
+        if not getattr(session, "alive", True):
+            return {"action": "aborted"}
         from app.core.sync_engine import TOMBSTONE_KEY
         eng = _engine()
         uid = eng.ensure_uuid(store)
@@ -118,6 +121,8 @@ def pull_on_open(page, session, on_pulled=None) -> bool:
         except Exception as e:               # 网络/解密/密钥任何问题都不能崩线程
             res = {"error": "%s: %s" % (type(e).__name__, e)}
         try:
+            if res.get("action") == "aborted":
+                return                       # 导入已替换资料：不弹提示、不刷新
             if res.get("action") == "pull":
                 toast(page, "已从云端同步《%s》（%d 张表）"
                       % (store.title, res.get("tables", 0)))
@@ -182,6 +187,8 @@ class Watcher:
                 pass
 
     def _tick(self):
+        if not getattr(self.session, "alive", True):
+            return                          # 全量导入已换会话：旧守护线程停手
         if not enabled(self.session):
             return
         if _g(self.session, "sync_auto_push", "1") != "1":

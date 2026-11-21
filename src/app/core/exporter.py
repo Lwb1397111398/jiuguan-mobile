@@ -838,6 +838,51 @@ def backup_plain_zip(src: str, password, dest_zip: str) -> str:
     return dest_zip
 
 
+def backup_summary(app_state) -> dict:
+    """全量备份**将要包含什么**（纯读，不落盘、不加锁、不动任何文件）。
+
+    与 `export_full_backup` 同一筛选口径：只算 `list_recent()` 里文件夹仍存在
+    且去重后的项目；破甲数只算安全文件名（`_safe_key`）。UI 用它给用户一张
+    「包内清单」，别在两端各写一份筛选逻辑——清单与实物不一致比没有清单更糟。
+
+    返回 {"projects": int, "titles": [str], "jailbreaks": int, "has_api_key": bool}
+    """
+    seen, titles = set(), []
+    for r in app_state.list_recent():
+        if not r.get("exists"):
+            continue
+        norm = os.path.normcase(r.get("path") or "")
+        if norm in seen:
+            continue
+        seen.add(norm)
+        titles.append(str(r.get("title") or os.path.basename(
+            str(r.get("path") or "")) or "未命名"))
+    jb_count = 0
+    jb_dir = os.path.join(app_state.data_dir, "jailbreaks")
+    if os.path.isdir(jb_dir):
+        for fn in sorted(os.listdir(jb_dir)):
+            if _safe_key(fn) and os.path.isfile(os.path.join(jb_dir, fn)):
+                jb_count += 1
+    # 口径与 _rekey_db_copy 对齐：导出不只看模型档案的 api_key，还会把 meta 里的
+    # 全局嵌入 Key 一起转格式带走。只配了 embed Key 的设备必须报「包里有 Key」，
+    # 否则清单会说「未包含」而实物里有——清单与实物不一致比没有清单更糟。
+    # 纯读、短路：档案里已有 Key 就不再读全局；不解密、不连库写、不加新异常路径。
+    has_key = False
+    try:
+        for p in app_state.gstore.list_profiles():
+            if str(p.get("api_key") or "").strip():
+                has_key = True
+                break
+        if not has_key:
+            has_key = bool(str(app_state.gstore.get_global_setting(
+                "embed_api_key", "") or "").strip())
+    except Exception:
+        # 档案/全局设置读不出来不影响备份本身；清单就报「未知」，界面按「未包含」处理
+        pass
+    return {"projects": len(titles), "titles": titles,
+            "jailbreaks": jb_count, "has_api_key": has_key}
+
+
 def export_full_backup(zip_path: str, app_state, password=None,
                        allow_plain: bool = False) -> tuple[bool, str]:
     """全量备份到 zip_path（**默认加密**，落盘为 JGB1 容器）。
