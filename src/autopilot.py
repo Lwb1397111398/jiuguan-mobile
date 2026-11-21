@@ -394,15 +394,24 @@ class AutoPilot:
             if not result.get("ok"):
                 self._fail(step, result.get("error", "生成失败"))
                 return
-            if result.get("status") == "stopped":
+            if result.get("status") == "stopped" or (
+                    result.get("status") == "ok" and result.get("abrupt")):
                 # 「停止」区分（对齐桌面 2026-09-08）：用户主动暂停就停在当前
                 # 进度；流式半路网络中断/服务端掐断按断连处置——攒断点下一拍
                 # 自动续写接力，不再原地停机也不再整章重写。
+                # abrupt（2026-11-21 对齐桌面同款修复）：流式读到 EOF 但没收到
+                # [DONE]/finish_reason = 渠道网关中途掐线，正文多半没写完——此前
+                # 只认 stopped，abrupt 轮被质量闸 no_end_mark 判失败后全新重写。
                 if self._paused:
                     self._set_state("paused", "已暂停")
                     return
-                self._accumulate_breakpoint(step, role, result)
-                return
+                # 批尾状态栏收货豁免优先于断点（对齐桌面 2026-11-21）：正文已写完、
+                # 只差批尾状态包的 abrupt 稿按「完整收货」放行，不攒断点续写状态栏。
+                from app.core.pipeline import state_bar_started
+                if not (result.get("abrupt")
+                        and state_bar_started(text or "")):
+                    self._accumulate_breakpoint(step, role, result)
+                    return
             if result.get("safety_blocked"):
                 # 平台内容审核掐断（2026-11-05，与桌面版对齐）：finish_reason=
                 # sensitive / content_filter。审核看的是内容本身，不看推杆，
@@ -498,7 +507,11 @@ class AutoPilot:
             return
         pthink = (result.get("thinking") or "")
         keep_think = bool(pthink.strip()) and not is_safety_thinking(pthink)
-        if len(part) >= AUTO_CONTINUE_MIN_CHARS or (not part and keep_think):
+        # 思考断点豁免（2026-11-21 对齐桌面同款修复）：思考是「结论」，非安全
+        # 评估就照攒——断片碎（<500 字门槛，碎片续写容易整篇重起）只影响断片
+        # 入不入底稿，不影响思考。碎断片+长思考（思考型模型思考 1~4 万字、正文
+        # 刚吐几十字被渠道掐线）此前思考白烧不攒 = 每轮重写都从头思考又死同处。
+        if len(part) >= AUTO_CONTINUE_MIN_CHARS:
             if part:
                 self._cont_base = join_continuation(
                     self._cont_base, trim_unfinished_tail(part))
@@ -510,6 +523,17 @@ class AutoPilot:
             self._bump_retry_or_fail(
                 step, "生成中途断连（疑似网络中断/服务端掐断）｜已保留断点"
                       f"（前文 {len(self._cont_base)} 字{extra}），稍后自动续写")
+            return
+        if keep_think:
+            # 只攒思考：碎断片不入底稿（防碎片续写整篇重起），思考断点照攒——
+            # 下一拍 build_continue_task 走「无正文思考续写」模式，模型照结论写。
+            self._cont_thinking = (self._cont_thinking + "\n" + pthink).strip()
+            self._cont_rounds += 1
+            self._retry += 1
+            self._bump_retry_or_fail(
+                step, "生成中途断连｜已保留思考断点（思考 "
+                      + str(len(self._cont_thinking)) + " 字），稍后从思考结论"
+                        "续写（碎断片不入底稿）")
             return
         self._retry += 1
         self._bump_retry_or_fail(
