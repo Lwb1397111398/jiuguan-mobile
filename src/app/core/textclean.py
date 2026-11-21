@@ -87,6 +87,38 @@ _FORMAL_NARROW_RE = re.compile(
     r"(?:[ \t]*[（(][^（）()\n]{1,40}[）)])?"
     r"[ \t]*(?:[】\]])?(?:\*{0,2})?[ \t]*(?:[。．]|[：:])?[ \t]*$", re.M)
 
+# 总纲裸框架行锚点（2026-11-21《小偷入室》synopsis log24 实测）：模型整篇漏写
+# 「正式输出」标记，思考段（裸行「思考输出」开头 + P0~P7 框架）后用一条 --- 分隔线
+# 直接接总纲正文，正文以裸行「整体层」开头、分卷行全是裸行「分卷N」——
+# 正式输出锚点（宽/窄形态）与思考段头（【…】/Markdown 标题）两头全部落空
+# → 思考段原样混进正文 → 「未识别到总纲候选」。
+# 裸行「整体层」是总纲框架的结构信号（与裸章标题行同理：结构化阶段的框架行是
+# 数据、是「正文起点」的强信号），整行恰为该词时豁免位置区——正常行文不会
+# 有一行只有「整体层」。
+# ⚠️ 只认裸行「整体层」，不认 `# 整体层`/【整体层】：H1 大段总纲（10-07）靠
+# `# 整体层` 判定「整篇是一份候选」，锚点若把它吃掉会把框架行从正文里剥掉。
+# ⚠️ 也**不认**「分卷纲要」：它常是总纲正文**中段**的分卷区标记（固定框架/
+# 第二种框架的正文里都有），拿它当锚点会把正文拦腰切断、设定段全丢。
+# 无「整体层」行时由裸行思考段头 + --- 边界（第三步）兜住。
+_SYNOPSIS_FRAMEWORK_RE = re.compile(
+    r"^[ \t]{0,3}(?:\*{0,2})?整体层(?:\*{0,2})?[ \t]*[:：]?[ \t]*$", re.M)
+
+# 裸行思考段头（2026-11-21《小偷入室》log24）：协议要求「先思考输出、再正式输出」，
+# 模型有时把思考标记写成不带任何包装的裸行（「思考输出」独立成行，无【】无 #
+# 无加粗）——既有两张思考段头表（Markdown 标题 / 【…】独立行）都匹配不上。
+# 只认「整行恰为协议思考词（可带冒号）」，与思考纪律协议用词对齐；
+# 正常行文不会有独立成行的「思考输出」。
+_BARE_THINK_HEAD_RE = re.compile(
+    r"^[ \t]{0,3}(?:\*{0,2})?(?:思考输出|思考环节|思考过程|自由思考|推理过程|思维链)"
+    r"(?:\*{0,2})?[ \t]*[:：]?[ \t]*$", re.M)
+
+# 裸行思考段的结束边界补充：思考段后常接一条 --- 分隔线再进正文
+# （该形态下思考段里没有任何【…】标记或标题可认）。裸行思考段专属，
+# 不进通用 _think_head_end——通用形态已有可靠边界，加分隔线只会让
+# 既有语料的截断点提前（2026-11-21 保持既有行为零变化的保守取法）。
+_BARE_THINK_BOUNDARY_RE = re.compile(
+    r"^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.M)
+
 # 任意 Markdown 标题（用于定位思考段的结束边界）
 _MD_ANY_HEAD_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]*[^\n]*$", re.M)
 # 任意独立成行的【…】标记
@@ -181,11 +213,14 @@ def _formal_anchor(text: str) -> int | None:
     切进思考段）：
     - 宽形态：受 60% 位置区 + head_like（无句读、≤40 字）双重限制；
     - 窄形态协议分隔行（「正式输出如下。」，见 _FORMAL_NARROW_RE 注释）：
-      整行恰为模板规定的分隔语，形态本身即强信号，豁免两项校验。
+      整行恰为模板规定的分隔语，形态本身即强信号，豁免两项校验；
+    - 总纲裸框架行（「整体层」「分卷纲要」整行，见 _SYNOPSIS_FRAMEWORK_RE 注释）：
+      总纲正文的起点信号，豁免位置区。
     """
     zone = len(text) * _FORMAL_ANCHOR_ZONE
     cands: list[tuple[int, int]] = [(m.start(), m.end())
                                     for m in _FORMAL_NARROW_RE.finditer(text)]
+    cands += [(m.start(), m.end()) for m in _SYNOPSIS_FRAMEWORK_RE.finditer(text)]
     for m in _FORMAL_HEAD_RE.finditer(text):
         if m.start() > zone:
             continue
@@ -237,6 +272,32 @@ def _think_head_end(text: str, head_match) -> int | None:
     return end
 
 
+def _bare_think_end(text: str, start: int) -> int | None:
+    """裸行思考段的结束边界（2026-11-21）：【…】标记行 / 裸章标题行 / --- 分隔线，
+    取最早者，拿不准返回 None。
+
+    只服务裸行思考段头（_BARE_THINK_HEAD_RE）：该形态的思考段里常没有任何
+    【…】标记或标题行可认，唯一可靠边界是「思考段收尾的 --- 分隔线」。
+    3000 字距离守卫与通用形态一致——超长宁可不剥。
+    """
+    cands: list[int] = []
+    m = _BRACKET_HEAD_RE.search(text, start)
+    if m:
+        cands.append(m.start())
+    m = _CHAPTER_TITLE_LINE_M_RE.search(text, start)
+    if m:
+        cands.append(m.start())
+    m = _BARE_THINK_BOUNDARY_RE.search(text, start)
+    if m:
+        cands.append(m.end())      # 分隔线整行吃掉（截到行尾），与标记行不同
+    if not cands:
+        return None
+    end = min(cands)
+    if end > start + _MAX_SECTION_CHARS:
+        return None
+    return end
+
+
 def strip_think_sections(text: str) -> tuple[str, str]:
     """剥离「思考环节 … 正式输出」分段 → (正文, 思考内容)。
 
@@ -257,7 +318,7 @@ def strip_think_sections(text: str) -> tuple[str, str]:
         if rest:
             return rest, text[:anchor].strip()
     # 2) 无锚点：按思考段头截断
-    zone = len(text) * _THINK_HEAD_ZONE
+    zone = _THINK_HEAD_ZONE * len(text)
     for pattern in (_MD_THINK_HEAD_RE, _BRACKET_THINK_HEAD_RE):
         for m in pattern.finditer(text):
             if m.start() > zone:
@@ -271,6 +332,19 @@ def strip_think_sections(text: str) -> tuple[str, str]:
             if not rest:
                 continue
             return rest, text[:end].strip()
+    # 3) 裸行思考段头（2026-11-21《小偷入室》log24）：协议思考词独立成行、无任何
+    #    包装。边界比通用形态宽一档：该形态下思考段里常没有任何【…】/标题可认，
+    #    常以一条 --- 分隔线收尾，把分隔线也当边界候选（_bare_think_end 取最早）。
+    for m in _BARE_THINK_HEAD_RE.finditer(text):
+        if m.start() > zone:
+            break
+        end = _bare_think_end(text, m.end())
+        if end is None or end <= m.start():
+            continue
+        rest = text[end:].strip()
+        if not rest:
+            continue
+        return rest, text[:end].strip()
     return text, ""
 
 
