@@ -220,6 +220,13 @@ def _overview_span(content: str) -> tuple[int, int, int] | None:
     Markdown 优先（标题任意级别，段尾取下一个同级或更高级标题）；没有 # 标记时
     退裸行形态（『整体层』独占一行，段尾取第一个裸行卷标题行 / 下一个 Markdown
     标题行）——老板的自定义总纲模板产出的就是这种无标记形态。
+    两种显式标题都没有时再退**隐式形态**（2026-11-21《小偷入室》实测）：底稿开头
+    就是【世界观与故事概述】这类小节、根本没写『整体层』标题行——识别层的裸行
+    切分早就把「开头 → 第一个分卷标题行」当 overview，替换链不认就会「底稿中
+    找不到『整体层』段落标题」整批拒绝。隐式段 = 文本开头(0) → 第一个分卷区起点
+    （Markdown 分卷标题 / 裸行分卷标题 / 『分卷纲要』分段标记三者取最早）；没有
+    分卷区则无法定位 → 维持 None（整批拒绝，绝不把说不清边界的东西当整体层）。
+    段内合并仍走 _merge_overview_body 的按小节对齐链，未提及的节逐字保留。
     """
     content = content or ""
     for m in _OVERVIEW_HEAD_RE.finditer(content):
@@ -230,7 +237,23 @@ def _overview_span(content: str) -> tuple[int, int, int] | None:
             return m.start(), m.end(), (nxt.start() if nxt else len(content))
     m = _BARE_OVERVIEW_HEAD_RE.search(content)
     if m is None:
-        return None
+        # 隐式形态：无『整体层』标题，靠分卷区起点定段尾（见 docstring）
+        starts: list[int] = []
+        md_vol = _SYN_VOL_HEADING_NUM_RE.search(content)
+        if md_vol:
+            starts.append(md_vol.start())
+        bare_marks = bare_synopsis_volume_marks(content)
+        if bare_marks:
+            starts.append(bare_marks[0]["line_start"])
+        sec = _BARE_VOL_SECTION_RE.search(content)
+        if sec:
+            starts.append(sec.start())
+        if not starts:
+            return None
+        vol_start = min(starts)
+        if vol_start <= 0:
+            return None
+        return 0, 0, vol_start
     ends = [len(content)]
     mk = next((x for x in (bare_synopsis_volume_marks(content) or [])
                if x["line_start"] > m.start()), None)

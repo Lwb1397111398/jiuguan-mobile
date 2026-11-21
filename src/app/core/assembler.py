@@ -3206,6 +3206,16 @@ class Assembler:
             refs = []
             for idx, _off, txt in offsets:
                 at = content.find(txt)
+                if at < 0:
+                    # 占位符多落在骨架的 JSON 字符串里，填充时按 JSON 规则转义
+                    # （换行→\n、引号→\"）——模块原文在报文里不是逐字子串，
+                    # 按转义形再找一次：预览跳转与去破限剔除全靠这组定位。
+                    # （小猫之神 SoliUmbra 2026-11-21 老板实测：不补这一步，
+                    # 预览清单点任何模块都不跳转、去破限视图也剔不动）
+                    esc = json.dumps(txt, ensure_ascii=False)[1:-1]
+                    at = content.find(esc)
+                    if at >= 0:
+                        txt = esc
                 if at >= 0:
                     refs.append((idx, at, txt))
             msg_modules.append(refs)
