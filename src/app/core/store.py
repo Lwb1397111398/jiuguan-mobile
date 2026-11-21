@@ -3510,6 +3510,55 @@ class ProjectStore(QObject):
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return dest
 
+    def matches_last_backup(self, backup_dir: str | None = None) -> bool:
+        """当前库与最近一份备份的内容是否完全一致（自动备份跳过空转用，2026-11-21 老板规则）。
+
+        定时备份到期时先问这个：内容没变 → 本轮不备，留到下个时间点再判
+        （一直没变就一直不备）。判据是**字节级 SHA-256**：先 TRUNCATE
+        checkpoint 把 WAL 全部并入主库（与 backup() 同口径，任何已提交写入
+        都会进主库文件），再对主库与最近一份备份各算一遍哈希。
+
+        - 任何逻辑变化必然改文件字节 → 绝不会漏备（不会出现「变了却跳过」）；
+        - 反过来，若库被琐碎触碰导致哈希永远不等，只会退化成「照旧每轮都备」，
+          与旧行为相同，同样不会丢数据——失败方向全部落在安全侧。
+        - checkpoint 被并发读/写挡住（TRUNCATE 返回 busy）时主库文件不代表
+          最新内容，保守返回 False 照常备份。
+        - 「最近一份」按文件 mtime 挑，不按文件名排序——restore_before_ 等前缀
+          会把字典序搅乱，mtime 才是真实先后。
+        """
+        backup_dir = backup_dir or os.path.join(self.folder, "backups")
+        newest, newest_t = "", -1.0
+        try:
+            for fn in os.listdir(backup_dir):
+                if not fn.endswith(".db"):
+                    continue
+                try:
+                    t = os.path.getmtime(os.path.join(backup_dir, fn))
+                except OSError:
+                    continue
+                if t > newest_t:
+                    newest, newest_t = fn, t
+        except OSError:
+            return False
+        if not newest:
+            return False
+        newest_path = os.path.join(backup_dir, newest)
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            except sqlite3.Error:
+                return False
+            if not row or row[0]:      # busy=-1/非0 = 有并发挡着，WAL 没并干净
+                return False
+        try:
+            if os.path.getsize(self.db_path) != os.path.getsize(newest_path):
+                return False           # 大小都不同，必然变了，省一遍哈希
+            return _sha256_file(self.db_path) == _sha256_file(newest_path)
+        except OSError:
+            return False
+
     @property
     def is_closed(self) -> bool:
         return self._closed
@@ -3598,6 +3647,15 @@ class ProjectStore(QObject):
             self.conn.close()
         except sqlite3.Error:
             pass
+
+
+def _sha256_file(path: str) -> str:
+    """分块算 SHA-256（单本小说库几十 MB，不整读进内存）。备份判重用。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------- 记忆 → 设定库导入（UI「从记忆导入全部」与归档自动导入共用，2026-09-08） ----------

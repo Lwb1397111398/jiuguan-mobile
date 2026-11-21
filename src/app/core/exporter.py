@@ -353,6 +353,62 @@ def import_project_zip(zip_path: str, dest_folder: str) -> ProjectStore | None:
     return ProjectStore(dest_folder)
 
 
+# ---------------- 项目库备份恢复（2026-11-21 老板需求） ----------------
+#
+# backups/*.db 是 store.backup() 的产物（checkpoint+copy2 整库文件）。
+# 「恢复」= 把某个时间点的备份文件原样换回 project.db。与全量备份导入同一套
+# 契约（四条不许回退）：先校验后替换、没有安全备份不动刀、开着连接不换文件、
+# 换文件失败必须把原库重新打开，不许停在半路。
+
+PROJECT_BACKUP_TABLES = ("meta", "chapters")
+
+
+def describe_project_backup(backup_path: str) -> dict:
+    """只读读取备份库的关键信息并做完整性校验，供恢复确认框展示。
+
+    返回 {title, chapters, schema, size}；备份损坏或不是本项目结构的库
+    （缺 meta/chapters 表）→ ValueError（中文原因），界面据此拒绝恢复。
+    """
+    if not os.path.isfile(backup_path):
+        raise ValueError("备份文件不存在：" + os.path.basename(backup_path))
+    _verify_db(backup_path, required_tables=PROJECT_BACKUP_TABLES)
+    con = sqlite3.connect(backup_path)
+    try:
+        r = con.execute("SELECT value FROM meta WHERE key='project_title'").fetchone()
+        title = (r[0] if r else "") or ""
+        chapters = int(con.execute("SELECT COUNT(*) FROM chapters").fetchone()[0])
+        r = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        schema = (r[0] if r else "") or ""
+    finally:
+        con.close()
+    return {"title": title or "未命名", "chapters": chapters,
+            "schema": schema, "size": os.path.getsize(backup_path)}
+
+
+def restore_project_backup(folder: str, backup_path: str) -> str:
+    """把 backups/*.db 换回项目库（调用前必须已关闭该项目全部连接）。
+
+    与全量备份导入同一条红线：
+    - 开着连接不换文件：轻则句柄挡路（Windows os.replace 直接 PermissionError），
+      重则连接页缓存错乱；
+    - 先校验后替换：`_verify_db`（integrity_check + 必要表）不过就抛 ValueError，
+      本机数据一字未动；
+    - `_install_file` 同盘原子替换（临时名 + os.replace），随后清 -wal/-shm/
+      -journal 残留（`_remove_sqlite_sidecars`），旧 sidecar 会污染新库；
+    - 安全备份（现状先备走）由调用方在关连接**之前**做（backup() 要开着
+      连接才能 checkpoint）；
+    - 换文件失败（如文件被别的程序占用）→ project.db 未被替换，调用方把原库
+      重新打开即可，不许停在半路。
+    """
+    if not os.path.isfile(backup_path):
+        raise ValueError("备份文件不存在：" + os.path.basename(backup_path))
+    _verify_db(backup_path, required_tables=PROJECT_BACKUP_TABLES)
+    target = os.path.join(folder, "project.db")
+    _install_file(backup_path, target)
+    _remove_sqlite_sidecars(target)
+    return target
+
+
 # ---------------- 全量备份（双端同步：Windows ↔ 安卓） ----------------
 #
 # 一个 zip = 全局库 app.db（模型档案/API Key/路由/偏好/预设/任务模板/全局设置）
