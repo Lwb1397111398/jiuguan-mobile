@@ -876,15 +876,28 @@ def trim_unfinished_tail(text: str, window: int = _TRIM_WINDOW) -> str:
     return text
 
 
+# 接缝重复窗口（2026-11-21 扩 30→400）：模型续写时常见「把断点尾部被掐断的
+# 半句/最后一条整条重写一遍再往下写」（老板实测：大纲子条目 ⑥（1）… 整条
+# 100+ 字被重复），30 字窗口抓不住这种条目级重复。逐字匹配从大到小取最长
+# 重叠，剪掉的重复段在底稿尾部已有逐字副本，无损；模型改写措辞的重复抓不住
+# 也不该抓（宁可重复，不剪破正文）。
+_JOIN_OVERLAP_MAX = 400
+
+
 def join_continuation(full_text: str, new_text: str) -> str:
-    """续写拼接：直接接在末尾；若模型重复了尾部若干字则去重，保证不出现叠字。"""
+    """续写拼接：直接接在末尾；若模型重复了尾部若干字则去重，保证不出现叠字。
+
+    窗口 `_JOIN_OVERLAP_MAX`（400 字）：从大到小找续写开头与底稿尾部的最长
+    逐字重叠，找到即剪掉续写开头那段再接——条目级重复（模型重写断点尾部
+    被掐断的整条）也能剪干净。
+    """
     full = (full_text or "").rstrip()
     new = (new_text or "").lstrip()
     if not full:
         return new
     if not new:
         return full
-    for tail_len in range(min(30, len(full), len(new)), 0, -1):
+    for tail_len in range(min(_JOIN_OVERLAP_MAX, len(full), len(new)), 0, -1):
         if full.endswith(new[:tail_len]):
             return full + new[tail_len:]
     return full + new

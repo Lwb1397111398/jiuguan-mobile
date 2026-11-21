@@ -105,6 +105,7 @@ class AutoPilot:
         self._cont_step_id = ""       # 断点归属（kind#章节id），换步骤即作废
         self._cont_soft_fails = 0     # 续写新增段连续不合格次数（第 2 次放弃断点）
         self._cont_last_new_len = 0   # 最近一次合格续写新增字数
+        self._cont_last_cut = 0       # 最近一次续写拼接剪掉的接缝重复字数
 
     # ---------- 断点生命周期 ----------
 
@@ -115,6 +116,7 @@ class AutoPilot:
         self._cont_rounds = 0
         self._cont_soft_fails = 0
         self._cont_last_new_len = 0
+        self._cont_last_cut = 0
 
     def _cont_breakpoint_clear(self):
         """断点使命完成（新增段体检合格，底稿已并入正文）后清底稿；
@@ -457,10 +459,15 @@ class AutoPilot:
                 self._cont_last_new_len = len(text)
                 head = cont_base.strip()[:60]
                 if head and text.startswith(head):
-                    # 整篇重写护栏（对齐桌面）：模型以断点开头整篇重写 → 以新输出为准
+                    # 整篇重写护栏（对齐桌面）：模型以断点结尾开头整篇重写 → 以新输出为准
                     pass
                 else:
-                    text = join_continuation(cont_base, text)
+                    joined = join_continuation(cont_base, text)
+                    # 接缝重复统计（2026-11-21 对齐桌面）：窗口已扩 400 字，
+                    # 条目级重复（模型重写断点尾部整条再续）也能剪干净。
+                    self._cont_last_cut = max(0,
+                        len(cont_base) + len(text) - len(joined))
+                    text = joined
                 self._cont_rounds += 1
             # 输出质量闸（能力矩阵 D4，判据/顺序/豁免全在 core，与桌面同一个函数）：
             # 不合格 → 走既有重试节拍，**不进 _apply_step**（不落库、不置已完成、
@@ -579,11 +586,14 @@ class AutoPilot:
         # 轮数都归零——解析失败的重试是不带断点的普通重试。
         cont_note = ""
         if self._cont_rounds:
-            tail = (f"（末轮新增 {self._cont_last_new_len} 字）"
+            tail = (f"（末轮新增 {self._cont_last_new_len} 字"
+                    + (f"，剪掉接缝重复 {self._cont_last_cut} 字"
+                       if self._cont_last_cut else "") + "）"
                     if self._cont_last_new_len else "")
             cont_note = f"断点续写 {self._cont_rounds} 轮接力{tail}"
         self._cont_rounds = 0
         self._cont_last_new_len = 0
+        self._cont_last_cut = 0
         try:
             if kind == "synopsis":
                 cands, err = Pipeline.parse_synopsis_candidates(text)
