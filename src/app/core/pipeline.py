@@ -1048,9 +1048,14 @@ _MD_H3_RE = re.compile(r"^\s*###(?!#)\s*(.*)$", re.M)
 # 总纲分卷段原位替换（2026-10-17 分卷写回总纲）用：识别 #~#### 卷标题行，
 # 捕获级别/序号/卷名（与 assembler._SYNOPSIS_VOL_HEADING_RE 同口径，多捕获组）。
 # ■/裸行形态无法安全定位段落边界，不参与原位替换（调用方回退注入覆盖机制）。
+# 卷名分隔不强制冒号（2026-11-22《暗日机械》实测：AI 分批生成的底稿写成
+# 『### 分卷一 边界初血与高空碎甲』——序号与卷名之间只有空格，强制冒号的
+# 旧正则整行不命中，逐卷原位替换报「找不到分卷N」整批拒绝）；分隔后卷名
+# 必须同行（[ \t] 不跨行，防『### 分卷一\n正文』把正文当卷名吞进标题行）。
+# # 与『分卷』之间同样收紧为 [ \t]*：\s* 会跨行，『# 引言\n分卷一』会被误命中。
 _SYN_VOL_HEADING_NUM_RE = re.compile(
-    r"^[ \t]*(#{1,4})\s*分卷\s*([0-9〇一二三四五六七八九十百千]+)"
-    r"(?:\s*[：:]\s*(.*))?$", re.M)
+    r"^[ \t]*(#{1,4})[ \t]*分卷[ \t]*([0-9〇一二三四五六七八九十百千]+)"
+    r"(?:(?:[ \t]*[：:][ \t]*|[ \t]+)(.*))?$", re.M)
 
 # 迭代增量化两段式协议标记（总纲/切章迭代共用；iter_review.py 复用同一份定义）。
 # 必须独占一行（容忍 Markdown 标题/引用符号与冒号变体），避免把正文里提到的
@@ -4065,6 +4070,16 @@ class Pipeline:
             return None
         nxt = next((m for m in marks if m.start() > target.start()), None)
         end = nxt.start() if nxt else len(content)
+        # 分卷段边界不跨 H1/H2 大节（2026-11-22《暗日机械》实测：AI 分批生成的
+        # 总纲把『## 资产清单』插在分卷三和分卷四之间——大节顺序异常，但底稿
+        # 是事实。旧边界只认「下一个分卷标题」，分卷三的替换区间越过资产清单
+        # 直吞到分卷四，替换成功的同时把资产清单整节顶掉。
+        # 段尾候选加「target 之后第一个 H1/H2 大节标题」取最早者。
+        ov = min((m2.start() for m2 in (rx.search(content, target.end())
+                                        for rx in (_MD_H1_RE, _MD_H2_RE))
+                  if m2), default=None)
+        if ov is not None and ov > target.end():
+            end = min(end, ov)
         level = target.group(1)
         num = target.group(2)
         t = (title or "").strip()

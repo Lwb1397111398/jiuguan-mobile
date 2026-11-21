@@ -232,9 +232,25 @@ def _overview_span(content: str) -> tuple[int, int, int] | None:
     for m in _OVERVIEW_HEAD_RE.finditer(content):
         if m.group(2).strip().replace(" ", "").startswith("整体层"):
             level = len(m.group(1))
+            ends = [len(content)]
+            # 整体层段不吞分卷区：Markdown 分卷标题行 / 『分卷纲要』分段标记都算
+            # 段尾候选（与隐式形态、裸行形态同一纪律）。底稿『## 整体层』后跟
+            # 『### 分卷N』而分卷区中间还插着别的 H2 大节时（AI 分批生成实测：
+            # 『## 资产清单』插在分卷三后），只认「下一个同级或更高级标题」会把
+            # 分卷一~三整段吞进整体层段，随后的按小节合并又把分卷段当节内容顶掉
+            # （2026-11-22《暗日机械》实测：分卷一标题+正文被顶掉，逐卷替换报
+            # 「找不到分卷1」整批拒绝 → 界面「识别失败」）。
+            md_vol = _SYN_VOL_HEADING_NUM_RE.search(content, m.end())
+            if md_vol:
+                ends.append(md_vol.start())
+            sec = _BARE_VOL_SECTION_RE.search(content, m.end())
+            if sec:
+                ends.append(sec.start())
             nxt = next((x for x in _OVERVIEW_HEAD_RE.finditer(content)
                         if x.start() > m.start() and len(x.group(1)) <= level), None)
-            return m.start(), m.end(), (nxt.start() if nxt else len(content))
+            if nxt:
+                ends.append(nxt.start())
+            return m.start(), m.end(), min(ends)
     m = _BARE_OVERVIEW_HEAD_RE.search(content)
     if m is None:
         # 隐式形态：无『整体层』标题，靠分卷区起点定段尾（见 docstring）
