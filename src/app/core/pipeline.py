@@ -3689,8 +3689,10 @@ class Pipeline:
         # 中断（truncated=False）照样被判「未写完」重生成——老板 2026-11-19 实测
         # 自动模式正是这样反复重跑。协议顺序固定为「正文 → 状态包 → 完成标志」，
         # 状态包开头出现 = 正文已写完，与它是被长度上限还是连接中断掐断无关。
-        # safety_blocked（平台审核）不在此列：审核掐断的处置协议不变（不重试、
-        # 不换渠道），且 auto_pilot/手动窗的审核分支都排在收货提示之前。
+        # 与 safety_blocked（平台审核）的关系（2026-11-21 老板裁定）：两者交叉时
+        # **收货优先**——审核掐在状态包半截 = 正文已完整，照样收货（本豁免不排
+        # 除 safety_blocked）；是否还要 fatal 暂停由 core.quality_gate 的
+        # safety_pause_needed 统一裁决（正文未完成被掐才暂停），两端 UI 同源调用。
         if (not end_mark_found and role in ("prose", "prose_rewrite")
                 and state_bar_started(formal_text)):
             end_mark_found = True

@@ -355,7 +355,7 @@ class AutoPilot:
                                        continuation_segment_issue,
                                        join_continuation)
         from app.core.quality_gate import (STEP_MIN_CHARS, describe_issue,
-                                           output_issue)
+                                           output_issue, safety_pause_needed)
         if min_chars is None:
             min_chars = STEP_MIN_CHARS
         cont_base = self._cont_base
@@ -414,11 +414,15 @@ class AutoPilot:
                         and state_bar_started(text or "")):
                     self._accumulate_breakpoint(step, role, result)
                     return
-            if result.get("safety_blocked"):
+            if (result.get("safety_blocked")
+                    and safety_pause_needed(result, text or "")):
                 # 平台内容审核掐断（2026-11-05，与桌面版对齐）：finish_reason=
                 # sensitive / content_filter。审核看的是内容本身，不看推杆，
                 # 同报文重试必然再被掐 → 不重试，直接停下交给人换渠道/降素材。
                 # fatal（对齐桌面）：断点一并作废。
+                # 例外（2026-11-21 老板裁定，对齐桌面）：正文已完成（批尾状态包
+                # 已开始）时收货优先于暂停——是否暂停由 core 的
+                # safety_pause_needed 统一裁决，正文未完成被掐才 fatal。
                 self._cont_reset()
                 self._retry = 0
                 fr = result.get("finish_reason") or "content_filter"

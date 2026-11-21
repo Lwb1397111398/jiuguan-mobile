@@ -71,6 +71,25 @@ def has_state_bar(text: str) -> bool:
     return state_bar_started(text or "")
 
 
+def safety_pause_needed(result: dict, text: str) -> bool:
+    """平台审核掐断（safety_blocked）是否需要 fatal 暂停（2026-11-21 老板裁定）。
+
+    两条规则合流：审核掐断「不重试、不换渠道」的纪律不变，但**正文已完成时
+    收货优先于暂停**——审核掐在批尾状态包半截（【滚动状态包】已出现）说明
+    正文已写完，掐掉的只是状态包，整篇作废纯属浪费（2026-11-21 小偷入室
+    实测：id=84 正文完整、状态包 to状态 被掐半截，自动模式却 fatal 丢弃）。
+
+    - 正文已完成（pipeline 已标 state_bar_accepted，或末尾状态栏已开始）
+      → False：放行收货，照常落库。不重试的纪律不受影响——收货本来就不重试。
+    - 正文未完成就被掐 → True：维持 fatal 暂停（换渠道/降素材极端度由人决定）。
+    """
+    if not result.get("safety_blocked"):
+        return False
+    if result.get("state_bar_accepted"):
+        return False
+    return not has_state_bar(text or "")
+
+
 def output_issue(role: str, text: str, result: dict | None = None,
                  context: dict | None = None, min_chars: int = 0) -> dict | None:
     """判一次生成结果是否有质量问题。
